@@ -1,4 +1,4 @@
-# Dnew clipboard datainew clipboard datarectory Structure
+# Directory Structure
 ```
 packages/
   quackgraph/
@@ -35,6 +35,10 @@ packages/
     RFC.README.md
     tsconfig.json
     tsup.config.ts
+src/
+  labyrinth.ts
+  types.ts
+.gitignore
 LICENSE
 README.md
 relay.config.json
@@ -254,11 +258,11 @@ pub struct GraphIndex {
     edge_type_map: HashMap<String, u8>,
     edge_type_vec: Vec<String>,
 
-    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID, Valid From, Valid To)
-    outgoing: Vec<Vec<(u32, u8, i64, i64)>>,
+    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID, Valid From, Valid To, Heat)
+    outgoing: Vec<Vec<(u32, u8, i64, i64, u8)>>,
     
-    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID, Valid From, Valid To)
-    incoming: Vec<Vec<(u32, u8, i64, i64)>>,
+    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID, Valid From, Valid To, Heat)
+    incoming: Vec<Vec<(u32, u8, i64, i64, u8)>>,
 
     // Bitmask for soft-deleted nodes.
     // true = deleted (tombstone), false = active.
@@ -370,9 +374,10 @@ impl GraphIndex {
     /// Adds an edge to the graph. 
     /// Idempotent: Does not add duplicate edges if they already exist.
     /// If timestamps are not provided, defaults to (0, MAX_TIME).
-    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str, valid_from: Option<i64>, valid_to: Option<i64>) {
+    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str, valid_from: Option<i64>, valid_to: Option<i64>, heat: Option<u8>) {
         let vf = valid_from.unwrap_or(0);
         let vt = valid_to.unwrap_or(MAX_TIME);
+        let h = heat.unwrap_or(0);
         
         let u_src = self.get_or_create_node(source);
         let u_tgt = self.get_or_create_node(target);
@@ -380,14 +385,15 @@ impl GraphIndex {
 
         // Add to forward index (Idempotent)
         let out_vec = &mut self.outgoing[u_src as usize];
-        if !out_vec.contains(&(u_tgt, u_type, vf, vt)) {
-            out_vec.push((u_tgt, u_type, vf, vt));
+        // We include heat in the uniqueness check, effectively allowing different heat levels to coexist if pushed explicitly
+        if !out_vec.contains(&(u_tgt, u_type, vf, vt, h)) {
+            out_vec.push((u_tgt, u_type, vf, vt, h));
         }
         
         // Add to reverse index (Idempotent)
         let in_vec = &mut self.incoming[u_tgt as usize];
-        if !in_vec.contains(&(u_src, u_type, vf, vt)) {
-            in_vec.push((u_src, u_type, vf, vt));
+        if !in_vec.contains(&(u_src, u_type, vf, vt, h)) {
+            in_vec.push((u_src, u_type, vf, vt, h));
         }
 
         // Ensure nodes are not tombstoned if they are being re-added/linked
@@ -412,13 +418,13 @@ impl GraphIndex {
             // However, this method removes it from RAM entirely (hard delete).
             // Remove from outgoing
             if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
-                if let Some(pos) = edges.iter().position(|x| x.0 == u_tgt && x.1 == u_type) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_tgt && x.1 == u_type) { // Ignores validity/heat for deletion
                     edges.swap_remove(pos);
                 }
             }
             // Remove from incoming
             if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
-                if let Some(pos) = edges.iter().position(|x| x.0 == u_src && x.1 == u_type) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_src && x.1 == u_type) { // Ignores validity/heat for deletion
                     edges.swap_remove(pos);
                 }
             }
@@ -530,8 +536,8 @@ impl GraphIndex {
             } else { MAX_TIME };
 
             // Fast Path: Blind push. We rely on compact() to deduplicate later.
-            self.outgoing[u_src as usize].push((u_tgt, u_type, valid_from, valid_to));
-            self.incoming[u_tgt as usize].push((u_src, u_type, valid_from, valid_to));
+            self.outgoing[u_src as usize].push((u_tgt, u_type, valid_from, valid_to, 0)); // Default heat 0
+            self.incoming[u_tgt as usize].push((u_src, u_type, valid_from, valid_to, 0)); // Default heat 0
 
             // Ensure nodes are not tombstoned (revival logic)
             if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
@@ -542,6 +548,78 @@ impl GraphIndex {
             }
         }
         Ok(())
+    }
+
+    /// Updates the 'heat' (pheromone level) of active edges matching the criteria.
+    /// Only affects edges where valid_to is MAX_TIME (active).
+    pub fn update_edge_heat(&mut self, source: &str, target: &str, edge_type: &str, new_heat: u8) {
+        if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+            self.node_interner.lookup_id(source),
+            self.node_interner.lookup_id(target),
+            self.edge_type_map.get(edge_type).copied(),
+        ) {
+            // Update outgoing
+            if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                for edge in edges.iter_mut() {
+                    // edge is (target, type, vf, vt, heat)
+                    if edge.0 == u_tgt && edge.1 == u_type && edge.3 == MAX_TIME {
+                        edge.4 = new_heat;
+                    }
+                }
+            }
+            // Update incoming
+            if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                for edge in edges.iter_mut() {
+                    // edge is (source, type, vf, vt, heat)
+                    if edge.0 == u_src && edge.1 == u_type && edge.3 == MAX_TIME {
+                        edge.4 = new_heat;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Contextual Schema Pruning.
+    /// Returns a list of unique Edge Types (strings) that originate from the given source nodes.
+    /// This allows an Agent to know "What moves are available?" without fetching all neighbors.
+    pub fn get_available_edge_types(&self, sources: &[String], as_of: Option<i64>) -> Vec<String> {
+        let mut type_ids = Vec::new();
+
+        for src_str in sources {
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+        if let Some(edges) = self.outgoing.get(src_id as usize) {
+            for &(_, type_id, vf, vt, _) in edges {
+                // Temporal Check
+                match as_of {
+                    Some(ts) => {
+                        // Edge is valid if it existed at 'ts' (valid_from <= ts < valid_to)
+                        if vf <= ts && vt > ts {
+                            type_ids.push(type_id);
+                        }
+                    },
+                    None => {
+                        // Current/Active only
+                        if vt == MAX_TIME {
+                            type_ids.push(type_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        type_ids.sort_unstable();
+        type_ids.dedup();
+
+        type_ids.into_iter()
+            .filter_map(|tid| {
+                // We can't easily do O(1) reverse lookup on the map unless we scan or store a reverse vec.
+                // Luckily `edge_type_vec` exists!
+                self.edge_type_vec.get(tid as usize).cloned()
+            })
+            .collect()
     }
 
     /// Low-level neighbor access for Matcher.
@@ -556,7 +634,7 @@ impl GraphIndex {
 
         if let Some(edges) = adjacency.get(node_id as usize) {
             edges.iter()
-                .filter_map(|&(target, t, vf, vt)| {
+                .filter_map(|&(target, t, vf, vt, _heat)| {
                     // Type match
                     if t != type_id { return None; }
                     // Tombstone check
@@ -601,7 +679,7 @@ impl GraphIndex {
                 }
 
                 if let Some(edges) = adjacency.get(src_id as usize) {
-                    for &(target, type_id, vf, vt) in edges {
+                    for &(target, type_id, vf, vt, _heat) in edges {
                         // Apply edge type filter if present
                         if let Some(req_type) = type_filter {
                             if req_type != type_id {
@@ -691,7 +769,7 @@ impl GraphIndex {
             let next_depth = curr_depth + 1;
 
             if let Some(edges) = adjacency.get(curr_id as usize) {
-                for &(target, type_id, vf, vt) in edges {
+                for &(target, type_id, vf, vt, _heat) in edges {
                     // Apply edge type filter
                     if let Some(req_type) = type_filter {
                         if req_type != type_id {
@@ -775,9 +853,9 @@ mod tests {
         let t_likes = graph.get_or_create_type("LIKES");
 
         // Manually push duplicates simulating blind batch add
-        graph.outgoing[u_a as usize].push((u_b, t_knows));
-        graph.outgoing[u_a as usize].push((u_b, t_knows)); // Duplicate
-        graph.outgoing[u_a as usize].push((u_b, t_likes)); // Different type
+        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0));
+        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0)); // Duplicate
+        graph.outgoing[u_a as usize].push((u_b, t_likes, 0, MAX_TIME, 0)); // Different type
 
         // Pre-compact: 3 edges
         assert_eq!(graph.outgoing[u_a as usize].len(), 3);
@@ -787,8 +865,8 @@ mod tests {
 
         // Post-compact: 2 edges (KNOWS, LIKES)
         assert_eq!(graph.outgoing[u_a as usize].len(), 2);
-        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows)));
-        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes)));
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows, 0, MAX_TIME, 0)));
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes, 0, MAX_TIME, 0)));
     }
 }
 ````
@@ -868,11 +946,12 @@ impl NativeGraph {
     }
 
     #[napi]
-    pub fn add_edge(&mut self, source: String, target: String, edge_type: String, valid_from: Option<f64>, valid_to: Option<f64>) {
+    pub fn add_edge(&mut self, source: String, target: String, edge_type: String, valid_from: Option<f64>, valid_to: Option<f64>, heat: Option<u32>) {
         // JS timestamps are millis (f64). Convert to micros (i64) for DuckDB compatibility.
         let vf = valid_from.map(|t| (t * 1000.0) as i64);
         let vt = valid_to.map(|t| (t * 1000.0) as i64);
-        self.inner.add_edge(&source, &target, &edge_type, vf, vt);
+        let h = heat.map(|v| v as u8); // safe cast for V1
+        self.inner.add_edge(&source, &target, &edge_type, vf, vt, h);
     }
 
     #[napi]
@@ -883,6 +962,21 @@ impl NativeGraph {
     #[napi]
     pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
         self.inner.remove_edge(&source, &target, &edge_type);
+    }
+
+    /// Updates the 'heat' (pheromone) level of an active edge.
+    /// Used for reinforcement learning in the agent loop.
+    #[napi(js_name = "updateEdgeHeat")]
+    pub fn update_edge_heat(&mut self, source: String, target: String, edge_type: String, heat: u32) {
+        self.inner.update_edge_heat(&source, &target, &edge_type, heat as u8);
+    }
+
+    /// Returns available edge types from the given source nodes.
+    /// Used for "Ghost Earth" Satellite View (LOD 0).
+    #[napi(js_name = "getAvailableEdgeTypes")]
+    pub fn get_available_edge_types(&self, sources: Vec<String>, as_of: Option<f64>) -> Vec<String> {
+        let ts = as_of.map(|t| t as i64);
+        self.inner.get_available_edge_types(&sources, ts)
     }
 
     /// Performs a single-hop traversal (bfs-step).
@@ -1049,6 +1143,16 @@ export declare class NativeGraph {
   addEdge(source: string, target: string, edgeType: string, validFrom?: number | undefined | null, validTo?: number | undefined | null): void
   removeNode(id: string): void
   removeEdge(source: string, target: string, edgeType: string): void
+  /**
+   * Updates the 'heat' (pheromone) level of an active edge.
+   * Used for reinforcement learning in the agent loop.
+   */
+  updateEdgeHeat(source: string, target: string, edgeType: string, heat: number): void
+  /**
+   * Returns available edge types from the given source nodes.
+   * Used for "Ghost Earth" Satellite View (LOD 0).
+   */
+  getAvailableEdgeTypes(sources: Array<string>, asOf?: number | undefined | null): Array<string>
   /**
    * Performs a single-hop traversal (bfs-step).
    * Returns unique neighbor IDs.
@@ -1796,6 +1900,22 @@ export class QuackGraph {
       // 2. Write to RAM (Remove)
       this.native.removeEdge(source, target, type);
     });
+  }
+
+  // --- Pheromones & Schema (Agent) ---
+
+  async updateEdgeHeat(source: string, target: string, type: string, heat: number) {
+    // This is an atomic memory operation, no disk write needed for V1 (transient)
+    // For persistence, we would write to a 'heat' column in DuckDB asynchronously
+    this.native.updateEdgeHeat(source, target, type, heat);
+  }
+
+  async getAvailableEdgeTypes(sources: string[]): Promise<string[]> {
+    // Fast scan of the CSR index
+    // Returns unique edge types outgoing from the source set
+    // Used for Labyrinth LOD 0 (Sector Scan)
+    const asOfTs = this.context.asOf ? this.context.asOf.getTime() * 1000 : undefined;
+    return this.native.getAvailableEdgeTypes(sources, asOfTs);
   }
 
   /**
@@ -3174,6 +3294,616 @@ export default defineConfig({
 });
 ````
 
+## File: src/labyrinth.ts
+````typescript
+import { QuackGraph } from '../packages/quackgraph/packages/quack-graph/src/graph';
+import type { 
+  AgentConfig, 
+  TraceStep, 
+  TraceLog, 
+  LabyrinthArtifact, 
+  ScoutDecision,
+  ScoutPrompt,
+  JudgePrompt,
+  CorrelationResult
+} from './types';
+import { randomUUID } from 'crypto';
+
+interface Cursor {
+  id: string;
+  currentNodeId: string;
+  path: string[]; // History of node IDs
+  traceHistory: string[]; // Summary of actions for context
+  stepCount: number;
+  confidence: number;
+  parentId?: number; // stepId of the action that led here
+  lastEdgeType?: string; // Edge taken to reach currentNodeId
+}
+
+export class Labyrinth {
+  private traces = new Map<string, TraceLog>();
+
+  constructor(
+    private graph: QuackGraph, 
+    private config: AgentConfig
+  ) {}
+
+  /**
+   * Parallel Speculative Execution:
+   * Main Entry Point: Orchestrates multiple Scouts and a Judge to find an answer.
+   */
+  async findPath(startNodeId: string, goal: string): Promise<LabyrinthArtifact | null> {
+    const traceId = randomUUID();
+    const startTime = Date.now();
+    
+    const log: TraceLog = {
+      traceId,
+      goal,
+      startTime,
+      steps: [],
+      outcome: 'ABORTED' // Default
+    };
+    
+    this.traces.set(traceId, log);
+
+    // Initialize Root Cursor
+    let cursors: Cursor[] = [{
+      id: randomUUID(),
+      currentNodeId: startNodeId,
+      path: [startNodeId],
+      traceHistory: [],
+      stepCount: 0,
+      confidence: 1.0
+    }];
+
+    const maxHops = this.config.maxHops || 10;
+    const maxCursors = this.config.maxCursors || 3;
+    let globalStepCounter = 0;
+
+    // Main Loop: While we have active cursors
+    while (cursors.length > 0) {
+      const nextCursors: Cursor[] = [];
+      
+      const promises = cursors.map(async (cursor) => {
+        // Pruning: Max Depth
+        if (cursor.stepCount >= maxHops) {
+          return null;
+        }
+
+        // 1. Context Awareness (LOD 1)
+        const nodeMeta = await this.graph.match([])
+          .where({ id: cursor.currentNodeId })
+          .select(n => ({ id: n.id, labels: n.labels }));
+        
+        if (nodeMeta.length === 0) return null; // Node lost/deleted
+        const currentNode = nodeMeta[0];
+
+        // 2. Sector Scan (LOD 0)
+        const edgeTypes = await this.sectorScan([cursor.currentNodeId]);
+
+        // 3. Ask Scout
+        const prompt: ScoutPrompt = {
+          goal,
+          currentNodeId: currentNode.id,
+          currentNodeLabels: currentNode.labels || [],
+          availableEdgeTypes: edgeTypes,
+          pathHistory: cursor.path
+        };
+
+        const decision = await this.askScout(prompt);
+        
+        // Register Step
+        const currentStepId = globalStepCounter++;
+        const step: TraceStep = {
+          stepId: currentStepId,
+          parentId: cursor.parentId,
+          cursorId: cursor.id,
+          nodeId: cursor.currentNodeId,
+          source: cursor.currentNodeId,
+          incomingEdge: cursor.lastEdgeType,
+          action: decision.action as 'MOVE' | 'CHECK',
+          decision,
+          reasoning: decision.reasoning,
+          timestamp: Date.now()
+        };
+        log.steps.push(step);
+        cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
+
+        // 4. Handle Decision
+        if (decision.action === 'CHECK') {
+          // LOD 2: Content Retrieval
+          const content = await this.contentRetrieval([cursor.currentNodeId]);
+          
+          // Ask Judge
+          const artifact = await this.askJudge({ goal, nodeContent: content });
+          
+          if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
+            // Success found by this cursor!
+            artifact.traceId = traceId;
+            artifact.sources = [cursor.currentNodeId];
+            return { type: 'FOUND', artifact, finalStepId: currentStepId };
+          } 
+          
+          // If Judge rejects, this path ends here.
+          return null;
+
+        } else if (decision.action === 'MOVE') {
+          const moves = [];
+          
+          // Primary Move
+          if (decision.edgeType) {
+            moves.push({ edge: decision.edgeType, conf: decision.confidence });
+          }
+          
+          // Alternative Moves (Speculative Execution)
+          if (decision.alternativeMoves) {
+            for (const alt of decision.alternativeMoves) {
+              moves.push({ edge: alt.edgeType, conf: alt.confidence });
+            }
+          }
+
+          // Process Moves
+          const generatedCursors: Cursor[] = [];
+
+          for (const move of moves) {
+            if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
+
+            // LOD 1: Topology Scan
+            const nextNodes = await this.topologyScan([cursor.currentNodeId], move.edge);
+            
+            if (nextNodes.length > 0) {
+              // Naive selection: Pick first. Real logic might fork for targets too.
+              const target = nextNodes[0]; 
+              
+              // Update step target if primary move (for legacy/simple visualization)
+              if (move.edge === decision.edgeType) {
+                 step.target = target;
+              }
+
+              generatedCursors.push({
+                id: randomUUID(),
+                currentNodeId: target,
+                path: [...cursor.path, target],
+                traceHistory: [...cursor.traceHistory],
+                stepCount: cursor.stepCount + 1,
+                confidence: cursor.confidence * move.conf,
+                parentId: currentStepId,
+                lastEdgeType: move.edge
+              });
+            }
+          }
+          return { type: 'CONTINUE', newCursors: generatedCursors };
+        }
+        
+        return null; // ABORT
+      });
+
+      const results = await Promise.all(promises);
+
+      // Check results
+      for (const res of results) {
+        if (!res) continue;
+        if (res.type === 'FOUND') {
+          log.outcome = 'FOUND';
+          const artifact = res.artifact as LabyrinthArtifact;
+          log.finalArtifact = artifact;
+          
+          // Reconstruct Path & Reinforce
+          if (res.finalStepId !== undefined) {
+            const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
+            await this.reinforcePath(winningTrace);
+          }
+          
+          return artifact;
+        }
+        if (res.type === 'CONTINUE' && res.newCursors) {
+          nextCursors.push(...res.newCursors);
+        }
+      }
+
+      // Pruning / Management
+      // Sort by confidence and take top N
+      nextCursors.sort((a, b) => b.confidence - a.confidence);
+      cursors = nextCursors.slice(0, maxCursors);
+    }
+
+    if (log.outcome !== 'FOUND') {
+      log.outcome = 'EXHAUSTED';
+    }
+    
+    return null;
+  }
+
+  getTrace(traceId: string): TraceLog | undefined {
+    return this.traces.get(traceId);
+  }
+
+  private reconstructPath(allSteps: TraceStep[], finalStepId: number): TraceStep[] {
+    const path: TraceStep[] = [];
+    let currentId: number | undefined = finalStepId;
+    
+    // Build map for O(1) lookup
+    const stepMap = new Map<number, TraceStep>();
+    for (const s of allSteps) stepMap.set(s.stepId, s);
+
+    while (currentId !== undefined) {
+      const step = stepMap.get(currentId);
+      if (step) {
+        path.unshift(step);
+        currentId = step.parentId;
+      } else {
+        break;
+      }
+    }
+    return path;
+  }
+
+  // --- LOD Implementations ---
+
+  /**
+   * LOD 0: Sector Scan (Satellite View)
+   * The "Ghost Layer". The agent asks: "Where CAN I go from here?"
+   */
+  async sectorScan(currentNodes: string[]): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    return await this.graph.getAvailableEdgeTypes(currentNodes);
+  }
+
+  /**
+   * LOD 1: Topology Scan (Drone View)
+   * The "Structural Layer". The agent moves blindly through the graph using only IDs and Types.
+   */
+  async topologyScan(currentNodes: string[], edgeType: string): Promise<string[]> {
+    const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() * 1000 : undefined;
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOfTs);
+  }
+
+  /**
+   * LOD 2: Content Retrieval (Street View)
+   * The "Data Layer". The agent has identified specific nodes of interest and now reads the text.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
+  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
+    if (nodeIds.length === 0) return [];
+    
+    return await this.graph.match([])
+      .where({ id: nodeIds })
+      .select();
+  }
+
+  /**
+   * Pheromones: Reinforce
+   * Reinforces edges along the winning path.
+   */
+  async reinforcePath(trace: TraceStep[]) {
+    // Traverse pairs of steps to find edges
+    for (let i = 1; i < trace.length; i++) {
+      const prev = trace[i - 1];
+      const curr = trace[i];
+      if (curr.incomingEdge) {
+        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 200);
+      }
+    }
+  }
+
+  /**
+   * Pheromones: Decay
+   * (Optional) Decay edges on failed paths.
+   */
+  async decayPath(trace: TraceStep[]) {
+     // Naive decay logic for now
+     for (let i = 1; i < trace.length; i++) {
+      const prev = trace[i - 1];
+      const curr = trace[i];
+      if (curr.incomingEdge) {
+        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 10);
+      }
+    }
+  }
+
+  // --- Part 3: Temporal Algebra & Metabolism ---
+
+  /**
+   * Analyze correlation between an anchor node and a target label within a time window.
+   * Uses DuckDB SQL window functions.
+   */
+  async analyzeCorrelation(
+    anchorNodeId: string, 
+    targetLabel: string, 
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
+    // 1. Get Anchor Node Timestamp (valid_from)
+    const anchorRows = await this.graph.db.query(
+      "SELECT valid_from FROM nodes WHERE id = ?", 
+      [anchorNodeId]
+    );
+    
+    if (anchorRows.length === 0) {
+      throw new Error(`Anchor node ${anchorNodeId} not found`);
+    }
+    
+    // DuckDB returns TIMESTAMP, which might be object or string depending on driver version.
+    
+    // Query: Find all nodes with targetLabel that overlap the [AnchorTime - Window, AnchorTime] interval
+    const sql = `
+      WITH Anchor AS (
+        SELECT valid_from as t_anchor 
+        FROM nodes 
+        WHERE id = ?
+      ),
+      Targets AS (
+        SELECT id, valid_from as t_target 
+        FROM nodes 
+        WHERE list_contains(labels, ?)
+      )
+      SELECT count(*) as count
+      FROM Targets, Anchor
+      WHERE t_target >= (t_anchor - INTERVAL ${windowMinutes} MINUTE)
+        AND t_target <= t_anchor
+    `;
+    
+    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
+    const count = Number(result[0]?.count || 0);
+    
+    return {
+      anchorLabel: 'Unknown', 
+      targetLabel,
+      windowSizeMinutes,
+      correlationScore: count > 0 ? 1.0 : 0.0, // Simplified boolean correlation
+      sampleSize: count,
+      description: `Found ${count} instances of ${targetLabel} in the ${windowMinutes}m window.`
+    };
+  }
+
+  /**
+   * Graph Metabolism: Summarize and Prune.
+   * Identifies old, dense clusters and compresses them.
+   */
+  async dream(criteria: { minAgeDays: number, targetLabel: string }) {
+    // 1. Identify Candidates (Nodes older than X days)
+    const sql = `
+      SELECT id, properties 
+      FROM nodes 
+      WHERE list_contains(labels, ?) 
+        AND valid_from < (current_timestamp - INTERVAL ${criteria.minAgeDays} DAY)
+        AND valid_to IS NULL -- Active nodes only
+      LIMIT 50 -- Batch size
+    `;
+    
+    const candidates = await this.graph.db.query(sql, [criteria.targetLabel]);
+    if (candidates.length === 0) return;
+
+    // 2. Synthesize (Judge)
+    const prompt: JudgePrompt = {
+      goal: `Summarize these ${criteria.targetLabel} logs into a single concise insight.`,
+      nodeContent: candidates.map(c => typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties)
+    };
+    
+    const artifact = await this.askJudge(prompt);
+    
+    if (!artifact) return; // Judge failed
+
+    // 3. Identification of Anchor (Parent)
+    const candidateIds = candidates.map(c => c.id);
+    const potentialParents = await this.graph.native.traverse(candidateIds, undefined, 'in', undefined);
+    
+    if (potentialParents.length === 0) return; // Orphaned
+    
+    const anchorId = potentialParents[0];
+
+    // 4. Rewire & Prune
+    const summaryId = `summary:${randomUUID()}`;
+    const summaryProps = {
+      content: artifact.answer,
+      source_count: candidates.length,
+      generated_at: new Date().toISOString()
+    };
+    
+    await this.graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
+    await this.graph.addEdge(anchorId, summaryId, 'HAS_SUMMARY');
+    
+    for (const id of candidateIds) {
+      await this.graph.deleteNode(id);
+    }
+  }
+
+  // --- LLM Interaction ---
+
+  private async askScout(promptCtx: ScoutPrompt): Promise<ScoutDecision> {
+    const prompt = `
+      You are a Graph Scout navigating a blind topology.
+      Goal: "${promptCtx.goal}"
+      Current Node: ${promptCtx.currentNodeId} (Labels: ${promptCtx.currentNodeLabels.join(', ')})
+      Path History: ${promptCtx.pathHistory.join(' -> ')}
+      Available Edges: ${JSON.stringify(promptCtx.availableEdgeTypes)}
+      
+      Decide your next move.
+      - If you strongly believe this current node contains the answer, action: "CHECK".
+      - If you want to explore, action: "MOVE" and specify the "edgeType".
+      - If stuck, "ABORT".
+      - If you see multiple promising paths, you can provide "alternativeMoves".
+      
+      Return ONLY a JSON object:
+      { 
+        "action": "MOVE", 
+        "edgeType": "KNOWS", 
+        "confidence": 0.9, 
+        "reasoning": "...",
+        "alternativeMoves": [
+           { "edgeType": "WORKS_WITH", "confidence": 0.5, "reasoning": "..." }
+        ]
+      }
+    `;
+
+    try {
+      const raw = await this.config.llmProvider.generate(prompt);
+      // Basic JSON extraction attempt
+      const jsonStr = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
+      return JSON.parse(jsonStr) as ScoutDecision;
+    } catch (e) {
+      return { action: 'ABORT', confidence: 0, reasoning: 'LLM Parsing Error' };
+    }
+  }
+
+  private async askJudge(promptCtx: JudgePrompt): Promise<LabyrinthArtifact | null> {
+    const prompt = `
+      You are a Judge evaluating data.
+      Goal: "${promptCtx.goal}"
+      Data: ${JSON.stringify(promptCtx.nodeContent)}
+      
+      Does this data answer the goal?
+      Return ONLY a JSON object:
+      { "isAnswer": true, "answer": "The user is...", "confidence": 0.95 }
+    `;
+
+    try {
+      const raw = await this.config.llmProvider.generate(prompt);
+      const jsonStr = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
+      // biome-ignore lint/suspicious/noExplicitAny: Weak schema for LLM response
+      const result = JSON.parse(jsonStr) as any;
+      
+      if (result.isAnswer) {
+        return {
+          answer: result.answer,
+          confidence: result.confidence,
+          traceId: '', // Filled by caller
+          sources: [] // Filled by caller
+        };
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  }
+}
+````
+
+## File: src/types.ts
+````typescript
+export enum ZoomLevel {
+  SECTOR = 0,    // Ghost/Satellite View: Available Moves (Schema)
+  TOPOLOGY = 1,  // Drone View: Structural Hops (IDs only)
+  CONTENT = 2    // Street View: Full JSON Data
+}
+
+export interface AgentConfig {
+  llmProvider: {
+    generate: (prompt: string) => Promise<string>;
+  };
+  maxHops?: number;
+  // Max number of concurrent exploration threads
+  maxCursors?: number;
+  // Max number of concurrent exploration threads
+  // Minimum confidence to pursue a path (0.0 - 1.0)
+  // Minimum confidence to pursue a path (0.0 - 1.0)
+  confidenceThreshold?: number;
+}
+
+export interface ScoutDecision {
+  action: 'MOVE' | 'CHECK' | 'ABORT';
+  edgeType?: string; // Required if action is MOVE
+  targetLabels?: string[]; // Optional filter for the move
+  confidence: number;
+  reasoning: string;
+  alternativeMoves?: {
+    edgeType: string;
+    confidence: number;
+    reasoning: string;
+  }[];
+}
+
+export interface ScoutPrompt {
+  goal: string;
+  currentNodeId: string;
+  currentNodeLabels: string[];
+  availableEdgeTypes: string[];
+  pathHistory: string[]; // Summarized path history
+}
+
+export interface JudgePrompt {
+  goal: string;
+  nodeContent: Record<string, any>[];
+}
+
+export interface TraceStep {
+  stepId: number;
+  parentId?: number;
+  cursorId: string;
+  incomingEdge?: string;
+  nodeId: string; // Source node where decision was made
+  source: string;
+  target?: string; // Resulting node if MOVE
+  action: 'MOVE' | 'CHECK';
+  decision: ScoutDecision;
+  reasoning: string;
+  timestamp: number;
+}
+
+export interface TraceLog {
+  traceId: string;
+  goal: string;
+  startTime: number;
+  steps: TraceStep[];
+  outcome: 'FOUND' | 'EXHAUSTED' | 'ABORTED';
+  finalArtifact?: LabyrinthArtifact;
+}
+
+export interface LabyrinthArtifact {
+  answer: string;
+  confidence: number;
+  traceId: string;
+  sources: string[];
+  metadata?: Record<string, any>;
+}
+
+// Temporal Logic Types
+export interface TemporalWindow {
+  anchorNodeId: string;
+  windowStart: number; // Unix timestamp
+  windowEnd: number;   // Unix timestamp
+}
+
+export interface CorrelationResult {
+  anchorLabel: string;
+  targetLabel: string;
+  windowSizeMinutes: number;
+  correlationScore: number; // 0.0 - 1.0
+  sampleSize: number;
+  description: string;
+}
+````
+
+## File: .gitignore
+````
+# relay state
+/.relay/
+````
+
+## File: LICENSE
+````
+MIT License
+
+Copyright (c) 2025 quackgraph
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
 ## File: relay.config.json
 ````json
 {
@@ -3240,6 +3970,7 @@ export default defineConfig({
     "useGitignore": true,
     "useDefaultPatterns": true,
     "customPatterns": [
+      "dev-docs/flow.todo.md",
       "packages/quackgraph/.git",
       "packages/quackgraph/repomix.config.json",
       "packages/quackgraph/relay.config.json",
@@ -3262,31 +3993,6 @@ export default defineConfig({
     "encoding": "o200k_base"
   }
 }
-````
-
-## File: LICENSE
-````
-MIT License
-
-Copyright (c) 2025 quackgraph
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 ````
 
 ## File: README.md
