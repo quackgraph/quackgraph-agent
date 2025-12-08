@@ -1,0 +1,56 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "input": {
+    "maxFileSize": 52428800
+  },
+  "output": {
+    "filePath": "dev-docs/repomix.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": false,
+    "directoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": true,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false
+    }
+  },
+  "include": [
+//"README.md",
+//"test-docs/"
+//"test/",
+//"test-docs/unit.test-plan.md"
+],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "packages/quackgraph/.git",
+      "packages/quackgraph/repomix.config.json",
+      "packages/quackgraph/relay.config.json",
+      "packages/quackgraph/.relay",
+      "packages/quackgraph/dev-docs",
+      "packages/quackgraph/LICENSE",
+      "packages/quackgraph/.gitignore",
+      "packages/quackgraph/tsconfig.tsbuildinfo",
+"packages/quackgraph/packages/quack-graph/dist",
+      "packages/quackgraph/test/",
+      "packages/quackgraph/test-docs/",
+      "packages/quackgraph/test/e2e/",
+      "packages/quackgraph/src"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
