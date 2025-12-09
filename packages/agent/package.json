@@ -14,7 +14,10 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check ."
   },
   "dependencies": {
     "@mastra/core": "^0.24.6",
@@ -26,6 +29,7 @@
     "@quackgraph/native": "workspace:*"
   },
   "devDependencies": {
+    "@biomejs/biome": "latest",
     "typescript": "^5.0.0",
     "tsup": "^8.0.0"
   }
