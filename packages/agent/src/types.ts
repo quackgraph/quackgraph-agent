@@ -4,6 +4,12 @@ export enum ZoomLevel {
   CONTENT = 2    // Street View: Full JSON Data
 }
 
+// Interface for Injected Agents (Mastra or custom)
+export interface MastraAgent {
+  // biome-ignore lint/suspicious/noExplicitAny: Prompt can be string or structured
+  generate(prompt: string | any, options?: { signal?: AbortSignal }): Promise<{ text: string }>;
+}
+
 export interface AgentConfig {
   llmProvider: {
     generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
@@ -24,7 +30,8 @@ export interface AgentConfig {
 export interface DomainConfig {
   name: string;
   description: string;
-  allowedEdges: string[]; // Whitelist of edge types visible to the Scout
+  allowedEdges: string[]; // Whitelist of edge types (empty = all unless excluded)
+  excludedEdges?: string[]; // Blacklist of edge types (overrides allowed)
   // If true, traversal enforces Monotonic Time (Next Event >= Current Event)
   isCausal?: boolean;
 }

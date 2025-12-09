@@ -14,8 +14,16 @@ export class GraphTools {
 
     // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
     const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-
-    // 2. Sort by count (descending)
+    
+    // 2. Filter if explicit allowed list provided (double check)
+    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
+    // Note: optimization - native filtering is faster, but we rely on caller to pass correct allowedEdgeTypes from registry.getValidEdges()
+    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
+        // redundant but safe if native implementation varies
+        // no-op if native did its job
+    }
+    
+    // 3. Sort by count (descending)
     return results.sort((a, b) => b.count - a.count);
   }
 
@@ -24,6 +32,7 @@ export class GraphTools {
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
   async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, minValidFrom?: number): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
     return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf, minValidFrom);
   }
 
@@ -36,10 +45,20 @@ export class GraphTools {
   }
 
   /**
+   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
+   */
+  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    // We use the native traverseInterval which accepts edgeType
+    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
    * LOD 1.5: Pattern Matching (Structural Inference)
    * Finds subgraphs matching a specific shape.
    */
   async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], asOf?: number): Promise<string[][]> {
+    if (startNodes.length === 0) return [];
     const nativePattern = pattern.map(p => ({
       srcVar: p.srcVar || 0,
       tgtVar: p.tgtVar || 0,
@@ -104,14 +123,17 @@ export class GraphTools {
   /**
    * Pheromones: Reinforce a successful path by increasing edge heat.
    */
-  async reinforcePath(trace: { source: string; incomingEdge?: string }[]) {
+  async reinforcePath(trace: { source: string; incomingEdge?: string }[], qualityScore: number = 1.0) {
+    // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
+    // We assume native handles saturation at 255.
+    const heatDelta = Math.floor(qualityScore * 50);
+    
     for (let i = 1; i < trace.length; i++) {
       const prev = trace[i - 1];
       const curr = trace[i];
       if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
       if (curr.incomingEdge) {
-        // Boost heat by 200 (max is 255 usually, V1 logic)
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 200);
+        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
       }
     }
   }

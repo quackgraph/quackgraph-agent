@@ -18,11 +18,13 @@ const identifyCandidates = createStep({
   execute: async ({ inputData }) => {
     const graph = getGraphInstance();
     // Raw SQL for efficiency
+    // Ensure we don't accidentally wipe recent data if minAgeDays is too small
+    const safeDays = Math.max(inputData.minAgeDays, 1);
     const sql = `
       SELECT id, properties 
       FROM nodes 
       WHERE list_contains(labels, ?) 
-        AND valid_from < (current_timestamp - INTERVAL ${inputData.minAgeDays} DAY)
+        AND valid_from < (current_timestamp - INTERVAL ${safeDays} DAY)
         AND valid_to IS NULL
       LIMIT 100
     `;
@@ -70,7 +72,8 @@ const synthesizeInsight = createStep({
             summaryText = result.answer;
         }
     } catch(e) {
-        console.warn("Metabolism synthesis failed parsing", e);
+        // Fallback or just log, but don't crash workflow if one synthesis fails
+        console.error("Metabolism synthesis failed parsing", e);
     }
 
     return { summaryText, candidateIds: inputData.candidateIds };

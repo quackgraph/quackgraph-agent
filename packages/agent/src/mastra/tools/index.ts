@@ -48,6 +48,29 @@ export const topologyScanTool = createTool({
   },
 });
 
+export const temporalScanTool = createTool({
+  id: 'temporal-scan',
+  description: 'Find neighbors connected via edges overlapping a specific time window',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    windowStart: z.string().describe('ISO Date String'),
+    windowEnd: z.string().describe('ISO Date String'),
+    edgeType: z.string().optional(),
+    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()),
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const s = new Date(context.windowStart).getTime();
+    const e = new Date(context.windowEnd).getTime();
+    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
+    return { neighborIds };
+  },
+});
+
 export const contentRetrievalTool = createTool({
   id: 'content-retrieval',
   description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',

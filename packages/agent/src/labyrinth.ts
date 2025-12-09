@@ -8,12 +8,11 @@ import type {
   JudgePrompt,
   CorrelationResult,
   TimeContext,
-  DomainConfig
+  DomainConfig,
+  MastraAgent
 } from './types';
 import { randomUUID } from 'crypto';
 
-// Mastra Imports
-import { mastra } from './mastra';
 import { setGraphInstance } from './lib/graph-instance';
 
 // Tools / Helpers
@@ -42,9 +41,14 @@ export class Labyrinth {
 
   constructor(
     private graph: QuackGraph,
+    private agents: {
+      scout: MastraAgent;
+      judge: MastraAgent;
+      router: MastraAgent;
+    },
     private config: AgentConfig
   ) {
-    // Initialize Graph Singleton for Mastra
+    // Initialize Graph Singleton for tool access if needed
     setGraphInstance(graph);
 
     this.tools = new GraphTools(graph);
@@ -77,31 +81,31 @@ export class Labyrinth {
     const startTime = Date.now();
 
     // --- Phase 0: Context Firewall (Routing) ---
-    // Using Mastra Router Agent
     const availableDomains = this.registry.getAllDomains();
-    const routerAgent = mastra.getAgent('routerAgent');
     let activeDomain = 'global';
 
     if (availableDomains.length > 1) {
-        const domainDescriptions = availableDomains
-            .map(d => `- "${d.name}": ${d.description}`)
-            .join('\n');
-        
-        const routerPrompt = `
+      const domainDescriptions = availableDomains
+        .map(d => `- "${d.name}": ${d.description}`)
+        .join('\n');
+
+      const routerPrompt = `
           Goal: "${goal}"
           Available Domains (Lenses):
           ${domainDescriptions}
         `;
-        
-        try {
-            const res = await routerAgent.generate(routerPrompt);
-            const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
-            const decision = JSON.parse(jsonStr);
-            const valid = availableDomains.find(d => d.name.toLowerCase() === decision.domain.toLowerCase());
-            if (valid) activeDomain = decision.domain;
-        } catch (e) {
-            console.warn("Routing failed, defaulting to global", e);
-        }
+
+      try {
+        const res = await this.agents.router.generate(routerPrompt, { signal: rootSignal });
+        const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+        const decision = JSON.parse(jsonStr);
+        const valid = availableDomains.find(
+          d => d.name.toLowerCase() === decision.domain.toLowerCase()
+        );
+        if (valid) activeDomain = decision.domain;
+      } catch (e) {
+        if (!rootSignal.aborted) console.warn('Routing failed, defaulting to global', e);
+      }
     }
 
     // Resolve effective timestamp (passed context > graph context > current)
@@ -110,7 +114,9 @@ export class Labyrinth {
 
     const timeDesc = effectiveAsOf
       ? `As of: ${effectiveAsOf.toISOString()}`
-      : (timeContext?.windowStart ? `Window: ${timeContext.windowStart.toISOString()} - ${timeContext.windowEnd?.toISOString()}` : undefined);
+      : timeContext?.windowStart
+        ? `Window: ${timeContext.windowStart.toISOString()} - ${timeContext.windowEnd?.toISOString()}`
+        : undefined;
 
     const log: TraceLog = {
       traceId,
@@ -128,7 +134,7 @@ export class Labyrinth {
     // Vector Genesis
     if (typeof start === 'object' && 'query' in start) {
       if (!this.config.embeddingProvider) {
-        throw new Error("Vector Genesis requires an embeddingProvider in AgentConfig.");
+        throw new Error('Vector Genesis requires an embeddingProvider in AgentConfig.');
       }
       const vector = await this.config.embeddingProvider.embed(start.query);
       // Get top 3 relevant start nodes
@@ -136,6 +142,11 @@ export class Labyrinth {
       startNodes = matches.map(m => m.id);
     } else {
       startNodes = [start as string];
+    }
+
+    if (startNodes.length === 0) {
+        log.outcome = 'EXHAUSTED';
+        return null;
     }
 
     // Initialize Root Cursor
@@ -151,34 +162,31 @@ export class Labyrinth {
     const maxHops = this.config.maxHops || 10;
     const maxCursors = this.config.maxCursors || 3;
     let globalStepCounter = 0;
-    let foundArtifact: LabyrinthArtifact | null = null;
+    // biome-ignore lint/suspicious/noExplicitAny: internal result carrier
+    let foundArtifact: { type: 'FOUND'; artifact: LabyrinthArtifact; finalStepId: number } | null = null;
 
-    // Mastra Agents
-    const scoutAgent = mastra.getAgent('scoutAgent');
-    const judgeAgent = mastra.getAgent('judgeAgent');
-
-    // Speculative Execution: We use a local controller for the batch to kill peers if winner found
+    // Speculative Execution Loop
     try {
-      // Main Loop: While we have active cursors and haven't found the answer
       while (cursors.length > 0 && !foundArtifact && !rootSignal.aborted) {
         const nextCursors: Cursor[] = [];
         const processingPromises: Promise<void>[] = [];
 
-        // We wrap the iteration to allow for "Race" logic (checking foundArtifact)
-
         for (const cursor of cursors) {
-          if (foundArtifact) break; // Early exit check
+          if (foundArtifact || rootSignal.aborted) break;
 
           const task = async () => {
-            if (foundArtifact) return; // Double check inside async
+            if (foundArtifact || rootSignal.aborted) return;
 
             // Pruning: Max Depth
             if (cursor.stepCount >= maxHops) return;
 
             // 1. Context Awareness (LOD 1)
-            const nodeMeta = await this.graph.match([])
+            const nodeMeta = await this.graph
+              .match([])
               .where({ id: cursor.currentNodeId })
-              .select('id, labels, date_diff(\'us\', \'1970-01-01\'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from_micros');
+              .select(
+                "id, labels, date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from_micros"
+              );
 
             if (nodeMeta.length === 0) return; // Node lost/deleted
             // biome-ignore lint/suspicious/noExplicitAny: raw sql result
@@ -186,19 +194,25 @@ export class Labyrinth {
             if (!currentNode) return;
 
             // 2. Sector Scan (LOD 0) - Enhanced Satellite View
-            const domainConfig = this.registry.getDomain(activeDomain);
-            let allowedEdges: string[] | undefined;
+            // Governance: Get effective whitelist
+            const allowedEdges = this.registry.getValidEdges(activeDomain);
 
-            if (domainConfig && domainConfig.name !== 'global' && domainConfig.allowedEdges.length > 0) {
-              allowedEdges = domainConfig.allowedEdges;
-            }
-
-            const sectorSummary = await this.tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+            const sectorSummary = await this.tools.getSectorSummary(
+              [cursor.currentNodeId],
+              asOfTs,
+              allowedEdges
+            );
             const summaryList = sectorSummary
-                .map(s => `- ${s.edgeType}: ${s.count} nodes${(s.avgHeat ?? 0) > 50 ? ' 🔥' : ''}`)
-                .join('\n');
+              .map(
+                s => `- ${s.edgeType}: ${s.count} nodes${(s.avgHeat ?? 0) > 50 ? ' 🔥' : ''}`
+              )
+              .join('\n');
 
-            // 3. Ask Scout (Mastra)
+            const validMovesText = allowedEdges
+              ? `Valid Moves for ${activeDomain}: [${allowedEdges.join(', ')}]`
+              : 'Valid Moves: ALL';
+
+            // 3. Ask Scout
             const scoutPrompt = `
               Goal: "${goal}"
               activeDomain: "${activeDomain}"
@@ -206,19 +220,21 @@ export class Labyrinth {
               currentNodeLabels: ${JSON.stringify(currentNode.labels || [])}
               pathHistory: ${JSON.stringify(cursor.path)}
               timeContext: "${timeDesc || ''}"
+              ${validMovesText}
               
               Satellite View (Available Moves):
               ${summaryList}
             `;
 
+            // biome-ignore lint/suspicious/noExplicitAny: decision blob
             let decision: any;
             try {
-                const res = await scoutAgent.generate(scoutPrompt);
-                const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
-                decision = JSON.parse(jsonStr);
+              const res = await this.agents.scout.generate(scoutPrompt, { signal: rootSignal });
+              const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+              decision = JSON.parse(jsonStr);
             } catch (e) {
-                console.warn("Scout failed", e);
-                return;
+              if (!rootSignal.aborted) console.warn('Scout failed to decide', e);
+              return;
             }
 
             // Register Step
@@ -243,32 +259,44 @@ export class Labyrinth {
               // LOD 2: Content Retrieval
               const content = await this.tools.contentRetrieval([cursor.currentNodeId]);
 
-              // Ask Judge (Mastra)
+              // Ask Judge
               const judgePrompt = `
                 Goal: "${goal}"
                 Data: ${JSON.stringify(content)}
                 Time Context: "${timeDesc || ''}"
               `;
-              
-              try {
-                const res = await judgeAgent.generate(judgePrompt);
-                const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
-                const artifact = JSON.parse(jsonStr) as LabyrinthArtifact & { isAnswer: boolean };
 
-                if (artifact.isAnswer && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
-                    artifact.traceId = traceId;
-                    artifact.sources = [cursor.currentNodeId];
-                    foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any;
-                    rootController.abort();
-                    return;
+              try {
+                const res = await this.agents.judge.generate(judgePrompt, { signal: rootSignal });
+                const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+                // biome-ignore lint/suspicious/noExplicitAny: artifact shape
+                const artifact = JSON.parse(jsonStr) as any;
+
+                if (
+                  artifact.isAnswer &&
+                  artifact.confidence >= (this.config.confidenceThreshold || 0.7)
+                ) {
+                  const finalArtifact = {
+                      ...artifact,
+                      traceId,
+                      sources: [cursor.currentNodeId]
+                  };
+                  foundArtifact = { type: 'FOUND', artifact: finalArtifact, finalStepId: currentStepId };
+                  rootController.abort(); // KILL SWITCH
+                  return;
                 }
-              } catch (e) { /* ignore judge fail */ }
+              } catch (e) {
+                /* ignore judge fail */
+              }
 
               return;
-
             } else if (decision.action === 'MATCH' && decision.pattern) {
               // Structural Inference
-              const matches = await this.tools.findPattern([cursor.currentNodeId], decision.pattern, asOfTs);
+              const matches = await this.tools.findPattern(
+                [cursor.currentNodeId],
+                decision.pattern,
+                asOfTs
+              );
 
               if (matches.length > 0) {
                 const foundPaths = matches.slice(0, 3);
@@ -289,24 +317,33 @@ export class Labyrinth {
                 }
               }
               return;
-
             } else if (decision.action === 'MOVE') {
-              const moves = [];
-              if (decision.edgeType) moves.push({ edge: decision.edgeType, conf: decision.confidence });
+              // biome-ignore lint/suspicious/noExplicitAny: flexible move structure
+              const moves: any[] = [];
+              if (decision.edgeType)
+                moves.push({ edge: decision.edgeType, conf: decision.confidence });
               if (decision.alternativeMoves) {
-                for (const alt of decision.alternativeMoves) {
-                    moves.push({ edge: alt.edgeType, conf: alt.confidence });
+                // biome-ignore lint/suspicious/noExplicitAny: flexible move structure
+                for (const alt of decision.alternativeMoves as any[]) {
+                  moves.push({ edge: alt.edgeType, conf: alt.confidence });
                 }
               }
+
+              const isCausal = this.registry.isDomainCausal(activeDomain);
+              const minValidFrom = isCausal
+                ? cursor.lastTimestamp || currentNode.valid_from_micros
+                : undefined;
 
               for (const move of moves) {
                 if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
                 if (!this.registry.isEdgeAllowed(activeDomain, move.edge)) continue;
-                
-                const isCausal = this.registry.isDomainCausal(activeDomain);
-                const minValidFrom = isCausal ? (cursor.lastTimestamp || currentNode.valid_from_micros) : undefined;
 
-                const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs, minValidFrom);
+                const nextNodes = await this.tools.topologyScan(
+                  [cursor.currentNodeId],
+                  move.edge,
+                  asOfTs,
+                  minValidFrom
+                );
 
                 if (nextNodes.length > 0) {
                   const targets = nextNodes.slice(0, 3);
@@ -319,7 +356,7 @@ export class Labyrinth {
                       stepCount: cursor.stepCount + 1,
                       confidence: cursor.confidence * move.conf,
                       parentId: currentStepId,
-                      lastEdgeType: move.edge,
+                      lastEdgeType: move.edge
                     });
                   }
                 }
@@ -331,22 +368,11 @@ export class Labyrinth {
           processingPromises.push(task());
         }
 
-        await Promise.all(processingPromises);
+        // Wait for batch to settle, but we might have aborted early
+        await Promise.allSettled(processingPromises);
 
-        // Check results
-        // biome-ignore lint/suspicious/noExplicitAny: hack for race result
-        const res = foundArtifact as any;
-        if (res && res.type === 'FOUND') {
-          log.outcome = 'FOUND';
-          const artifact = res.artifact as LabyrinthArtifact;
-          log.finalArtifact = artifact;
-
-          if (res.finalStepId !== undefined) {
-            const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
-            await this.tools.reinforcePath(winningTrace);
-          }
-
-          return artifact;
+        if (foundArtifact) {
+            break;
         }
 
         // Pruning
@@ -355,8 +381,21 @@ export class Labyrinth {
       }
     } finally {
       if (!foundArtifact && !rootSignal.aborted) {
-        rootController.abort();
+        rootController.abort(); // Cleanup
       }
+    }
+
+    if (foundArtifact) {
+      log.outcome = 'FOUND';
+      const fa = foundArtifact as { type: 'FOUND'; artifact: LabyrinthArtifact; finalStepId: number };
+      log.finalArtifact = fa.artifact;
+
+      if (fa.finalStepId !== undefined) {
+        const winningTrace = this.reconstructPath(log.steps, fa.finalStepId);
+        // Reinforce with quality score
+        await this.tools.reinforcePath(winningTrace, fa.artifact.confidence);
+      }
+      return fa.artifact;
     }
 
     if (log.outcome !== 'FOUND') {
@@ -368,6 +407,15 @@ export class Labyrinth {
 
   getTrace(traceId: string): TraceLog | undefined {
     return this.traces.get(traceId);
+  }
+  
+  /**
+   * Returns a JSON-serializable version of the trace for debugging or frontend rendering.
+   */
+  getTraceJSON(traceId: string): string | undefined {
+      const trace = this.traces.get(traceId);
+      if(!trace) return undefined;
+      return JSON.stringify(trace, null, 2);
   }
 
   private reconstructPath(allSteps: TraceStep[], finalStepId: number): TraceStep[] {
@@ -390,14 +438,11 @@ export class Labyrinth {
   }
 
   // --- Wrapper for Chronos ---
-  async analyzeCorrelation(anchorNodeId: string, targetLabel: string, windowMinutes: number): Promise<CorrelationResult> {
+  async analyzeCorrelation(
+    anchorNodeId: string,
+    targetLabel: string,
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
     return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
-  }
-
-  // --- Wrapper for Metabolism Workflow ---
-  async dream(criteria: { minAgeDays: number; targetLabel: string }) {
-    const workflow = mastra.getWorkflow('metabolismWorkflow');
-    if (!workflow) throw new Error('Metabolism workflow not found');
-    return await workflow.execute({ triggerData: criteria });
   }
 }

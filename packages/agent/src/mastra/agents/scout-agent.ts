@@ -1,5 +1,5 @@
 import { Agent } from '@mastra/core/agent';
-import { sectorScanTool, topologyScanTool } from '../tools';
+import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
 
 export const scoutAgent = new Agent({
   name: 'Scout Agent',
@@ -40,6 +40,7 @@ export const scoutAgent = new Agent({
   },
   tools: {
     sectorScanTool,
-    topologyScanTool
+    topologyScanTool,
+    temporalScanTool
   }
 });

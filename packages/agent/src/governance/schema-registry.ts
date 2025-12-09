@@ -8,12 +8,17 @@ export class SchemaRegistry {
     this.register({
       name: 'global',
       description: 'Unrestricted access to the entire topology.',
-      allowedEdges: [] // Empty means ALL allowed in our logic, or handled as special case
+      allowedEdges: [], // Empty means ALL allowed
+      excludedEdges: []
     });
   }
 
   register(config: DomainConfig) {
     this.domains.set(config.name.toLowerCase(), config);
+  }
+
+  loadFromConfig(configs: DomainConfig[]) {
+    configs.forEach(c => this.register(c));
   }
 
   getDomain(name: string): DomainConfig | undefined {
@@ -31,11 +36,26 @@ export class SchemaRegistry {
    */
   isEdgeAllowed(domainName: string, edgeType: string): boolean {
     const domain = this.domains.get(domainName.toLowerCase());
-    if (!domain) return true; // Fallback to permissive
-    if (domain.name === 'global') return true;
-    if (domain.allowedEdges.length === 0) return true; // Empty whitelist = all allowed? Or none? Usually global handles all.
+    if (!domain) return true;
     
-    return domain.allowedEdges.includes(edgeType);
+    // 1. Check Exclusion (Blacklist)
+    if (domain.excludedEdges?.includes(edgeType)) return false;
+
+    // 2. Check Inclusion (Whitelist)
+    if (domain.allowedEdges.length > 0) {
+      return domain.allowedEdges.includes(edgeType);
+    }
+
+    // 3. Default Permissive
+    return true;
+  }
+
+  getValidEdges(domainName: string): string[] | undefined {
+    const domain = this.domains.get(domainName.toLowerCase());
+    if (!domain || (domain.allowedEdges.length === 0 && (!domain.excludedEdges || domain.excludedEdges.length === 0))) {
+      return undefined; // All allowed
+    }
+    return domain.allowedEdges;
   }
 
   /**
