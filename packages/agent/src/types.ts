@@ -7,6 +7,8 @@ export enum ZoomLevel {
 // Type alias for Mastra Agent - imports the actual Agent type from @mastra/core
 import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { Metric } from '@mastra/core/eval';
+import { z } from 'zod';
+import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from './agent-schemas';
 
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
@@ -42,11 +44,7 @@ export interface RouterPrompt {
   availableDomains: DomainConfig[];
 }
 
-export interface RouterDecision {
-  domain: string;
-  confidence: number;
-  reasoning: string;
-}
+export type RouterDecision = z.infer<typeof RouterDecisionSchema>;
 
 // --- Scout ---
 
@@ -62,19 +60,7 @@ export interface SectorSummary {
   avgHeat?: number;
 }
 
-export interface ScoutDecision {
-  action: 'MOVE' | 'CHECK' | 'ABORT' | 'MATCH';
-  edgeType?: string; // Required if action is MOVE
-  pattern?: { srcVar: number; tgtVar: number; edgeType: string; direction?: string }[]; // Required if action is MATCH
-  targetLabels?: string[]; // Optional filter for the move
-  confidence: number;
-  reasoning: string;
-  alternativeMoves?: {
-    edgeType: string;
-    confidence: number;
-    reasoning: string;
-  }[];
-}
+export type ScoutDecision = z.infer<typeof ScoutDecisionSchema>;
 
 export interface ScoutPrompt {
   goal: string;
@@ -93,30 +79,6 @@ export interface JudgePrompt {
 }
 
 // --- Traces ---
-
-export interface TraceStep {
-  stepId: number;
-  parentId?: number;
-  cursorId: string;
-  incomingEdge?: string;
-  nodeId: string; // Source node where decision was made
-  source: string;
-  target?: string; // Resulting node if MOVE
-  action: 'MOVE' | 'CHECK' | 'MATCH';
-  decision: ScoutDecision;
-  reasoning: string;
-  timestamp: number;
-}
-
-export interface TraceLog {
-  traceId: string;
-  goal: string;
-  activeDomain: string;
-  startTime: number;
-  steps: TraceStep[];
-  outcome: 'FOUND' | 'EXHAUSTED' | 'ABORTED';
-  finalArtifact?: LabyrinthArtifact;
-}
 
 export interface LabyrinthArtifact {
   answer: string;

@@ -26,7 +26,14 @@
 //"README.md",
 //"test-docs/"
 //"test/",
-//"test-docs/unit.test-plan.md"
+//"test-docs/unit.test-plan.
+         "packages/agent/src/labyrinth.ts",
+  "packages/agent/src/mastra/agents/judge-agent.ts",
+  "packages/agent/src/mastra/agents/router-agent.ts",
+  "packages/agent/src/mastra/agents/scout-agent.ts",
+  "packages/agent/src/mastra/workflows/metabolism-workflow.ts",
+  "packages/agent/src/tools/graph-tools.ts",
+  "packages/agent/src/types.ts"
 ],
   "ignore": {
     "useGitignore": true,

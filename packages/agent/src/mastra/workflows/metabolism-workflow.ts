@@ -2,6 +2,7 @@ import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { randomUUID } from 'crypto';
+import { JudgeDecisionSchema } from '../../agent-schemas';
 
 // Step 1: Identify Candidates
 const identifyCandidates = createStep({
@@ -62,13 +63,16 @@ const synthesizeInsight = createStep({
       Data: ${JSON.stringify(inputData.candidatesContent)}
     `;
 
-    const response = await judge.generate(prompt);
+    const response = await judge.generate(prompt, {
+      structuredOutput: {
+        schema: JudgeDecisionSchema
+      }
+    });
     let summaryText = '';
 
     try {
-      const jsonStr = response.text.match(/\{[\s\S]*\}/)?.[0] || response.text;
-      const result = JSON.parse(jsonStr);
-      if (result.isAnswer || result.answer) {
+      const result = response.object;
+      if (result && (result.isAnswer || result.answer)) {
         summaryText = result.answer;
       }
     } catch (e) {

@@ -10,13 +10,6 @@ export const routerAgent = new Agent({
     Input provided:
     - Goal: User query.
     - Available Domains: List of domains and descriptions.
-    
-    Return ONLY a JSON object:
-    {
-      "domain": string,
-      "confidence": number,
-      "reasoning": string
-    }
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',

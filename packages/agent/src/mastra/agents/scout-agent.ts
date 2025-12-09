@@ -22,16 +22,6 @@ export const scoutAgent = new Agent({
     - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
     - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
     - **Abort:** If stuck, action: "ABORT".
-    
-    Return ONLY a JSON object matching this schema:
-    { 
-      "action": "MOVE" | "CHECK" | "ABORT" | "MATCH", 
-      "edgeType": string (optional), 
-      "confidence": number (0-1), 
-      "reasoning": string,
-      "pattern": array (optional),
-      "alternativeMoves": array (optional)
-    }
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',

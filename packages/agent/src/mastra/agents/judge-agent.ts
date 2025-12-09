@@ -11,13 +11,6 @@ export const judgeAgent = new Agent({
     - Time Context: Relevant timeframe.
     
     Task: Determine if the data answers the goal.
-    
-    Return ONLY a JSON object:
-    { 
-      "isAnswer": boolean, 
-      "answer": string (The synthesized answer), 
-      "confidence": number (0-1) 
-    }
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',
