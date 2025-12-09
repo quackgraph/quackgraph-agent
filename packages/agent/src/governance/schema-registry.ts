@@ -37,4 +37,12 @@ export class SchemaRegistry {
     
     return domain.allowedEdges.includes(edgeType);
   }
+
+  /**
+   * Returns true if the domain requires causal (monotonic) time traversal.
+   */
+  isDomainCausal(domainName: string): boolean {
+    const domain = this.domains.get(domainName.toLowerCase());
+    return !!domain?.isCausal;
+  }
 }

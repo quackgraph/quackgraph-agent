@@ -29,6 +29,7 @@ interface Cursor {
   confidence: number;
   parentId?: number; // stepId of the action that led here
   lastEdgeType?: string; // Edge taken to reach currentNodeId
+  lastTimestamp?: number; // Microseconds timestamp of the current node (for Causal enforcement)
 }
 
 export class Labyrinth {
@@ -153,12 +154,14 @@ export class Labyrinth {
             if (cursor.stepCount >= maxHops) return;
 
             // 1. Context Awareness (LOD 1)
+            // We use raw SQL selection to get the valid_from timestamp for Causal Logic
             const nodeMeta = await this.graph.match([])
               .where({ id: cursor.currentNodeId })
-              .select(n => ({ id: n.id, labels: n.labels }));
+              .select('id, labels, date_diff(\'us\', \'1970-01-01\'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from_micros');
 
             if (nodeMeta.length === 0) return; // Node lost/deleted
-            const currentNode = nodeMeta[0];
+            // biome-ignore lint/suspicious/noExplicitAny: raw sql result
+            const currentNode = nodeMeta[0] as any;
             if (!currentNode) return; // Satisfy noUncheckedIndexedAccess
 
             // 2. Sector Scan (LOD 0) - Enhanced Satellite View
@@ -282,9 +285,14 @@ export class Labyrinth {
                   // If Scout tries to move on a forbidden edge (despite firewall in prompt), block it.
                   continue;
                 }
+                
+                // Causal / Monotonic Enforcement
+                const isCausal = this.registry.isDomainCausal(activeDomain);
+                // If causal, we only traverse edges/nodes that happened AFTER or AT the same time as current
+                const minValidFrom = isCausal ? (cursor.lastTimestamp || currentNode.valid_from_micros) : undefined;
 
                 // LOD 1: Topology Scan
-                const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs);
+                const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs, minValidFrom);
 
                 if (nextNodes.length > 0) {
                   // If multiple targets, we branch, taking up to 3 to prevent explosion
@@ -303,7 +311,12 @@ export class Labyrinth {
                       stepCount: cursor.stepCount + 1,
                       confidence: cursor.confidence * move.conf,
                       parentId: currentStepId,
-                      lastEdgeType: move.edge
+                      lastEdgeType: move.edge,
+                      // For the next step, the 'lastTimestamp' is effectively the arrival time at this new node
+                      // But strictly, we should fetch the target node's timestamp in the next loop iteration.
+                      // However, to be safe, we can carry forward the current node's timestamp as a floor if needed.
+                      // Actually, 'minValidFrom' ensures the EDGE is valid > T. The target node itself has its own valid_from.
+                      // We don't set lastTimestamp here; it will be fetched in the next iteration for that node.
                     });
                   }
                 }

@@ -25,6 +25,8 @@ export interface DomainConfig {
   name: string;
   description: string;
   allowedEdges: string[]; // Whitelist of edge types visible to the Scout
+  // If true, traversal enforces Monotonic Time (Next Event >= Current Event)
+  isCausal?: boolean;
 }
 
 export interface RouterPrompt {

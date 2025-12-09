@@ -23,8 +23,8 @@ export class GraphTools {
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number): Promise<string[]> {
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
+  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, minValidFrom?: number): Promise<string[]> {
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf, minValidFrom);
   }
 
   /**

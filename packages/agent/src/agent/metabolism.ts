@@ -42,19 +42,21 @@ export class Metabolism {
 
     // 3. Identification of Anchor (Parent)
     const candidateIds = candidates.map((c) => c.id);
-    const potentialParents = await this.graph.native.traverse(
+    
+    // Find ALL parents (incoming edges) to preserve topology
+    const allParents = await this.graph.native.traverse(
       candidateIds,
       undefined,
       'in',
       undefined,
       undefined
     );
+    
+    // Filter out internal parents (nodes that are part of the cluster being summarized)
+    const candidateSet = new Set(candidateIds);
+    const externalParents = allParents.filter(p => !candidateSet.has(p));
 
-    if (potentialParents.length === 0) return; // Orphaned
-
-    // Use the first parent found as the anchor for the summary
-    const anchorId = potentialParents[0];
-    if (!anchorId) return; // Satisfy noUncheckedIndexedAccess
+    if (externalParents.length === 0) return; // Orphaned cluster, maybe okay to summarize but risky to detach.
 
     // 4. Rewire & Prune
     const summaryId = `summary:${randomUUID()}`;
@@ -66,7 +68,12 @@ export class Metabolism {
     };
 
     await this.graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
-    await this.graph.addEdge(anchorId, summaryId, 'HAS_SUMMARY');
+
+    // Link ALL external parents to this new summary
+    // This maintains the graph structure: (Parents) -> (Summary) instead of (Parents) -> (Raw Nodes)
+    for (const parentId of externalParents) {
+      await this.graph.addEdge(parentId, summaryId, 'HAS_SUMMARY');
+    }
 
     // Soft delete raw nodes
     for (const id of candidateIds) {
