@@ -12,12 +12,13 @@ import type {
 } from './types';
 import { randomUUID } from 'crypto';
 
-import { Scout } from './agent/scout';
-import { Judge } from './agent/judge';
+// Mastra Imports
+import { mastra } from './mastra';
+import { setGraphInstance } from './lib/graph-instance';
+
+// Tools / Helpers
 import { Chronos } from './agent/chronos';
 import { GraphTools } from './tools/graph-tools';
-import { Metabolism } from './agent/metabolism';
-import { Router } from './agent/router';
 import { SchemaRegistry } from './governance/schema-registry';
 
 interface Cursor {
@@ -35,26 +36,21 @@ interface Cursor {
 export class Labyrinth {
   private traces = new Map<string, TraceLog>();
 
-  public scout: Scout;
-  public judge: Judge;
   public chronos: Chronos;
   public tools: GraphTools;
-  public metabolism: Metabolism;
-  public router: Router;
   public registry: SchemaRegistry;
 
   constructor(
     private graph: QuackGraph,
     private config: AgentConfig
   ) {
-    this.scout = new Scout(config);
-    this.judge = new Judge(config);
+    // Initialize Graph Singleton for Mastra
+    setGraphInstance(graph);
+
     this.tools = new GraphTools(graph);
     this.chronos = new Chronos(graph, this.tools);
-    this.metabolism = new Metabolism(graph, this.judge);
 
     // Governance
-    this.router = new Router(config);
     this.registry = new SchemaRegistry();
   }
 
@@ -81,10 +77,32 @@ export class Labyrinth {
     const startTime = Date.now();
 
     // --- Phase 0: Context Firewall (Routing) ---
-    // Before we start walking, decide WHICH domain we are walking in.
+    // Using Mastra Router Agent
     const availableDomains = this.registry.getAllDomains();
-    const route = await this.router.route(goal, availableDomains, rootSignal);
-    const activeDomain = route.domain;
+    const routerAgent = mastra.getAgent('routerAgent');
+    let activeDomain = 'global';
+
+    if (availableDomains.length > 1) {
+        const domainDescriptions = availableDomains
+            .map(d => `- "${d.name}": ${d.description}`)
+            .join('\n');
+        
+        const routerPrompt = `
+          Goal: "${goal}"
+          Available Domains (Lenses):
+          ${domainDescriptions}
+        `;
+        
+        try {
+            const res = await routerAgent.generate(routerPrompt);
+            const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+            const decision = JSON.parse(jsonStr);
+            const valid = availableDomains.find(d => d.name.toLowerCase() === decision.domain.toLowerCase());
+            if (valid) activeDomain = decision.domain;
+        } catch (e) {
+            console.warn("Routing failed, defaulting to global", e);
+        }
+    }
 
     // Resolve effective timestamp (passed context > graph context > current)
     const effectiveAsOf = timeContext?.asOf || this.graph.context.asOf;
@@ -135,6 +153,10 @@ export class Labyrinth {
     let globalStepCounter = 0;
     let foundArtifact: LabyrinthArtifact | null = null;
 
+    // Mastra Agents
+    const scoutAgent = mastra.getAgent('scoutAgent');
+    const judgeAgent = mastra.getAgent('judgeAgent');
+
     // Speculative Execution: We use a local controller for the batch to kill peers if winner found
     try {
       // Main Loop: While we have active cursors and haven't found the answer
@@ -154,7 +176,6 @@ export class Labyrinth {
             if (cursor.stepCount >= maxHops) return;
 
             // 1. Context Awareness (LOD 1)
-            // We use raw SQL selection to get the valid_from timestamp for Causal Logic
             const nodeMeta = await this.graph.match([])
               .where({ id: cursor.currentNodeId })
               .select('id, labels, date_diff(\'us\', \'1970-01-01\'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from_micros');
@@ -162,11 +183,9 @@ export class Labyrinth {
             if (nodeMeta.length === 0) return; // Node lost/deleted
             // biome-ignore lint/suspicious/noExplicitAny: raw sql result
             const currentNode = nodeMeta[0] as any;
-            if (!currentNode) return; // Satisfy noUncheckedIndexedAccess
+            if (!currentNode) return;
 
             // 2. Sector Scan (LOD 0) - Enhanced Satellite View
-
-            // CONTEXT FIREWALL: Push filtering down to Rust
             const domainConfig = this.registry.getDomain(activeDomain);
             let allowedEdges: string[] | undefined;
 
@@ -175,19 +194,32 @@ export class Labyrinth {
             }
 
             const sectorSummary = await this.tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+            const summaryList = sectorSummary
+                .map(s => `- ${s.edgeType}: ${s.count} nodes${(s.avgHeat ?? 0) > 50 ? ' 🔥' : ''}`)
+                .join('\n');
 
-            // 3. Ask Scout
-            const prompt: ScoutPrompt = {
-              goal,
-              activeDomain,
-              currentNodeId: currentNode.id,
-              currentNodeLabels: currentNode.labels || [],
-              sectorSummary,
-              pathHistory: cursor.path,
-              timeContext: timeDesc
-            };
+            // 3. Ask Scout (Mastra)
+            const scoutPrompt = `
+              Goal: "${goal}"
+              activeDomain: "${activeDomain}"
+              currentNodeId: "${currentNode.id}"
+              currentNodeLabels: ${JSON.stringify(currentNode.labels || [])}
+              pathHistory: ${JSON.stringify(cursor.path)}
+              timeContext: "${timeDesc || ''}"
+              
+              Satellite View (Available Moves):
+              ${summaryList}
+            `;
 
-            const decision = await this.scout.decide(prompt, rootSignal);
+            let decision: any;
+            try {
+                const res = await scoutAgent.generate(scoutPrompt);
+                const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+                decision = JSON.parse(jsonStr);
+            } catch (e) {
+                console.warn("Scout failed", e);
+                return;
+            }
 
             // Register Step
             const currentStepId = globalStepCounter++;
@@ -198,7 +230,7 @@ export class Labyrinth {
               nodeId: cursor.currentNodeId,
               source: cursor.currentNodeId,
               incomingEdge: cursor.lastEdgeType,
-              action: decision.action as 'MOVE' | 'CHECK' | 'MATCH',
+              action: decision.action,
               decision,
               reasoning: decision.reasoning,
               timestamp: Date.now()
@@ -211,26 +243,27 @@ export class Labyrinth {
               // LOD 2: Content Retrieval
               const content = await this.tools.contentRetrieval([cursor.currentNodeId]);
 
-              // Ask Judge
-              const judgePrompt: JudgePrompt = {
-                goal,
-                nodeContent: content,
-                timeContext: timeDesc
-              };
-              const artifact = await this.judge.evaluate(judgePrompt, rootSignal);
+              // Ask Judge (Mastra)
+              const judgePrompt = `
+                Goal: "${goal}"
+                Data: ${JSON.stringify(content)}
+                Time Context: "${timeDesc || ''}"
+              `;
+              
+              try {
+                const res = await judgeAgent.generate(judgePrompt);
+                const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
+                const artifact = JSON.parse(jsonStr) as LabyrinthArtifact & { isAnswer: boolean };
 
-              if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
-                // Success found by this cursor!
-                artifact.traceId = traceId;
-                artifact.sources = [cursor.currentNodeId];
+                if (artifact.isAnswer && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
+                    artifact.traceId = traceId;
+                    artifact.sources = [cursor.currentNodeId];
+                    foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any;
+                    rootController.abort();
+                    return;
+                }
+              } catch (e) { /* ignore judge fail */ }
 
-                // Set global found flag to stop other cursors
-                foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any;
-                rootController.abort(); // Kill other pending scouts in this batch
-                return;
-              }
-
-              // If Judge rejects, this path ends here.
               return;
 
             } else if (decision.action === 'MATCH' && decision.pattern) {
@@ -238,21 +271,17 @@ export class Labyrinth {
               const matches = await this.tools.findPattern([cursor.currentNodeId], decision.pattern, asOfTs);
 
               if (matches.length > 0) {
-                // Pattern found! Jump to the end of the matched paths.
-                // matches is Vec<Vec<string>> (list of paths)
-                // We take up to 3 matches to spawn cursors
                 const foundPaths = matches.slice(0, 3);
-
                 for (const path of foundPaths) {
-                  const endNode = path[path.length - 1]; // Jump to end of pattern
+                  const endNode = path[path.length - 1];
                   if (endNode) {
                     nextCursors.push({
                       id: randomUUID(),
                       currentNodeId: endNode,
-                      path: [...cursor.path, ...path.slice(1)], // Append path (skipping start which is current)
-                      traceHistory: [...cursor.traceHistory, `[MATCH] Pattern Found: ${JSON.stringify(decision.pattern)}`],
-                      stepCount: cursor.stepCount + path.length - 1, // Advance step count
-                      confidence: cursor.confidence * 0.9, // Slight penalty for jump
+                      path: [...cursor.path, ...path.slice(1)],
+                      traceHistory: [...cursor.traceHistory, `[MATCH] Pattern Found`],
+                      stepCount: cursor.stepCount + path.length - 1,
+                      confidence: cursor.confidence * 0.9,
                       parentId: currentStepId,
                       lastEdgeType: 'MATCH_JUMP'
                     });
@@ -263,46 +292,25 @@ export class Labyrinth {
 
             } else if (decision.action === 'MOVE') {
               const moves = [];
-
-              // Primary Move
-              if (decision.edgeType) {
-                moves.push({ edge: decision.edgeType, conf: decision.confidence });
-              }
-
-              // Alternative Moves (Speculative Execution)
+              if (decision.edgeType) moves.push({ edge: decision.edgeType, conf: decision.confidence });
               if (decision.alternativeMoves) {
                 for (const alt of decision.alternativeMoves) {
-                  moves.push({ edge: alt.edgeType, conf: alt.confidence });
+                    moves.push({ edge: alt.edgeType, conf: alt.confidence });
                 }
               }
 
-              // Process Moves
               for (const move of moves) {
                 if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
-
-                // Double check governance (Scout hallucination check)
-                if (!this.registry.isEdgeAllowed(activeDomain, move.edge)) {
-                  // If Scout tries to move on a forbidden edge (despite firewall in prompt), block it.
-                  continue;
-                }
+                if (!this.registry.isEdgeAllowed(activeDomain, move.edge)) continue;
                 
-                // Causal / Monotonic Enforcement
                 const isCausal = this.registry.isDomainCausal(activeDomain);
-                // If causal, we only traverse edges/nodes that happened AFTER or AT the same time as current
                 const minValidFrom = isCausal ? (cursor.lastTimestamp || currentNode.valid_from_micros) : undefined;
 
-                // LOD 1: Topology Scan
                 const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs, minValidFrom);
 
                 if (nextNodes.length > 0) {
-                  // If multiple targets, we branch, taking up to 3 to prevent explosion
                   const targets = nextNodes.slice(0, 3);
-
                   for (const target of targets) {
-                    if (move.edge === decision.edgeType && target === nextNodes[0]) {
-                      step.target = target;
-                    }
-
                     nextCursors.push({
                       id: randomUUID(),
                       currentNodeId: target,
@@ -312,11 +320,6 @@ export class Labyrinth {
                       confidence: cursor.confidence * move.conf,
                       parentId: currentStepId,
                       lastEdgeType: move.edge,
-                      // For the next step, the 'lastTimestamp' is effectively the arrival time at this new node
-                      // But strictly, we should fetch the target node's timestamp in the next loop iteration.
-                      // However, to be safe, we can carry forward the current node's timestamp as a floor if needed.
-                      // Actually, 'minValidFrom' ensures the EDGE is valid > T. The target node itself has its own valid_from.
-                      // We don't set lastTimestamp here; it will be fetched in the next iteration for that node.
                     });
                   }
                 }
@@ -346,13 +349,11 @@ export class Labyrinth {
           return artifact;
         }
 
-        // Pruning / Management
-        // We sort by confidence and take top N
+        // Pruning
         nextCursors.sort((a, b) => b.confidence - a.confidence);
         cursors = nextCursors.slice(0, maxCursors);
       }
     } finally {
-      // Ensure we clean up if something throws
       if (!foundArtifact && !rootSignal.aborted) {
         rootController.abort();
       }
@@ -389,8 +390,14 @@ export class Labyrinth {
   }
 
   // --- Wrapper for Chronos ---
-
   async analyzeCorrelation(anchorNodeId: string, targetLabel: string, windowMinutes: number): Promise<CorrelationResult> {
     return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
+  }
+
+  // --- Wrapper for Metabolism Workflow ---
+  async dream(criteria: { minAgeDays: number; targetLabel: string }) {
+    const workflow = mastra.getWorkflow('metabolismWorkflow');
+    if (!workflow) throw new Error('Metabolism workflow not found');
+    return await workflow.execute({ triggerData: criteria });
   }
 }

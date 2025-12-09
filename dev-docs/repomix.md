@@ -1,6 +1,21 @@
 # Directory Structure
 ```
 dev-docs/
+  mastra-test/
+    src/
+      mastra/
+        agents/
+          weather-agent.ts
+        scorers/
+          weather-scorer.ts
+        tools/
+          weather-tool.ts
+        workflows/
+          weather-workflow.ts
+        index.ts
+    .env
+    package.json
+    tsconfig.json
   MONOREPO.md
 packages/
   agent/
@@ -66,6 +81,533 @@ tsconfig.json
 ```
 
 # Files
+
+## File: dev-docs/mastra-test/src/mastra/agents/weather-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { weatherTool } from '../tools/weather-tool';
+import { scorers } from '../scorers/weather-scorer';
+
+export const weatherAgent = new Agent({
+  name: 'Weather Agent',
+  instructions: `
+      You are a helpful weather assistant that provides accurate weather information and can help planning activities based on the weather.
+
+      Your primary function is to help users get weather details for specific locations. When responding:
+      - Always ask for a location if none is provided
+      - If the location name isn't in English, please translate it
+      - If giving a location with multiple parts (e.g. "New York, NY"), use the most relevant part (e.g. "New York")
+      - Include relevant details like humidity, wind conditions, and precipitation
+      - Keep responses concise but informative
+      - If the user asks for activities and provides the weather forecast, suggest activities based on the weather forecast.
+      - If the user asks for activities, respond in the format they request.
+
+      Use the weatherTool to fetch current weather data.
+`,
+  model: 'groq/llama-3.3-70b-versatile',
+  tools: { weatherTool },
+  scorers: {
+    toolCallAppropriateness: {
+      scorer: scorers.toolCallAppropriatenessScorer,
+      sampling: {
+        type: 'ratio',
+        rate: 1,
+      },
+    },
+    completeness: {
+      scorer: scorers.completenessScorer,
+      sampling: {
+        type: 'ratio',
+        rate: 1,
+      },
+    },
+    translation: {
+      scorer: scorers.translationScorer,
+      sampling: {
+        type: 'ratio',
+        rate: 1,
+      },
+    },
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: 'file:../mastra.db', // path is relative to the .mastra/output directory
+    }),
+  }),
+});
+````
+
+## File: dev-docs/mastra-test/src/mastra/scorers/weather-scorer.ts
+````typescript
+import { z } from 'zod';
+import { createToolCallAccuracyScorerCode } from '@mastra/evals/scorers/code';
+import { createCompletenessScorer } from '@mastra/evals/scorers/code';
+import { createScorer } from '@mastra/core/scores';
+
+export const toolCallAppropriatenessScorer = createToolCallAccuracyScorerCode({
+  expectedTool: 'weatherTool',
+  strictMode: false,
+});
+
+export const completenessScorer = createCompletenessScorer();
+
+// Custom LLM-judged scorer: evaluates if non-English locations are translated appropriately
+export const translationScorer = createScorer({
+  name: 'Translation Quality',
+  description:
+    'Checks that non-English location names are translated and used correctly',
+  type: 'agent',
+  judge: {
+    model: 'groq/llama-3.3-70b-versatile',
+    instructions:
+      'You are an expert evaluator of translation quality for geographic locations. ' +
+      'Determine whether the user text mentions a non-English location and whether the assistant correctly uses an English translation of that location. ' +
+      'Be lenient with transliteration differences and diacritics. ' +
+      'Return only the structured JSON matching the provided schema.',
+  },
+})
+  .preprocess(({ run }) => {
+    const userText = (run.input?.inputMessages?.[0]?.content as string) || '';
+    const assistantText = (run.output?.[0]?.content as string) || '';
+    return { userText, assistantText };
+  })
+  .analyze({
+    description:
+      'Extract location names and detect language/translation adequacy',
+    outputSchema: z.object({
+      nonEnglish: z.boolean(),
+      translated: z.boolean(),
+      confidence: z.number().min(0).max(1).default(1),
+      explanation: z.string().default(''),
+    }),
+    createPrompt: ({ results }) => `
+            You are evaluating if a weather assistant correctly handled translation of a non-English location.
+            User text:
+            """
+            ${results.preprocessStepResult.userText}
+            """
+            Assistant response:
+            """
+            ${results.preprocessStepResult.assistantText}
+            """
+            Tasks:
+            1) Identify if the user mentioned a location that appears non-English.
+            2) If non-English, check whether the assistant used a correct English translation of that location in its response.
+            3) Be lenient with transliteration differences (e.g., accents/diacritics).
+            Return JSON with fields:
+            {
+            "nonEnglish": boolean,
+            "translated": boolean,
+            "confidence": number, // 0-1
+            "explanation": string
+            }
+        `,
+  })
+  .generateScore(({ results }) => {
+    const r = (results as any)?.analyzeStepResult || {};
+    if (!r.nonEnglish) return 1; // If not applicable, full credit
+    if (r.translated)
+      return Math.max(0, Math.min(1, 0.7 + 0.3 * (r.confidence ?? 1)));
+    return 0; // Non-English but not translated
+  })
+  .generateReason(({ results, score }) => {
+    const r = (results as any)?.analyzeStepResult || {};
+    return `Translation scoring: nonEnglish=${r.nonEnglish ?? false}, translated=${r.translated ?? false}, confidence=${r.confidence ?? 0}. Score=${score}. ${r.explanation ?? ''}`;
+  });
+
+export const scorers = {
+  toolCallAppropriatenessScorer,
+  completenessScorer,
+  translationScorer,
+};
+````
+
+## File: dev-docs/mastra-test/src/mastra/tools/weather-tool.ts
+````typescript
+import { createTool } from '@mastra/core/tools';
+import { z } from 'zod';
+
+interface GeocodingResponse {
+  results: {
+    latitude: number;
+    longitude: number;
+    name: string;
+  }[];
+}
+interface WeatherResponse {
+  current: {
+    time: string;
+    temperature_2m: number;
+    apparent_temperature: number;
+    relative_humidity_2m: number;
+    wind_speed_10m: number;
+    wind_gusts_10m: number;
+    weather_code: number;
+  };
+}
+
+export const weatherTool = createTool({
+  id: 'get-weather',
+  description: 'Get current weather for a location',
+  inputSchema: z.object({
+    location: z.string().describe('City name'),
+  }),
+  outputSchema: z.object({
+    temperature: z.number(),
+    feelsLike: z.number(),
+    humidity: z.number(),
+    windSpeed: z.number(),
+    windGust: z.number(),
+    conditions: z.string(),
+    location: z.string(),
+  }),
+  execute: async ({ context }) => {
+    return await getWeather(context.location);
+  },
+});
+
+const getWeather = async (location: string) => {
+  const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
+  const geocodingResponse = await fetch(geocodingUrl);
+  const geocodingData = (await geocodingResponse.json()) as GeocodingResponse;
+
+  if (!geocodingData.results?.[0]) {
+    throw new Error(`Location '${location}' not found`);
+  }
+
+  const { latitude, longitude, name } = geocodingData.results[0];
+
+  const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,weather_code`;
+
+  const response = await fetch(weatherUrl);
+  const data = (await response.json()) as WeatherResponse;
+
+  return {
+    temperature: data.current.temperature_2m,
+    feelsLike: data.current.apparent_temperature,
+    humidity: data.current.relative_humidity_2m,
+    windSpeed: data.current.wind_speed_10m,
+    windGust: data.current.wind_gusts_10m,
+    conditions: getWeatherCondition(data.current.weather_code),
+    location: name,
+  };
+};
+
+function getWeatherCondition(code: number): string {
+  const conditions: Record<number, string> = {
+    0: 'Clear sky',
+    1: 'Mainly clear',
+    2: 'Partly cloudy',
+    3: 'Overcast',
+    45: 'Foggy',
+    48: 'Depositing rime fog',
+    51: 'Light drizzle',
+    53: 'Moderate drizzle',
+    55: 'Dense drizzle',
+    56: 'Light freezing drizzle',
+    57: 'Dense freezing drizzle',
+    61: 'Slight rain',
+    63: 'Moderate rain',
+    65: 'Heavy rain',
+    66: 'Light freezing rain',
+    67: 'Heavy freezing rain',
+    71: 'Slight snow fall',
+    73: 'Moderate snow fall',
+    75: 'Heavy snow fall',
+    77: 'Snow grains',
+    80: 'Slight rain showers',
+    81: 'Moderate rain showers',
+    82: 'Violent rain showers',
+    85: 'Slight snow showers',
+    86: 'Heavy snow showers',
+    95: 'Thunderstorm',
+    96: 'Thunderstorm with slight hail',
+    99: 'Thunderstorm with heavy hail',
+  };
+  return conditions[code] || 'Unknown';
+}
+````
+
+## File: dev-docs/mastra-test/src/mastra/workflows/weather-workflow.ts
+````typescript
+import { createStep, createWorkflow } from '@mastra/core/workflows';
+import { z } from 'zod';
+
+const forecastSchema = z.object({
+  date: z.string(),
+  maxTemp: z.number(),
+  minTemp: z.number(),
+  precipitationChance: z.number(),
+  condition: z.string(),
+  location: z.string(),
+});
+
+function getWeatherCondition(code: number): string {
+  const conditions: Record<number, string> = {
+    0: 'Clear sky',
+    1: 'Mainly clear',
+    2: 'Partly cloudy',
+    3: 'Overcast',
+    45: 'Foggy',
+    48: 'Depositing rime fog',
+    51: 'Light drizzle',
+    53: 'Moderate drizzle',
+    55: 'Dense drizzle',
+    61: 'Slight rain',
+    63: 'Moderate rain',
+    65: 'Heavy rain',
+    71: 'Slight snow fall',
+    73: 'Moderate snow fall',
+    75: 'Heavy snow fall',
+    95: 'Thunderstorm',
+  };
+  return conditions[code] || 'Unknown';
+}
+
+const fetchWeather = createStep({
+  id: 'fetch-weather',
+  description: 'Fetches weather forecast for a given city',
+  inputSchema: z.object({
+    city: z.string().describe('The city to get the weather for'),
+  }),
+  outputSchema: forecastSchema,
+  execute: async ({ inputData }) => {
+    if (!inputData) {
+      throw new Error('Input data not found');
+    }
+
+    const geocodingUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(inputData.city)}&count=1`;
+    const geocodingResponse = await fetch(geocodingUrl);
+    const geocodingData = (await geocodingResponse.json()) as {
+      results: { latitude: number; longitude: number; name: string }[];
+    };
+
+    if (!geocodingData.results?.[0]) {
+      throw new Error(`Location '${inputData.city}' not found`);
+    }
+
+    const { latitude, longitude, name } = geocodingData.results[0];
+
+    const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=precipitation,weathercode&timezone=auto,&hourly=precipitation_probability,temperature_2m`;
+    const response = await fetch(weatherUrl);
+    const data = (await response.json()) as {
+      current: {
+        time: string;
+        precipitation: number;
+        weathercode: number;
+      };
+      hourly: {
+        precipitation_probability: number[];
+        temperature_2m: number[];
+      };
+    };
+
+    const forecast = {
+      date: new Date().toISOString(),
+      maxTemp: Math.max(...data.hourly.temperature_2m),
+      minTemp: Math.min(...data.hourly.temperature_2m),
+      condition: getWeatherCondition(data.current.weathercode),
+      precipitationChance: data.hourly.precipitation_probability.reduce(
+        (acc, curr) => Math.max(acc, curr),
+        0,
+      ),
+      location: name,
+    };
+
+    return forecast;
+  },
+});
+
+const planActivities = createStep({
+  id: 'plan-activities',
+  description: 'Suggests activities based on weather conditions',
+  inputSchema: forecastSchema,
+  outputSchema: z.object({
+    activities: z.string(),
+  }),
+  execute: async ({ inputData, mastra }) => {
+    const forecast = inputData;
+
+    if (!forecast) {
+      throw new Error('Forecast data not found');
+    }
+
+    const agent = mastra?.getAgent('weatherAgent');
+    if (!agent) {
+      throw new Error('Weather agent not found');
+    }
+
+    const prompt = `Based on the following weather forecast for ${forecast.location}, suggest appropriate activities:
+      ${JSON.stringify(forecast, null, 2)}
+      For each day in the forecast, structure your response exactly as follows:
+
+      📅 [Day, Month Date, Year]
+      ═══════════════════════════
+
+      🌡️ WEATHER SUMMARY
+      • Conditions: [brief description]
+      • Temperature: [X°C/Y°F to A°C/B°F]
+      • Precipitation: [X% chance]
+
+      🌅 MORNING ACTIVITIES
+      Outdoor:
+      • [Activity Name] - [Brief description including specific location/route]
+        Best timing: [specific time range]
+        Note: [relevant weather consideration]
+
+      🌞 AFTERNOON ACTIVITIES
+      Outdoor:
+      • [Activity Name] - [Brief description including specific location/route]
+        Best timing: [specific time range]
+        Note: [relevant weather consideration]
+
+      🏠 INDOOR ALTERNATIVES
+      • [Activity Name] - [Brief description including specific venue]
+        Ideal for: [weather condition that would trigger this alternative]
+
+      ⚠️ SPECIAL CONSIDERATIONS
+      • [Any relevant weather warnings, UV index, wind conditions, etc.]
+
+      Guidelines:
+      - Suggest 2-3 time-specific outdoor activities per day
+      - Include 1-2 indoor backup options
+      - For precipitation >50%, lead with indoor activities
+      - All activities must be specific to the location
+      - Include specific venues, trails, or locations
+      - Consider activity intensity based on temperature
+      - Keep descriptions concise but informative
+
+      Maintain this exact formatting for consistency, using the emoji and section headers as shown.`;
+
+    const response = await agent.stream([
+      {
+        role: 'user',
+        content: prompt,
+      },
+    ]);
+
+    let activitiesText = '';
+
+    for await (const chunk of response.textStream) {
+      process.stdout.write(chunk);
+      activitiesText += chunk;
+    }
+
+    return {
+      activities: activitiesText,
+    };
+  },
+});
+
+const weatherWorkflow = createWorkflow({
+  id: 'weather-workflow',
+  inputSchema: z.object({
+    city: z.string().describe('The city to get the weather for'),
+  }),
+  outputSchema: z.object({
+    activities: z.string(),
+  }),
+})
+  .then(fetchWeather)
+  .then(planActivities);
+
+weatherWorkflow.commit();
+
+export { weatherWorkflow };
+````
+
+## File: dev-docs/mastra-test/src/mastra/index.ts
+````typescript
+import { Mastra } from '@mastra/core/mastra';
+import { PinoLogger } from '@mastra/loggers';
+import { LibSQLStore } from '@mastra/libsql';
+import { weatherWorkflow } from './workflows/weather-workflow';
+import { weatherAgent } from './agents/weather-agent';
+import { toolCallAppropriatenessScorer, completenessScorer, translationScorer } from './scorers/weather-scorer';
+
+export const mastra = new Mastra({
+  workflows: { weatherWorkflow },
+  agents: { weatherAgent },
+  scorers: { toolCallAppropriatenessScorer, completenessScorer, translationScorer },
+  storage: new LibSQLStore({
+    // stores observability, scores, ... into memory storage, if it needs to persist, change to file:../mastra.db
+    url: ":memory:",
+  }),
+  logger: new PinoLogger({
+    name: 'Mastra',
+    level: 'info',
+  }),
+  telemetry: {
+    // Telemetry is deprecated and will be removed in the Nov 4th release
+    enabled: false, 
+  },
+  observability: {
+    // Enables DefaultExporter and CloudExporter for AI tracing
+    default: { enabled: false }, 
+  },
+});
+````
+
+## File: dev-docs/mastra-test/.env
+````
+GROQ_API_KEY=REDACTED
+````
+
+## File: dev-docs/mastra-test/package.json
+````json
+{
+  "name": "mastra-test",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "mastra": "^0.18.6"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "mastra dev",
+    "build": "mastra build",
+    "start": "mastra start"
+  },
+  "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/evals": "^0.14.4",
+    "@mastra/libsql": "^0.16.3",
+    "@mastra/loggers": "^0.10.19",
+    "@mastra/memory": "^0.15.12",
+    "@types/node": "^24.10.1",
+    "zod": "^4"
+  }
+}
+````
+
+## File: dev-docs/mastra-test/tsconfig.json
+````json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "outDir": "dist"
+  },
+  "include": [
+    "src/**/*"
+  ]
+}
+````
 
 ## File: packages/quackgraph/crates/quack_core/src/interner.rs
 ````rust
@@ -3828,86 +4370,6 @@ export class Judge {
 }
 ````
 
-## File: packages/agent/src/agent/metabolism.ts
-````typescript
-import { randomUUID } from 'crypto';
-import type { QuackGraph } from '@quackgraph/graph';
-import type { Judge } from './judge';
-import type { JudgePrompt } from '../types';
-
-export class Metabolism {
-  constructor(
-    private graph: QuackGraph,
-    private judge: Judge
-  ) { }
-
-  /**
-   * Graph Metabolism: Summarize and Prune.
-   * Identifies old, dense clusters and summarizes them into a single high-level node.
-   */
-  async dream(criteria: { minAgeDays: number; targetLabel: string }) {
-    // 1. Identify Candidates (Nodes older than X days)
-    // We process in batches to allow iterative cleanup
-    const sql = `
-      SELECT id, properties 
-      FROM nodes 
-      WHERE list_contains(labels, ?) 
-        AND valid_from < (current_timestamp - INTERVAL ${criteria.minAgeDays} DAY)
-        AND valid_to IS NULL -- Active nodes only
-      LIMIT 100 -- Batch size
-    `;
-
-    const candidates = await this.graph.db.query(sql, [criteria.targetLabel]);
-    if (candidates.length === 0) return;
-
-    // 2. Synthesize (Judge)
-    const judgePrompt: JudgePrompt = {
-      goal: `Metabolism/Dreaming: Summarize these ${candidates.length} ${criteria.targetLabel} logs into a single concise insight node. Focus on patterns and key events.`,
-      nodeContent: candidates.map((c) =>
-        typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
-      ),
-    };
-
-    const artifact = await this.judge.evaluate(judgePrompt);
-
-    if (!artifact) return; // Judge failed
-
-    // 3. Identification of Anchor (Parent)
-    const candidateIds = candidates.map((c) => c.id);
-    const potentialParents = await this.graph.native.traverse(
-      candidateIds,
-      undefined,
-      'in',
-      undefined,
-      undefined
-    );
-
-    if (potentialParents.length === 0) return; // Orphaned
-
-    // Use the first parent found as the anchor for the summary
-    const anchorId = potentialParents[0];
-    if (!anchorId) return; // Satisfy noUncheckedIndexedAccess
-
-    // 4. Rewire & Prune
-    const summaryId = `summary:${randomUUID()}`;
-    const summaryProps = {
-      content: artifact.answer,
-      source_count: candidates.length,
-      generated_at: new Date().toISOString(),
-      period_end: new Date().toISOString()
-    };
-
-    await this.graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
-    await this.graph.addEdge(anchorId, summaryId, 'HAS_SUMMARY');
-
-    // Soft delete raw nodes
-    for (const id of candidateIds) {
-      await this.graph.deleteNode(id);
-    }
-  }
-}
-````
-
 ## File: packages/agent/src/agent/router.ts
 ````typescript
 import type { AgentConfig, DomainConfig, RouterDecision } from '../types';
@@ -4038,172 +4500,6 @@ export class Scout {
 }
 ````
 
-## File: packages/agent/src/governance/schema-registry.ts
-````typescript
-import type { DomainConfig } from '../types';
-
-export class SchemaRegistry {
-  private domains = new Map<string, DomainConfig>();
-
-  constructor() {
-    // Default 'Global' domain that sees everything (fallback)
-    this.register({
-      name: 'global',
-      description: 'Unrestricted access to the entire topology.',
-      allowedEdges: [] // Empty means ALL allowed in our logic, or handled as special case
-    });
-  }
-
-  register(config: DomainConfig) {
-    this.domains.set(config.name.toLowerCase(), config);
-  }
-
-  getDomain(name: string): DomainConfig | undefined {
-    return this.domains.get(name.toLowerCase());
-  }
-
-  getAllDomains(): DomainConfig[] {
-    return Array.from(this.domains.values());
-  }
-
-  /**
-   * Returns true if the edge type is allowed within the domain.
-   * If domain is 'global' or not found, it defaults to true (permissive) 
-   * unless strict mode is desired.
-   */
-  isEdgeAllowed(domainName: string, edgeType: string): boolean {
-    const domain = this.domains.get(domainName.toLowerCase());
-    if (!domain) return true; // Fallback to permissive
-    if (domain.name === 'global') return true;
-    if (domain.allowedEdges.length === 0) return true; // Empty whitelist = all allowed? Or none? Usually global handles all.
-    
-    return domain.allowedEdges.includes(edgeType);
-  }
-}
-````
-
-## File: packages/agent/src/tools/graph-tools.ts
-````typescript
-import type { QuackGraph } from '@quackgraph/graph';
-import type { SectorSummary } from '../types';
-import type { JsPatternEdge } from '@quackgraph/native';
-
-export class GraphTools {
-  constructor(private graph: QuackGraph) { }
-
-  /**
-   * LOD 0: Sector Scan / Satellite View
-   * Returns a summary of available moves from the current nodes.
-   */
-  async getSectorSummary(currentNodes: string[], asOf?: number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
-    if (currentNodes.length === 0) return [];
-
-    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
-    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-
-    // 2. Sort by count (descending)
-    return results.sort((a, b) => b.count - a.count);
-  }
-
-  /**
-   * LOD 1: Topology Scan
-   * Returns the IDs of neighbors reachable via a specific edge type.
-   */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number): Promise<string[]> {
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
-  }
-
-  /**
-   * LOD 1: Temporal Interval Scan
-   * Finds neighbors connected via edges overlapping/contained in the window.
-   */
-  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
-  }
-
-  /**
-   * LOD 1.5: Pattern Matching (Structural Inference)
-   * Finds subgraphs matching a specific shape.
-   */
-  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], asOf?: number): Promise<string[][]> {
-    const nativePattern = pattern.map(p => ({
-      srcVar: p.srcVar || 0,
-      tgtVar: p.tgtVar || 0,
-      edgeType: p.edgeType || '',
-      direction: p.direction || 'out'
-    }));
-    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
-  }
-
-  /**
-   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
-   * If nodes are part of a document chain (NEXT/PREV), fetch context.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
-  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
-    if (nodeIds.length === 0) return [];
-
-    // 1. Fetch Primary Content
-    const primaryNodes = await this.graph.match([])
-      .where({ id: nodeIds })
-      .select();
-
-    // 2. Virtual Spine Expansion
-    // Check for "NEXT" or "PREV" connections to provide document flow context.
-    const spineContextIds = new Set<string>();
-
-    for (const id of nodeIds) {
-      // Look ahead
-      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach(nid => spineContextIds.add(nid));
-
-      // Look back
-      const prev = await this.graph.native.traverse([id], 'PREV', 'out');
-      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach(nid => spineContextIds.add(nid));
-
-      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach(nid => spineContextIds.add(nid));
-    }
-
-    // Remove duplicates (original nodes)
-    nodeIds.forEach(id => spineContextIds.delete(id));
-
-    if (spineContextIds.size > 0) {
-      const contextNodes = await this.graph.match([])
-        .where({ id: Array.from(spineContextIds) })
-        .select();
-
-      // Merge and Annotate
-      return primaryNodes.map(node => {
-        return {
-          ...node,
-          _isPrimary: true,
-          _context: contextNodes
-        };
-      });
-    }
-
-    return primaryNodes;
-  }
-
-  /**
-   * Pheromones: Reinforce a successful path by increasing edge heat.
-   */
-  async reinforcePath(trace: { source: string; incomingEdge?: string }[]) {
-    for (let i = 1; i < trace.length; i++) {
-      const prev = trace[i - 1];
-      const curr = trace[i];
-      if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
-      if (curr.incomingEdge) {
-        // Boost heat by 200 (max is 255 usually, V1 logic)
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 200);
-      }
-    }
-  }
-}
-````
-
 ## File: packages/agent/src/index.ts
 ````typescript
 export * from './labyrinth';
@@ -4215,544 +4511,6 @@ export * from './agent/chronos';
 export * from './agent/metabolism';
 export * from './governance/schema-registry';
 export * from './tools/graph-tools';
-````
-
-## File: packages/agent/src/labyrinth.ts
-````typescript
-import { QuackGraph } from '@quackgraph/graph';
-import type {
-  AgentConfig,
-  TraceStep,
-  TraceLog,
-  LabyrinthArtifact,
-  ScoutPrompt,
-  JudgePrompt,
-  CorrelationResult,
-  TimeContext,
-  DomainConfig
-} from './types';
-import { randomUUID } from 'crypto';
-
-import { Scout } from './agent/scout';
-import { Judge } from './agent/judge';
-import { Chronos } from './agent/chronos';
-import { GraphTools } from './tools/graph-tools';
-import { Metabolism } from './agent/metabolism';
-import { Router } from './agent/router';
-import { SchemaRegistry } from './governance/schema-registry';
-
-interface Cursor {
-  id: string;
-  currentNodeId: string;
-  path: string[]; // History of node IDs
-  traceHistory: string[]; // Summary of actions for context
-  stepCount: number;
-  confidence: number;
-  parentId?: number; // stepId of the action that led here
-  lastEdgeType?: string; // Edge taken to reach currentNodeId
-}
-
-export class Labyrinth {
-  private traces = new Map<string, TraceLog>();
-
-  public scout: Scout;
-  public judge: Judge;
-  public chronos: Chronos;
-  public tools: GraphTools;
-  public metabolism: Metabolism;
-  public router: Router;
-  public registry: SchemaRegistry;
-
-  constructor(
-    private graph: QuackGraph,
-    private config: AgentConfig
-  ) {
-    this.scout = new Scout(config);
-    this.judge = new Judge(config);
-    this.tools = new GraphTools(graph);
-    this.chronos = new Chronos(graph, this.tools);
-    this.metabolism = new Metabolism(graph, this.judge);
-
-    // Governance
-    this.router = new Router(config);
-    this.registry = new SchemaRegistry();
-  }
-
-  /**
-   * Register a new Domain (Semantic Lens) for the agent to use.
-   */
-  registerDomain(config: DomainConfig) {
-    this.registry.register(config);
-  }
-
-  /**
-   * Parallel Speculative Execution:
-   * Main Entry Point: Orchestrates multiple Scouts and a Judge to find an answer.
-   */
-  async findPath(
-    start: string | { query: string },
-    goal: string,
-    timeContext?: TimeContext
-  ): Promise<LabyrinthArtifact | null> {
-    const rootController = new AbortController();
-    const rootSignal = rootController.signal;
-
-    const traceId = randomUUID();
-    const startTime = Date.now();
-
-    // --- Phase 0: Context Firewall (Routing) ---
-    // Before we start walking, decide WHICH domain we are walking in.
-    const availableDomains = this.registry.getAllDomains();
-    const route = await this.router.route(goal, availableDomains, rootSignal);
-    const activeDomain = route.domain;
-
-    // Resolve effective timestamp (passed context > graph context > current)
-    const effectiveAsOf = timeContext?.asOf || this.graph.context.asOf;
-    const asOfTs = effectiveAsOf ? effectiveAsOf.getTime() * 1000 : undefined;
-
-    const timeDesc = effectiveAsOf
-      ? `As of: ${effectiveAsOf.toISOString()}`
-      : (timeContext?.windowStart ? `Window: ${timeContext.windowStart.toISOString()} - ${timeContext.windowEnd?.toISOString()}` : undefined);
-
-    const log: TraceLog = {
-      traceId,
-      goal,
-      activeDomain,
-      startTime,
-      steps: [],
-      outcome: 'ABORTED' // Default
-    };
-
-    this.traces.set(traceId, log);
-
-    let startNodes: string[] = [];
-
-    // Vector Genesis
-    if (typeof start === 'object' && 'query' in start) {
-      if (!this.config.embeddingProvider) {
-        throw new Error("Vector Genesis requires an embeddingProvider in AgentConfig.");
-      }
-      const vector = await this.config.embeddingProvider.embed(start.query);
-      // Get top 3 relevant start nodes
-      const matches = await this.graph.match([]).nearText(vector).limit(3).select();
-      startNodes = matches.map(m => m.id);
-    } else {
-      startNodes = [start as string];
-    }
-
-    // Initialize Root Cursor
-    let cursors: Cursor[] = startNodes.map(nodeId => ({
-      id: randomUUID(),
-      currentNodeId: nodeId,
-      path: [nodeId],
-      traceHistory: [`[ROUTER] Selected domain: ${activeDomain}`],
-      stepCount: 0,
-      confidence: 1.0
-    }));
-
-    const maxHops = this.config.maxHops || 10;
-    const maxCursors = this.config.maxCursors || 3;
-    let globalStepCounter = 0;
-    let foundArtifact: LabyrinthArtifact | null = null;
-
-    // Speculative Execution: We use a local controller for the batch to kill peers if winner found
-    try {
-      // Main Loop: While we have active cursors and haven't found the answer
-      while (cursors.length > 0 && !foundArtifact && !rootSignal.aborted) {
-        const nextCursors: Cursor[] = [];
-        const processingPromises: Promise<void>[] = [];
-
-        // We wrap the iteration to allow for "Race" logic (checking foundArtifact)
-
-        for (const cursor of cursors) {
-          if (foundArtifact) break; // Early exit check
-
-          const task = async () => {
-            if (foundArtifact) return; // Double check inside async
-
-            // Pruning: Max Depth
-            if (cursor.stepCount >= maxHops) return;
-
-            // 1. Context Awareness (LOD 1)
-            const nodeMeta = await this.graph.match([])
-              .where({ id: cursor.currentNodeId })
-              .select(n => ({ id: n.id, labels: n.labels }));
-
-            if (nodeMeta.length === 0) return; // Node lost/deleted
-            const currentNode = nodeMeta[0];
-            if (!currentNode) return; // Satisfy noUncheckedIndexedAccess
-
-            // 2. Sector Scan (LOD 0) - Enhanced Satellite View
-
-            // CONTEXT FIREWALL: Push filtering down to Rust
-            const domainConfig = this.registry.getDomain(activeDomain);
-            let allowedEdges: string[] | undefined;
-
-            if (domainConfig && domainConfig.name !== 'global' && domainConfig.allowedEdges.length > 0) {
-              allowedEdges = domainConfig.allowedEdges;
-            }
-
-            const sectorSummary = await this.tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
-
-            // 3. Ask Scout
-            const prompt: ScoutPrompt = {
-              goal,
-              activeDomain,
-              currentNodeId: currentNode.id,
-              currentNodeLabels: currentNode.labels || [],
-              sectorSummary,
-              pathHistory: cursor.path,
-              timeContext: timeDesc
-            };
-
-            const decision = await this.scout.decide(prompt, rootSignal);
-
-            // Register Step
-            const currentStepId = globalStepCounter++;
-            const step: TraceStep = {
-              stepId: currentStepId,
-              parentId: cursor.parentId,
-              cursorId: cursor.id,
-              nodeId: cursor.currentNodeId,
-              source: cursor.currentNodeId,
-              incomingEdge: cursor.lastEdgeType,
-              action: decision.action as 'MOVE' | 'CHECK' | 'MATCH',
-              decision,
-              reasoning: decision.reasoning,
-              timestamp: Date.now()
-            };
-            log.steps.push(step);
-            cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
-
-            // 4. Handle Decision
-            if (decision.action === 'CHECK') {
-              // LOD 2: Content Retrieval
-              const content = await this.tools.contentRetrieval([cursor.currentNodeId]);
-
-              // Ask Judge
-              const judgePrompt: JudgePrompt = {
-                goal,
-                nodeContent: content,
-                timeContext: timeDesc
-              };
-              const artifact = await this.judge.evaluate(judgePrompt, rootSignal);
-
-              if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
-                // Success found by this cursor!
-                artifact.traceId = traceId;
-                artifact.sources = [cursor.currentNodeId];
-
-                // Set global found flag to stop other cursors
-                foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any;
-                rootController.abort(); // Kill other pending scouts in this batch
-                return;
-              }
-
-              // If Judge rejects, this path ends here.
-              return;
-
-            } else if (decision.action === 'MATCH' && decision.pattern) {
-              // Structural Inference
-              const matches = await this.tools.findPattern([cursor.currentNodeId], decision.pattern, asOfTs);
-
-              if (matches.length > 0) {
-                // Pattern found! Jump to the end of the matched paths.
-                // matches is Vec<Vec<string>> (list of paths)
-                // We take up to 3 matches to spawn cursors
-                const foundPaths = matches.slice(0, 3);
-
-                for (const path of foundPaths) {
-                  const endNode = path[path.length - 1]; // Jump to end of pattern
-                  if (endNode) {
-                    nextCursors.push({
-                      id: randomUUID(),
-                      currentNodeId: endNode,
-                      path: [...cursor.path, ...path.slice(1)], // Append path (skipping start which is current)
-                      traceHistory: [...cursor.traceHistory, `[MATCH] Pattern Found: ${JSON.stringify(decision.pattern)}`],
-                      stepCount: cursor.stepCount + path.length - 1, // Advance step count
-                      confidence: cursor.confidence * 0.9, // Slight penalty for jump
-                      parentId: currentStepId,
-                      lastEdgeType: 'MATCH_JUMP'
-                    });
-                  }
-                }
-              }
-              return;
-
-            } else if (decision.action === 'MOVE') {
-              const moves = [];
-
-              // Primary Move
-              if (decision.edgeType) {
-                moves.push({ edge: decision.edgeType, conf: decision.confidence });
-              }
-
-              // Alternative Moves (Speculative Execution)
-              if (decision.alternativeMoves) {
-                for (const alt of decision.alternativeMoves) {
-                  moves.push({ edge: alt.edgeType, conf: alt.confidence });
-                }
-              }
-
-              // Process Moves
-              for (const move of moves) {
-                if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
-
-                // Double check governance (Scout hallucination check)
-                if (!this.registry.isEdgeAllowed(activeDomain, move.edge)) {
-                  // If Scout tries to move on a forbidden edge (despite firewall in prompt), block it.
-                  continue;
-                }
-
-                // LOD 1: Topology Scan
-                const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs);
-
-                if (nextNodes.length > 0) {
-                  // If multiple targets, we branch, taking up to 3 to prevent explosion
-                  const targets = nextNodes.slice(0, 3);
-
-                  for (const target of targets) {
-                    if (move.edge === decision.edgeType && target === nextNodes[0]) {
-                      step.target = target;
-                    }
-
-                    nextCursors.push({
-                      id: randomUUID(),
-                      currentNodeId: target,
-                      path: [...cursor.path, target],
-                      traceHistory: [...cursor.traceHistory],
-                      stepCount: cursor.stepCount + 1,
-                      confidence: cursor.confidence * move.conf,
-                      parentId: currentStepId,
-                      lastEdgeType: move.edge
-                    });
-                  }
-                }
-              }
-              return;
-            }
-          };
-
-          processingPromises.push(task());
-        }
-
-        await Promise.all(processingPromises);
-
-        // Check results
-        // biome-ignore lint/suspicious/noExplicitAny: hack for race result
-        const res = foundArtifact as any;
-        if (res && res.type === 'FOUND') {
-          log.outcome = 'FOUND';
-          const artifact = res.artifact as LabyrinthArtifact;
-          log.finalArtifact = artifact;
-
-          if (res.finalStepId !== undefined) {
-            const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
-            await this.tools.reinforcePath(winningTrace);
-          }
-
-          return artifact;
-        }
-
-        // Pruning / Management
-        // We sort by confidence and take top N
-        nextCursors.sort((a, b) => b.confidence - a.confidence);
-        cursors = nextCursors.slice(0, maxCursors);
-      }
-    } finally {
-      // Ensure we clean up if something throws
-      if (!foundArtifact && !rootSignal.aborted) {
-        rootController.abort();
-      }
-    }
-
-    if (log.outcome !== 'FOUND') {
-      log.outcome = 'EXHAUSTED';
-    }
-
-    return null;
-  }
-
-  getTrace(traceId: string): TraceLog | undefined {
-    return this.traces.get(traceId);
-  }
-
-  private reconstructPath(allSteps: TraceStep[], finalStepId: number): TraceStep[] {
-    const path: TraceStep[] = [];
-    let currentId: number | undefined = finalStepId;
-
-    const stepMap = new Map<number, TraceStep>();
-    for (const s of allSteps) stepMap.set(s.stepId, s);
-
-    while (currentId !== undefined) {
-      const step = stepMap.get(currentId);
-      if (step) {
-        path.unshift(step);
-        currentId = step.parentId;
-      } else {
-        break;
-      }
-    }
-    return path;
-  }
-
-  // --- Wrapper for Chronos ---
-
-  async analyzeCorrelation(anchorNodeId: string, targetLabel: string, windowMinutes: number): Promise<CorrelationResult> {
-    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
-  }
-}
-````
-
-## File: packages/agent/src/types.ts
-````typescript
-export enum ZoomLevel {
-  SECTOR = 0,    // Ghost/Satellite View: Available Moves (Schema)
-  TOPOLOGY = 1,  // Drone View: Structural Hops (IDs only)
-  CONTENT = 2    // Street View: Full JSON Data
-}
-
-export interface AgentConfig {
-  llmProvider: {
-    generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
-  };
-  maxHops?: number;
-  // Max number of concurrent exploration threads
-  maxCursors?: number;
-  // Minimum confidence to pursue a path (0.0 - 1.0)
-  confidenceThreshold?: number;
-  // Vector Genesis: Optional embedding provider for start-from-text
-  embeddingProvider?: {
-    embed: (text: string) => Promise<number[]>;
-  };
-}
-
-// --- Governance & Router ---
-
-export interface DomainConfig {
-  name: string;
-  description: string;
-  allowedEdges: string[]; // Whitelist of edge types visible to the Scout
-}
-
-export interface RouterPrompt {
-  goal: string;
-  availableDomains: DomainConfig[];
-}
-
-export interface RouterDecision {
-  domain: string;
-  confidence: number;
-  reasoning: string;
-}
-
-// --- Scout ---
-
-export interface TimeContext {
-  asOf?: Date;
-  windowStart?: Date;
-  windowEnd?: Date;
-}
-
-export interface SectorSummary {
-  edgeType: string;
-  count: number;
-  avgHeat?: number;
-}
-
-export interface ScoutDecision {
-  action: 'MOVE' | 'CHECK' | 'ABORT' | 'MATCH';
-  edgeType?: string; // Required if action is MOVE
-  pattern?: { srcVar: number; tgtVar: number; edgeType: string; direction?: string }[]; // Required if action is MATCH
-  targetLabels?: string[]; // Optional filter for the move
-  confidence: number;
-  reasoning: string;
-  alternativeMoves?: {
-    edgeType: string;
-    confidence: number;
-    reasoning: string;
-  }[];
-}
-
-export interface ScoutPrompt {
-  goal: string;
-  activeDomain: string; // The semantic domain grounding this search
-  currentNodeId: string;
-  currentNodeLabels: string[];
-  sectorSummary: SectorSummary[]; 
-  pathHistory: string[]; 
-  timeContext?: string; 
-}
-
-export interface JudgePrompt {
-  goal: string;
-  nodeContent: Record<string, any>[];
-  timeContext?: string;
-}
-
-// --- Traces ---
-
-export interface TraceStep {
-  stepId: number;
-  parentId?: number;
-  cursorId: string;
-  incomingEdge?: string;
-  nodeId: string; // Source node where decision was made
-  source: string;
-  target?: string; // Resulting node if MOVE
-  action: 'MOVE' | 'CHECK' | 'MATCH';
-  decision: ScoutDecision;
-  reasoning: string;
-  timestamp: number;
-}
-
-export interface TraceLog {
-  traceId: string;
-  goal: string;
-  activeDomain: string;
-  startTime: number;
-  steps: TraceStep[];
-  outcome: 'FOUND' | 'EXHAUSTED' | 'ABORTED';
-  finalArtifact?: LabyrinthArtifact;
-}
-
-export interface LabyrinthArtifact {
-  answer: string;
-  confidence: number;
-  traceId: string;
-  sources: string[];
-  metadata?: Record<string, any>;
-}
-
-// Temporal Logic Types
-export interface TemporalWindow {
-  anchorNodeId: string;
-  windowStart: number; // Unix timestamp
-  windowEnd: number;   // Unix timestamp
-}
-
-export interface CorrelationResult {
-  anchorLabel: string;
-  targetLabel: string;
-  windowSizeMinutes: number;
-  correlationScore: number; // 0.0 - 1.0
-  sampleSize: number;
-  description: string;
-}
-
-export interface EvolutionResult {
-  anchorNodeId: string;
-  timeline: TimeStepDiff[];
-}
-
-export interface TimeStepDiff {
-  timestamp: Date;
-  // Comparison vs previous step (or baseline)
-  addedEdges: SectorSummary[];
-  removedEdges: SectorSummary[];
-  persistedEdges: SectorSummary[];
-  densityChange: number; // percentage
-}
 ````
 
 ## File: packages/agent/package.json
@@ -5068,6 +4826,820 @@ SOFTWARE.
         "packages/agent/src/**/*",
         "packages/quackgraph/packages/*/src/**/*"
     ]
+}
+````
+
+## File: packages/agent/src/agent/metabolism.ts
+````typescript
+import { randomUUID } from 'crypto';
+import type { QuackGraph } from '@quackgraph/graph';
+import type { Judge } from './judge';
+import type { JudgePrompt } from '../types';
+
+export class Metabolism {
+  constructor(
+    private graph: QuackGraph,
+    private judge: Judge
+  ) { }
+
+  /**
+   * Graph Metabolism: Summarize and Prune.
+   * Identifies old, dense clusters and summarizes them into a single high-level node.
+   */
+  async dream(criteria: { minAgeDays: number; targetLabel: string }) {
+    // 1. Identify Candidates (Nodes older than X days)
+    // We process in batches to allow iterative cleanup
+    const sql = `
+      SELECT id, properties 
+      FROM nodes 
+      WHERE list_contains(labels, ?) 
+        AND valid_from < (current_timestamp - INTERVAL ${criteria.minAgeDays} DAY)
+        AND valid_to IS NULL -- Active nodes only
+      LIMIT 100 -- Batch size
+    `;
+
+    const candidates = await this.graph.db.query(sql, [criteria.targetLabel]);
+    if (candidates.length === 0) return;
+
+    // 2. Synthesize (Judge)
+    const judgePrompt: JudgePrompt = {
+      goal: `Metabolism/Dreaming: Summarize these ${candidates.length} ${criteria.targetLabel} logs into a single concise insight node. Focus on patterns and key events.`,
+      nodeContent: candidates.map((c) =>
+        typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
+      ),
+    };
+
+    const artifact = await this.judge.evaluate(judgePrompt);
+
+    if (!artifact) return; // Judge failed
+
+    // 3. Identification of Anchor (Parent)
+    const candidateIds = candidates.map((c) => c.id);
+    
+    // Find ALL parents (incoming edges) to preserve topology
+    const allParents = await this.graph.native.traverse(
+      candidateIds,
+      undefined,
+      'in',
+      undefined,
+      undefined
+    );
+    
+    // Filter out internal parents (nodes that are part of the cluster being summarized)
+    const candidateSet = new Set(candidateIds);
+    const externalParents = allParents.filter(p => !candidateSet.has(p));
+
+    if (externalParents.length === 0) return; // Orphaned cluster, maybe okay to summarize but risky to detach.
+
+    // 4. Rewire & Prune
+    const summaryId = `summary:${randomUUID()}`;
+    const summaryProps = {
+      content: artifact.answer,
+      source_count: candidates.length,
+      generated_at: new Date().toISOString(),
+      period_end: new Date().toISOString()
+    };
+
+    await this.graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
+
+    // Link ALL external parents to this new summary
+    // This maintains the graph structure: (Parents) -> (Summary) instead of (Parents) -> (Raw Nodes)
+    for (const parentId of externalParents) {
+      await this.graph.addEdge(parentId, summaryId, 'HAS_SUMMARY');
+    }
+
+    // Soft delete raw nodes
+    for (const id of candidateIds) {
+      await this.graph.deleteNode(id);
+    }
+  }
+}
+````
+
+## File: packages/agent/src/governance/schema-registry.ts
+````typescript
+import type { DomainConfig } from '../types';
+
+export class SchemaRegistry {
+  private domains = new Map<string, DomainConfig>();
+
+  constructor() {
+    // Default 'Global' domain that sees everything (fallback)
+    this.register({
+      name: 'global',
+      description: 'Unrestricted access to the entire topology.',
+      allowedEdges: [] // Empty means ALL allowed in our logic, or handled as special case
+    });
+  }
+
+  register(config: DomainConfig) {
+    this.domains.set(config.name.toLowerCase(), config);
+  }
+
+  getDomain(name: string): DomainConfig | undefined {
+    return this.domains.get(name.toLowerCase());
+  }
+
+  getAllDomains(): DomainConfig[] {
+    return Array.from(this.domains.values());
+  }
+
+  /**
+   * Returns true if the edge type is allowed within the domain.
+   * If domain is 'global' or not found, it defaults to true (permissive) 
+   * unless strict mode is desired.
+   */
+  isEdgeAllowed(domainName: string, edgeType: string): boolean {
+    const domain = this.domains.get(domainName.toLowerCase());
+    if (!domain) return true; // Fallback to permissive
+    if (domain.name === 'global') return true;
+    if (domain.allowedEdges.length === 0) return true; // Empty whitelist = all allowed? Or none? Usually global handles all.
+    
+    return domain.allowedEdges.includes(edgeType);
+  }
+
+  /**
+   * Returns true if the domain requires causal (monotonic) time traversal.
+   */
+  isDomainCausal(domainName: string): boolean {
+    const domain = this.domains.get(domainName.toLowerCase());
+    return !!domain?.isCausal;
+  }
+}
+````
+
+## File: packages/agent/src/tools/graph-tools.ts
+````typescript
+import type { QuackGraph } from '@quackgraph/graph';
+import type { SectorSummary } from '../types';
+import type { JsPatternEdge } from '@quackgraph/native';
+
+export class GraphTools {
+  constructor(private graph: QuackGraph) { }
+
+  /**
+   * LOD 0: Sector Scan / Satellite View
+   * Returns a summary of available moves from the current nodes.
+   */
+  async getSectorSummary(currentNodes: string[], asOf?: number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+    if (currentNodes.length === 0) return [];
+
+    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
+    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
+
+    // 2. Sort by count (descending)
+    return results.sort((a, b) => b.count - a.count);
+  }
+
+  /**
+   * LOD 1: Topology Scan
+   * Returns the IDs of neighbors reachable via a specific edge type.
+   */
+  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, minValidFrom?: number): Promise<string[]> {
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf, minValidFrom);
+  }
+
+  /**
+   * LOD 1: Temporal Interval Scan
+   * Finds neighbors connected via edges overlapping/contained in the window.
+   */
+  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1.5: Pattern Matching (Structural Inference)
+   * Finds subgraphs matching a specific shape.
+   */
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], asOf?: number): Promise<string[][]> {
+    const nativePattern = pattern.map(p => ({
+      srcVar: p.srcVar || 0,
+      tgtVar: p.tgtVar || 0,
+      edgeType: p.edgeType || '',
+      direction: p.direction || 'out'
+    }));
+    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
+  }
+
+  /**
+   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
+   * If nodes are part of a document chain (NEXT/PREV), fetch context.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
+  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
+    if (nodeIds.length === 0) return [];
+
+    // 1. Fetch Primary Content
+    const primaryNodes = await this.graph.match([])
+      .where({ id: nodeIds })
+      .select();
+
+    // 2. Virtual Spine Expansion
+    // Check for "NEXT" or "PREV" connections to provide document flow context.
+    const spineContextIds = new Set<string>();
+
+    for (const id of nodeIds) {
+      // Look ahead
+      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
+      next.forEach(nid => spineContextIds.add(nid));
+
+      // Look back
+      const prev = await this.graph.native.traverse([id], 'PREV', 'out');
+      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
+      incomingNext.forEach(nid => spineContextIds.add(nid));
+
+      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
+      explicitPrev.forEach(nid => spineContextIds.add(nid));
+    }
+
+    // Remove duplicates (original nodes)
+    nodeIds.forEach(id => spineContextIds.delete(id));
+
+    if (spineContextIds.size > 0) {
+      const contextNodes = await this.graph.match([])
+        .where({ id: Array.from(spineContextIds) })
+        .select();
+
+      // Merge and Annotate
+      return primaryNodes.map(node => {
+        return {
+          ...node,
+          _isPrimary: true,
+          _context: contextNodes
+        };
+      });
+    }
+
+    return primaryNodes;
+  }
+
+  /**
+   * Pheromones: Reinforce a successful path by increasing edge heat.
+   */
+  async reinforcePath(trace: { source: string; incomingEdge?: string }[]) {
+    for (let i = 1; i < trace.length; i++) {
+      const prev = trace[i - 1];
+      const curr = trace[i];
+      if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
+      if (curr.incomingEdge) {
+        // Boost heat by 200 (max is 255 usually, V1 logic)
+        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 200);
+      }
+    }
+  }
+}
+````
+
+## File: packages/agent/src/labyrinth.ts
+````typescript
+import { QuackGraph } from '@quackgraph/graph';
+import type {
+  AgentConfig,
+  TraceStep,
+  TraceLog,
+  LabyrinthArtifact,
+  ScoutPrompt,
+  JudgePrompt,
+  CorrelationResult,
+  TimeContext,
+  DomainConfig
+} from './types';
+import { randomUUID } from 'crypto';
+
+import { Scout } from './agent/scout';
+import { Judge } from './agent/judge';
+import { Chronos } from './agent/chronos';
+import { GraphTools } from './tools/graph-tools';
+import { Metabolism } from './agent/metabolism';
+import { Router } from './agent/router';
+import { SchemaRegistry } from './governance/schema-registry';
+
+interface Cursor {
+  id: string;
+  currentNodeId: string;
+  path: string[]; // History of node IDs
+  traceHistory: string[]; // Summary of actions for context
+  stepCount: number;
+  confidence: number;
+  parentId?: number; // stepId of the action that led here
+  lastEdgeType?: string; // Edge taken to reach currentNodeId
+  lastTimestamp?: number; // Microseconds timestamp of the current node (for Causal enforcement)
+}
+
+export class Labyrinth {
+  private traces = new Map<string, TraceLog>();
+
+  public scout: Scout;
+  public judge: Judge;
+  public chronos: Chronos;
+  public tools: GraphTools;
+  public metabolism: Metabolism;
+  public router: Router;
+  public registry: SchemaRegistry;
+
+  constructor(
+    private graph: QuackGraph,
+    private config: AgentConfig
+  ) {
+    this.scout = new Scout(config);
+    this.judge = new Judge(config);
+    this.tools = new GraphTools(graph);
+    this.chronos = new Chronos(graph, this.tools);
+    this.metabolism = new Metabolism(graph, this.judge);
+
+    // Governance
+    this.router = new Router(config);
+    this.registry = new SchemaRegistry();
+  }
+
+  /**
+   * Register a new Domain (Semantic Lens) for the agent to use.
+   */
+  registerDomain(config: DomainConfig) {
+    this.registry.register(config);
+  }
+
+  /**
+   * Parallel Speculative Execution:
+   * Main Entry Point: Orchestrates multiple Scouts and a Judge to find an answer.
+   */
+  async findPath(
+    start: string | { query: string },
+    goal: string,
+    timeContext?: TimeContext
+  ): Promise<LabyrinthArtifact | null> {
+    const rootController = new AbortController();
+    const rootSignal = rootController.signal;
+
+    const traceId = randomUUID();
+    const startTime = Date.now();
+
+    // --- Phase 0: Context Firewall (Routing) ---
+    // Before we start walking, decide WHICH domain we are walking in.
+    const availableDomains = this.registry.getAllDomains();
+    const route = await this.router.route(goal, availableDomains, rootSignal);
+    const activeDomain = route.domain;
+
+    // Resolve effective timestamp (passed context > graph context > current)
+    const effectiveAsOf = timeContext?.asOf || this.graph.context.asOf;
+    const asOfTs = effectiveAsOf ? effectiveAsOf.getTime() * 1000 : undefined;
+
+    const timeDesc = effectiveAsOf
+      ? `As of: ${effectiveAsOf.toISOString()}`
+      : (timeContext?.windowStart ? `Window: ${timeContext.windowStart.toISOString()} - ${timeContext.windowEnd?.toISOString()}` : undefined);
+
+    const log: TraceLog = {
+      traceId,
+      goal,
+      activeDomain,
+      startTime,
+      steps: [],
+      outcome: 'ABORTED' // Default
+    };
+
+    this.traces.set(traceId, log);
+
+    let startNodes: string[] = [];
+
+    // Vector Genesis
+    if (typeof start === 'object' && 'query' in start) {
+      if (!this.config.embeddingProvider) {
+        throw new Error("Vector Genesis requires an embeddingProvider in AgentConfig.");
+      }
+      const vector = await this.config.embeddingProvider.embed(start.query);
+      // Get top 3 relevant start nodes
+      const matches = await this.graph.match([]).nearText(vector).limit(3).select();
+      startNodes = matches.map(m => m.id);
+    } else {
+      startNodes = [start as string];
+    }
+
+    // Initialize Root Cursor
+    let cursors: Cursor[] = startNodes.map(nodeId => ({
+      id: randomUUID(),
+      currentNodeId: nodeId,
+      path: [nodeId],
+      traceHistory: [`[ROUTER] Selected domain: ${activeDomain}`],
+      stepCount: 0,
+      confidence: 1.0
+    }));
+
+    const maxHops = this.config.maxHops || 10;
+    const maxCursors = this.config.maxCursors || 3;
+    let globalStepCounter = 0;
+    let foundArtifact: LabyrinthArtifact | null = null;
+
+    // Speculative Execution: We use a local controller for the batch to kill peers if winner found
+    try {
+      // Main Loop: While we have active cursors and haven't found the answer
+      while (cursors.length > 0 && !foundArtifact && !rootSignal.aborted) {
+        const nextCursors: Cursor[] = [];
+        const processingPromises: Promise<void>[] = [];
+
+        // We wrap the iteration to allow for "Race" logic (checking foundArtifact)
+
+        for (const cursor of cursors) {
+          if (foundArtifact) break; // Early exit check
+
+          const task = async () => {
+            if (foundArtifact) return; // Double check inside async
+
+            // Pruning: Max Depth
+            if (cursor.stepCount >= maxHops) return;
+
+            // 1. Context Awareness (LOD 1)
+            // We use raw SQL selection to get the valid_from timestamp for Causal Logic
+            const nodeMeta = await this.graph.match([])
+              .where({ id: cursor.currentNodeId })
+              .select('id, labels, date_diff(\'us\', \'1970-01-01\'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from_micros');
+
+            if (nodeMeta.length === 0) return; // Node lost/deleted
+            // biome-ignore lint/suspicious/noExplicitAny: raw sql result
+            const currentNode = nodeMeta[0] as any;
+            if (!currentNode) return; // Satisfy noUncheckedIndexedAccess
+
+            // 2. Sector Scan (LOD 0) - Enhanced Satellite View
+
+            // CONTEXT FIREWALL: Push filtering down to Rust
+            const domainConfig = this.registry.getDomain(activeDomain);
+            let allowedEdges: string[] | undefined;
+
+            if (domainConfig && domainConfig.name !== 'global' && domainConfig.allowedEdges.length > 0) {
+              allowedEdges = domainConfig.allowedEdges;
+            }
+
+            const sectorSummary = await this.tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+
+            // 3. Ask Scout
+            const prompt: ScoutPrompt = {
+              goal,
+              activeDomain,
+              currentNodeId: currentNode.id,
+              currentNodeLabels: currentNode.labels || [],
+              sectorSummary,
+              pathHistory: cursor.path,
+              timeContext: timeDesc
+            };
+
+            const decision = await this.scout.decide(prompt, rootSignal);
+
+            // Register Step
+            const currentStepId = globalStepCounter++;
+            const step: TraceStep = {
+              stepId: currentStepId,
+              parentId: cursor.parentId,
+              cursorId: cursor.id,
+              nodeId: cursor.currentNodeId,
+              source: cursor.currentNodeId,
+              incomingEdge: cursor.lastEdgeType,
+              action: decision.action as 'MOVE' | 'CHECK' | 'MATCH',
+              decision,
+              reasoning: decision.reasoning,
+              timestamp: Date.now()
+            };
+            log.steps.push(step);
+            cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
+
+            // 4. Handle Decision
+            if (decision.action === 'CHECK') {
+              // LOD 2: Content Retrieval
+              const content = await this.tools.contentRetrieval([cursor.currentNodeId]);
+
+              // Ask Judge
+              const judgePrompt: JudgePrompt = {
+                goal,
+                nodeContent: content,
+                timeContext: timeDesc
+              };
+              const artifact = await this.judge.evaluate(judgePrompt, rootSignal);
+
+              if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
+                // Success found by this cursor!
+                artifact.traceId = traceId;
+                artifact.sources = [cursor.currentNodeId];
+
+                // Set global found flag to stop other cursors
+                foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any;
+                rootController.abort(); // Kill other pending scouts in this batch
+                return;
+              }
+
+              // If Judge rejects, this path ends here.
+              return;
+
+            } else if (decision.action === 'MATCH' && decision.pattern) {
+              // Structural Inference
+              const matches = await this.tools.findPattern([cursor.currentNodeId], decision.pattern, asOfTs);
+
+              if (matches.length > 0) {
+                // Pattern found! Jump to the end of the matched paths.
+                // matches is Vec<Vec<string>> (list of paths)
+                // We take up to 3 matches to spawn cursors
+                const foundPaths = matches.slice(0, 3);
+
+                for (const path of foundPaths) {
+                  const endNode = path[path.length - 1]; // Jump to end of pattern
+                  if (endNode) {
+                    nextCursors.push({
+                      id: randomUUID(),
+                      currentNodeId: endNode,
+                      path: [...cursor.path, ...path.slice(1)], // Append path (skipping start which is current)
+                      traceHistory: [...cursor.traceHistory, `[MATCH] Pattern Found: ${JSON.stringify(decision.pattern)}`],
+                      stepCount: cursor.stepCount + path.length - 1, // Advance step count
+                      confidence: cursor.confidence * 0.9, // Slight penalty for jump
+                      parentId: currentStepId,
+                      lastEdgeType: 'MATCH_JUMP'
+                    });
+                  }
+                }
+              }
+              return;
+
+            } else if (decision.action === 'MOVE') {
+              const moves = [];
+
+              // Primary Move
+              if (decision.edgeType) {
+                moves.push({ edge: decision.edgeType, conf: decision.confidence });
+              }
+
+              // Alternative Moves (Speculative Execution)
+              if (decision.alternativeMoves) {
+                for (const alt of decision.alternativeMoves) {
+                  moves.push({ edge: alt.edgeType, conf: alt.confidence });
+                }
+              }
+
+              // Process Moves
+              for (const move of moves) {
+                if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
+
+                // Double check governance (Scout hallucination check)
+                if (!this.registry.isEdgeAllowed(activeDomain, move.edge)) {
+                  // If Scout tries to move on a forbidden edge (despite firewall in prompt), block it.
+                  continue;
+                }
+                
+                // Causal / Monotonic Enforcement
+                const isCausal = this.registry.isDomainCausal(activeDomain);
+                // If causal, we only traverse edges/nodes that happened AFTER or AT the same time as current
+                const minValidFrom = isCausal ? (cursor.lastTimestamp || currentNode.valid_from_micros) : undefined;
+
+                // LOD 1: Topology Scan
+                const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs, minValidFrom);
+
+                if (nextNodes.length > 0) {
+                  // If multiple targets, we branch, taking up to 3 to prevent explosion
+                  const targets = nextNodes.slice(0, 3);
+
+                  for (const target of targets) {
+                    if (move.edge === decision.edgeType && target === nextNodes[0]) {
+                      step.target = target;
+                    }
+
+                    nextCursors.push({
+                      id: randomUUID(),
+                      currentNodeId: target,
+                      path: [...cursor.path, target],
+                      traceHistory: [...cursor.traceHistory],
+                      stepCount: cursor.stepCount + 1,
+                      confidence: cursor.confidence * move.conf,
+                      parentId: currentStepId,
+                      lastEdgeType: move.edge,
+                      // For the next step, the 'lastTimestamp' is effectively the arrival time at this new node
+                      // But strictly, we should fetch the target node's timestamp in the next loop iteration.
+                      // However, to be safe, we can carry forward the current node's timestamp as a floor if needed.
+                      // Actually, 'minValidFrom' ensures the EDGE is valid > T. The target node itself has its own valid_from.
+                      // We don't set lastTimestamp here; it will be fetched in the next iteration for that node.
+                    });
+                  }
+                }
+              }
+              return;
+            }
+          };
+
+          processingPromises.push(task());
+        }
+
+        await Promise.all(processingPromises);
+
+        // Check results
+        // biome-ignore lint/suspicious/noExplicitAny: hack for race result
+        const res = foundArtifact as any;
+        if (res && res.type === 'FOUND') {
+          log.outcome = 'FOUND';
+          const artifact = res.artifact as LabyrinthArtifact;
+          log.finalArtifact = artifact;
+
+          if (res.finalStepId !== undefined) {
+            const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
+            await this.tools.reinforcePath(winningTrace);
+          }
+
+          return artifact;
+        }
+
+        // Pruning / Management
+        // We sort by confidence and take top N
+        nextCursors.sort((a, b) => b.confidence - a.confidence);
+        cursors = nextCursors.slice(0, maxCursors);
+      }
+    } finally {
+      // Ensure we clean up if something throws
+      if (!foundArtifact && !rootSignal.aborted) {
+        rootController.abort();
+      }
+    }
+
+    if (log.outcome !== 'FOUND') {
+      log.outcome = 'EXHAUSTED';
+    }
+
+    return null;
+  }
+
+  getTrace(traceId: string): TraceLog | undefined {
+    return this.traces.get(traceId);
+  }
+
+  private reconstructPath(allSteps: TraceStep[], finalStepId: number): TraceStep[] {
+    const path: TraceStep[] = [];
+    let currentId: number | undefined = finalStepId;
+
+    const stepMap = new Map<number, TraceStep>();
+    for (const s of allSteps) stepMap.set(s.stepId, s);
+
+    while (currentId !== undefined) {
+      const step = stepMap.get(currentId);
+      if (step) {
+        path.unshift(step);
+        currentId = step.parentId;
+      } else {
+        break;
+      }
+    }
+    return path;
+  }
+
+  // --- Wrapper for Chronos ---
+
+  async analyzeCorrelation(anchorNodeId: string, targetLabel: string, windowMinutes: number): Promise<CorrelationResult> {
+    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
+  }
+}
+````
+
+## File: packages/agent/src/types.ts
+````typescript
+export enum ZoomLevel {
+  SECTOR = 0,    // Ghost/Satellite View: Available Moves (Schema)
+  TOPOLOGY = 1,  // Drone View: Structural Hops (IDs only)
+  CONTENT = 2    // Street View: Full JSON Data
+}
+
+export interface AgentConfig {
+  llmProvider: {
+    generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
+  };
+  maxHops?: number;
+  // Max number of concurrent exploration threads
+  maxCursors?: number;
+  // Minimum confidence to pursue a path (0.0 - 1.0)
+  confidenceThreshold?: number;
+  // Vector Genesis: Optional embedding provider for start-from-text
+  embeddingProvider?: {
+    embed: (text: string) => Promise<number[]>;
+  };
+}
+
+// --- Governance & Router ---
+
+export interface DomainConfig {
+  name: string;
+  description: string;
+  allowedEdges: string[]; // Whitelist of edge types visible to the Scout
+  // If true, traversal enforces Monotonic Time (Next Event >= Current Event)
+  isCausal?: boolean;
+}
+
+export interface RouterPrompt {
+  goal: string;
+  availableDomains: DomainConfig[];
+}
+
+export interface RouterDecision {
+  domain: string;
+  confidence: number;
+  reasoning: string;
+}
+
+// --- Scout ---
+
+export interface TimeContext {
+  asOf?: Date;
+  windowStart?: Date;
+  windowEnd?: Date;
+}
+
+export interface SectorSummary {
+  edgeType: string;
+  count: number;
+  avgHeat?: number;
+}
+
+export interface ScoutDecision {
+  action: 'MOVE' | 'CHECK' | 'ABORT' | 'MATCH';
+  edgeType?: string; // Required if action is MOVE
+  pattern?: { srcVar: number; tgtVar: number; edgeType: string; direction?: string }[]; // Required if action is MATCH
+  targetLabels?: string[]; // Optional filter for the move
+  confidence: number;
+  reasoning: string;
+  alternativeMoves?: {
+    edgeType: string;
+    confidence: number;
+    reasoning: string;
+  }[];
+}
+
+export interface ScoutPrompt {
+  goal: string;
+  activeDomain: string; // The semantic domain grounding this search
+  currentNodeId: string;
+  currentNodeLabels: string[];
+  sectorSummary: SectorSummary[]; 
+  pathHistory: string[]; 
+  timeContext?: string; 
+}
+
+export interface JudgePrompt {
+  goal: string;
+  nodeContent: Record<string, any>[];
+  timeContext?: string;
+}
+
+// --- Traces ---
+
+export interface TraceStep {
+  stepId: number;
+  parentId?: number;
+  cursorId: string;
+  incomingEdge?: string;
+  nodeId: string; // Source node where decision was made
+  source: string;
+  target?: string; // Resulting node if MOVE
+  action: 'MOVE' | 'CHECK' | 'MATCH';
+  decision: ScoutDecision;
+  reasoning: string;
+  timestamp: number;
+}
+
+export interface TraceLog {
+  traceId: string;
+  goal: string;
+  activeDomain: string;
+  startTime: number;
+  steps: TraceStep[];
+  outcome: 'FOUND' | 'EXHAUSTED' | 'ABORTED';
+  finalArtifact?: LabyrinthArtifact;
+}
+
+export interface LabyrinthArtifact {
+  answer: string;
+  confidence: number;
+  traceId: string;
+  sources: string[];
+  metadata?: Record<string, any>;
+}
+
+// Temporal Logic Types
+export interface TemporalWindow {
+  anchorNodeId: string;
+  windowStart: number; // Unix timestamp
+  windowEnd: number;   // Unix timestamp
+}
+
+export interface CorrelationResult {
+  anchorLabel: string;
+  targetLabel: string;
+  windowSizeMinutes: number;
+  correlationScore: number; // 0.0 - 1.0
+  sampleSize: number;
+  description: string;
+}
+
+export interface EvolutionResult {
+  anchorNodeId: string;
+  timeline: TimeStepDiff[];
+}
+
+export interface TimeStepDiff {
+  timestamp: Date;
+  // Comparison vs previous step (or baseline)
+  addedEdges: SectorSummary[];
+  removedEdges: SectorSummary[];
+  persistedEdges: SectorSummary[];
+  densityChange: number; // percentage
 }
 ````
 

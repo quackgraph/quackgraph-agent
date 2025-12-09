@@ -6,7 +6,7 @@ I want feature so that external agent can see whole graph and relationship of a 
 
 ===
 
-correct mastra ai implementation is like in doc/mastra-example
+correct mastra ai implementation is like in dev-docs/mastra-test
 
 ===
 
@@ -15,3 +15,7 @@ understand readme.md then develop the quackgraph-agent. you can also edit packag
 ---
 
 understand readme.md then continue develop the quackgraph-agent. 
+
+---
+
+understand readme.md then continue develop the quackgraph-agent until all features well implemented in production ready manner. 

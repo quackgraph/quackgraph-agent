@@ -17,6 +17,9 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/memory": "^0.15.12",
+    "zod": "^3.23.0",
     "@quackgraph/graph": "workspace:*",
     "@quackgraph/native": "workspace:*"
   },
