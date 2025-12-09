@@ -1,2 +1,25 @@
-# relay state
+# Dependencies
+node_modules/
+bun.lock
+
+# Build outputs
+dist/
+*.node
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Relay state
 /.relay/
+
+# Logs
+*.log
+npm-debug.log*

@@ -1,0 +1,31 @@
+{
+  "name": "quackgraph-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/agent",
+    "packages/quackgraph/packages/*"
+  ],
+  "scripts": {
+    "format": "bun run --cwd packages/quackgraph format",
+    "clean": "rm -rf node_modules packages/agent/dist && bun run --cwd packages/quackgraph clean",
+    "postinstall": "bun run --cwd packages/quackgraph/packages/native build",
+    "typecheck": "tsc --noEmit && bun run --cwd packages/quackgraph typecheck",
+    "lint": "bun run --cwd packages/quackgraph lint",
+    "check": "bun run typecheck && bun run lint",
+    "dev": "bun test --watch",
+    "test": "bun run build && bun test",
+    "build": "bun run build:core && bun run build:agent",
+    "build:core": "bun run --cwd packages/quackgraph build",
+    "build:agent": "bun run --cwd packages/agent build",
+    "build:watch": "bun run --cwd packages/agent build --watch",
+    "push:all": "bun run scripts/git-sync.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
+  }
+}
