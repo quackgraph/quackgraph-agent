@@ -11,10 +11,20 @@ export interface AgentConfig {
   maxHops?: number;
   // Max number of concurrent exploration threads
   maxCursors?: number;
-  // Max number of concurrent exploration threads
-  // Minimum confidence to pursue a path (0.0 - 1.0)
   // Minimum confidence to pursue a path (0.0 - 1.0)
   confidenceThreshold?: number;
+}
+
+export interface TimeContext {
+  asOf?: Date;
+  windowStart?: Date;
+  windowEnd?: Date;
+}
+
+export interface SectorSummary {
+  edgeType: string;
+  count: number;
+  avgHeat?: number;
 }
 
 export interface ScoutDecision {
@@ -34,13 +44,15 @@ export interface ScoutPrompt {
   goal: string;
   currentNodeId: string;
   currentNodeLabels: string[];
-  availableEdgeTypes: string[];
+  sectorSummary: SectorSummary[]; // Changed from availableEdgeTypes
   pathHistory: string[]; // Summarized path history
+  timeContext?: string; // Human readable time context
 }
 
 export interface JudgePrompt {
   goal: string;
   nodeContent: Record<string, any>[];
+  timeContext?: string;
 }
 
 export interface TraceStep {
@@ -88,4 +100,18 @@ export interface CorrelationResult {
   correlationScore: number; // 0.0 - 1.0
   sampleSize: number;
   description: string;
+}
+
+export interface EvolutionResult {
+  anchorNodeId: string;
+  timeline: TimeStepDiff[];
+}
+
+export interface TimeStepDiff {
+  timestamp: Date;
+  // Comparison vs previous step (or baseline)
+  addedEdges: SectorSummary[];
+  removedEdges: SectorSummary[];
+  persistedEdges: SectorSummary[];
+  densityChange: number; // percentage
 }

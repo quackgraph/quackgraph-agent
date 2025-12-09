@@ -4,12 +4,18 @@ import type {
   TraceStep, 
   TraceLog, 
   LabyrinthArtifact, 
-  ScoutDecision,
   ScoutPrompt,
   JudgePrompt,
-  CorrelationResult
+  CorrelationResult,
+  TimeContext,
 } from './types';
 import { randomUUID } from 'crypto';
+
+import { Scout } from './agent/scout';
+import { Judge } from './agent/judge';
+import { Chronos } from './agent/chronos';
+import { GraphTools } from './tools/graph-tools';
+import { Metabolism } from './agent/metabolism';
 
 interface Cursor {
   id: string;
@@ -24,19 +30,43 @@ interface Cursor {
 
 export class Labyrinth {
   private traces = new Map<string, TraceLog>();
+  
+  public scout: Scout;
+  public judge: Judge;
+  public chronos: Chronos;
+  public tools: GraphTools;
+  public metabolism: Metabolism;
 
   constructor(
     private graph: QuackGraph, 
     private config: AgentConfig
-  ) {}
+  ) {
+    this.scout = new Scout(config);
+    this.judge = new Judge(config);
+    this.tools = new GraphTools(graph);
+    this.chronos = new Chronos(graph, this.tools);
+    this.metabolism = new Metabolism(graph, this.judge);
+  }
 
   /**
    * Parallel Speculative Execution:
    * Main Entry Point: Orchestrates multiple Scouts and a Judge to find an answer.
    */
-  async findPath(startNodeId: string, goal: string): Promise<LabyrinthArtifact | null> {
+  async findPath(
+    startNodeId: string, 
+    goal: string,
+    timeContext?: TimeContext
+  ): Promise<LabyrinthArtifact | null> {
     const traceId = randomUUID();
     const startTime = Date.now();
+    
+    // Resolve effective timestamp (passed context > graph context > current)
+    const effectiveAsOf = timeContext?.asOf || this.graph.context.asOf;
+    const asOfTs = effectiveAsOf ? effectiveAsOf.getTime() * 1000 : undefined;
+
+    const timeDesc = effectiveAsOf 
+      ? `As of: ${effectiveAsOf.toISOString()}` 
+      : (timeContext?.windowStart ? `Window: ${timeContext.windowStart.toISOString()} - ${timeContext.windowEnd?.toISOString()}` : undefined);
     
     const log: TraceLog = {
       traceId,
@@ -61,150 +91,161 @@ export class Labyrinth {
     const maxHops = this.config.maxHops || 10;
     const maxCursors = this.config.maxCursors || 3;
     let globalStepCounter = 0;
+    let foundArtifact: LabyrinthArtifact | null = null;
 
-    // Main Loop: While we have active cursors
-    while (cursors.length > 0) {
+    // Main Loop: While we have active cursors and haven't found the answer
+    while (cursors.length > 0 && !foundArtifact) {
       const nextCursors: Cursor[] = [];
+      const processingPromises: Promise<void>[] = [];
       
-      const promises = cursors.map(async (cursor) => {
-        // Pruning: Max Depth
-        if (cursor.stepCount >= maxHops) {
-          return null;
-        }
+      // We wrap the iteration to allow for "Race" logic (checking foundArtifact)
+      
+      for (const cursor of cursors) {
+        if (foundArtifact) break; // Early exit check
 
-        // 1. Context Awareness (LOD 1)
-        const nodeMeta = await this.graph.match([])
-          .where({ id: cursor.currentNodeId })
-          .select(n => ({ id: n.id, labels: n.labels }));
-        
-        if (nodeMeta.length === 0) return null; // Node lost/deleted
-        const currentNode = nodeMeta[0];
-
-        // 2. Sector Scan (LOD 0)
-        const edgeTypes = await this.sectorScan([cursor.currentNodeId]);
-
-        // 3. Ask Scout
-        const prompt: ScoutPrompt = {
-          goal,
-          currentNodeId: currentNode.id,
-          currentNodeLabels: currentNode.labels || [],
-          availableEdgeTypes: edgeTypes,
-          pathHistory: cursor.path
-        };
-
-        const decision = await this.askScout(prompt);
-        
-        // Register Step
-        const currentStepId = globalStepCounter++;
-        const step: TraceStep = {
-          stepId: currentStepId,
-          parentId: cursor.parentId,
-          cursorId: cursor.id,
-          nodeId: cursor.currentNodeId,
-          source: cursor.currentNodeId,
-          incomingEdge: cursor.lastEdgeType,
-          action: decision.action as 'MOVE' | 'CHECK',
-          decision,
-          reasoning: decision.reasoning,
-          timestamp: Date.now()
-        };
-        log.steps.push(step);
-        cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
-
-        // 4. Handle Decision
-        if (decision.action === 'CHECK') {
-          // LOD 2: Content Retrieval
-          const content = await this.contentRetrieval([cursor.currentNodeId]);
+        const task = async () => {
+          if (foundArtifact) return; // Double check inside async
           
-          // Ask Judge
-          const artifact = await this.askJudge({ goal, nodeContent: content });
-          
-          if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
-            // Success found by this cursor!
-            artifact.traceId = traceId;
-            artifact.sources = [cursor.currentNodeId];
-            return { type: 'FOUND', artifact, finalStepId: currentStepId };
-          } 
-          
-          // If Judge rejects, this path ends here.
-          return null;
+          // Pruning: Max Depth
+          if (cursor.stepCount >= maxHops) return;
 
-        } else if (decision.action === 'MOVE') {
-          const moves = [];
+          // 1. Context Awareness (LOD 1)
+          const nodeMeta = await this.graph.match([])
+            .where({ id: cursor.currentNodeId })
+            .select(n => ({ id: n.id, labels: n.labels }));
           
-          // Primary Move
-          if (decision.edgeType) {
-            moves.push({ edge: decision.edgeType, conf: decision.confidence });
-          }
+          if (nodeMeta.length === 0) return; // Node lost/deleted
+          const currentNode = nodeMeta[0];
+
+          // 2. Sector Scan (LOD 0) - Enhanced Satellite View
+          const sectorSummary = await this.tools.getSectorSummary([cursor.currentNodeId], asOfTs);
+
+          // 3. Ask Scout
+          const prompt: ScoutPrompt = {
+            goal,
+            currentNodeId: currentNode.id,
+            currentNodeLabels: currentNode.labels || [],
+            sectorSummary,
+            pathHistory: cursor.path,
+            timeContext: timeDesc
+          };
+
+          const decision = await this.scout.decide(prompt);
           
-          // Alternative Moves (Speculative Execution)
-          if (decision.alternativeMoves) {
-            for (const alt of decision.alternativeMoves) {
-              moves.push({ edge: alt.edgeType, conf: alt.confidence });
-            }
-          }
+          // Register Step
+          const currentStepId = globalStepCounter++;
+          const step: TraceStep = {
+            stepId: currentStepId,
+            parentId: cursor.parentId,
+            cursorId: cursor.id,
+            nodeId: cursor.currentNodeId,
+            source: cursor.currentNodeId,
+            incomingEdge: cursor.lastEdgeType,
+            action: decision.action as 'MOVE' | 'CHECK',
+            decision,
+            reasoning: decision.reasoning,
+            timestamp: Date.now()
+          };
+          log.steps.push(step);
+          cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
 
-          // Process Moves
-          const generatedCursors: Cursor[] = [];
-
-          for (const move of moves) {
-            if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
-
-            // LOD 1: Topology Scan
-            const nextNodes = await this.topologyScan([cursor.currentNodeId], move.edge);
+          // 4. Handle Decision
+          if (decision.action === 'CHECK') {
+            // LOD 2: Content Retrieval
+            const content = await this.tools.contentRetrieval([cursor.currentNodeId]);
             
-            if (nextNodes.length > 0) {
-              // Naive selection: Pick first. Real logic might fork for targets too.
-              const target = nextNodes[0]; 
+            // Ask Judge
+            const judgePrompt: JudgePrompt = { 
+              goal, 
+              nodeContent: content,
+              timeContext: timeDesc 
+            };
+            const artifact = await this.judge.evaluate(judgePrompt);
+            
+            if (artifact && artifact.confidence >= (this.config.confidenceThreshold || 0.7)) {
+              // Success found by this cursor!
+              artifact.traceId = traceId;
+              artifact.sources = [cursor.currentNodeId];
               
-              // Update step target if primary move (for legacy/simple visualization)
-              if (move.edge === decision.edgeType) {
-                 step.target = target;
-              }
+              // Set global found flag to stop other cursors
+              foundArtifact = { type: 'FOUND', artifact, finalStepId: currentStepId } as any; 
+              return;
+            } 
+            
+            // If Judge rejects, this path ends here.
+            return;
 
-              generatedCursors.push({
-                id: randomUUID(),
-                currentNodeId: target,
-                path: [...cursor.path, target],
-                traceHistory: [...cursor.traceHistory],
-                stepCount: cursor.stepCount + 1,
-                confidence: cursor.confidence * move.conf,
-                parentId: currentStepId,
-                lastEdgeType: move.edge
-              });
+          } else if (decision.action === 'MOVE') {
+            const moves = [];
+            
+            // Primary Move
+            if (decision.edgeType) {
+              moves.push({ edge: decision.edgeType, conf: decision.confidence });
             }
-          }
-          return { type: 'CONTINUE', newCursors: generatedCursors };
-        }
-        
-        return null; // ABORT
-      });
+            
+            // Alternative Moves (Speculative Execution)
+            if (decision.alternativeMoves) {
+              for (const alt of decision.alternativeMoves) {
+                moves.push({ edge: alt.edgeType, conf: alt.confidence });
+              }
+            }
 
-      const results = await Promise.all(promises);
+            // Process Moves
+            for (const move of moves) {
+              if (move.conf < (this.config.confidenceThreshold || 0.2)) continue;
+
+              // LOD 1: Topology Scan
+              const nextNodes = await this.tools.topologyScan([cursor.currentNodeId], move.edge, asOfTs);
+              
+              if (nextNodes.length > 0) {
+                // If multiple targets, we branch, taking up to 3 to prevent explosion
+                const targets = nextNodes.slice(0, 3); 
+
+                for (const target of targets) {
+                  if (move.edge === decision.edgeType && target === nextNodes[0]) {
+                     step.target = target;
+                  }
+
+                  nextCursors.push({
+                    id: randomUUID(),
+                    currentNodeId: target,
+                    path: [...cursor.path, target],
+                    traceHistory: [...cursor.traceHistory],
+                    stepCount: cursor.stepCount + 1,
+                    confidence: cursor.confidence * move.conf,
+                    parentId: currentStepId,
+                    lastEdgeType: move.edge
+                  });
+                }
+              }
+            }
+            return;
+          }
+        };
+        
+        processingPromises.push(task());
+      }
+
+      await Promise.all(processingPromises);
 
       // Check results
-      for (const res of results) {
-        if (!res) continue;
-        if (res.type === 'FOUND') {
-          log.outcome = 'FOUND';
-          const artifact = res.artifact as LabyrinthArtifact;
-          log.finalArtifact = artifact;
-          
-          // Reconstruct Path & Reinforce
-          if (res.finalStepId !== undefined) {
-            const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
-            await this.reinforcePath(winningTrace);
-          }
-          
-          return artifact;
+      // biome-ignore lint/suspicious/noExplicitAny: hack for race result
+      const res = foundArtifact as any;
+      if (res && res.type === 'FOUND') {
+        log.outcome = 'FOUND';
+        const artifact = res.artifact as LabyrinthArtifact;
+        log.finalArtifact = artifact;
+        
+        if (res.finalStepId !== undefined) {
+          const winningTrace = this.reconstructPath(log.steps, res.finalStepId);
+          await this.tools.reinforcePath(winningTrace);
         }
-        if (res.type === 'CONTINUE' && res.newCursors) {
-          nextCursors.push(...res.newCursors);
-        }
+        
+        return artifact;
       }
 
       // Pruning / Management
-      // Sort by confidence and take top N
+      // We sort by confidence and take top N
       nextCursors.sort((a, b) => b.confidence - a.confidence);
       cursors = nextCursors.slice(0, maxCursors);
     }
@@ -224,7 +265,6 @@ export class Labyrinth {
     const path: TraceStep[] = [];
     let currentId: number | undefined = finalStepId;
     
-    // Build map for O(1) lookup
     const stepMap = new Map<number, TraceStep>();
     for (const s of allSteps) stepMap.set(s.stepId, s);
 
@@ -240,241 +280,9 @@ export class Labyrinth {
     return path;
   }
 
-  // --- LOD Implementations ---
-
-  /**
-   * LOD 0: Sector Scan (Satellite View)
-   * The "Ghost Layer". The agent asks: "Where CAN I go from here?"
-   */
-  async sectorScan(currentNodes: string[]): Promise<string[]> {
-    if (currentNodes.length === 0) return [];
-    return await this.graph.getAvailableEdgeTypes(currentNodes);
-  }
-
-  /**
-   * LOD 1: Topology Scan (Drone View)
-   * The "Structural Layer". The agent moves blindly through the graph using only IDs and Types.
-   */
-  async topologyScan(currentNodes: string[], edgeType: string): Promise<string[]> {
-    const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() * 1000 : undefined;
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOfTs);
-  }
-
-  /**
-   * LOD 2: Content Retrieval (Street View)
-   * The "Data Layer". The agent has identified specific nodes of interest and now reads the text.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
-  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
-    if (nodeIds.length === 0) return [];
-    
-    return await this.graph.match([])
-      .where({ id: nodeIds })
-      .select();
-  }
-
-  /**
-   * Pheromones: Reinforce
-   * Reinforces edges along the winning path.
-   */
-  async reinforcePath(trace: TraceStep[]) {
-    // Traverse pairs of steps to find edges
-    for (let i = 1; i < trace.length; i++) {
-      const prev = trace[i - 1];
-      const curr = trace[i];
-      if (curr.incomingEdge) {
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 200);
-      }
-    }
-  }
-
-  /**
-   * Pheromones: Decay
-   * (Optional) Decay edges on failed paths.
-   */
-  async decayPath(trace: TraceStep[]) {
-     // Naive decay logic for now
-     for (let i = 1; i < trace.length; i++) {
-      const prev = trace[i - 1];
-      const curr = trace[i];
-      if (curr.incomingEdge) {
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, 10);
-      }
-    }
-  }
-
-  // --- Part 3: Temporal Algebra & Metabolism ---
-
-  /**
-   * Analyze correlation between an anchor node and a target label within a time window.
-   * Uses DuckDB SQL window functions.
-   */
-  async analyzeCorrelation(
-    anchorNodeId: string, 
-    targetLabel: string, 
-    windowMinutes: number
-  ): Promise<CorrelationResult> {
-    // 1. Get Anchor Node Timestamp (valid_from)
-    const anchorRows = await this.graph.db.query(
-      "SELECT valid_from FROM nodes WHERE id = ?", 
-      [anchorNodeId]
-    );
-    
-    if (anchorRows.length === 0) {
-      throw new Error(`Anchor node ${anchorNodeId} not found`);
-    }
-    
-    // DuckDB returns TIMESTAMP, which might be object or string depending on driver version.
-    
-    // Query: Find all nodes with targetLabel that overlap the [AnchorTime - Window, AnchorTime] interval
-    const sql = `
-      WITH Anchor AS (
-        SELECT valid_from as t_anchor 
-        FROM nodes 
-        WHERE id = ?
-      ),
-      Targets AS (
-        SELECT id, valid_from as t_target 
-        FROM nodes 
-        WHERE list_contains(labels, ?)
-      )
-      SELECT count(*) as count
-      FROM Targets, Anchor
-      WHERE t_target >= (t_anchor - INTERVAL ${windowMinutes} MINUTE)
-        AND t_target <= t_anchor
-    `;
-    
-    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
-    const count = Number(result[0]?.count || 0);
-    
-    return {
-      anchorLabel: 'Unknown', 
-      targetLabel,
-      windowSizeMinutes,
-      correlationScore: count > 0 ? 1.0 : 0.0, // Simplified boolean correlation
-      sampleSize: count,
-      description: `Found ${count} instances of ${targetLabel} in the ${windowMinutes}m window.`
-    };
-  }
-
-  /**
-   * Graph Metabolism: Summarize and Prune.
-   * Identifies old, dense clusters and compresses them.
-   */
-  async dream(criteria: { minAgeDays: number, targetLabel: string }) {
-    // 1. Identify Candidates (Nodes older than X days)
-    const sql = `
-      SELECT id, properties 
-      FROM nodes 
-      WHERE list_contains(labels, ?) 
-        AND valid_from < (current_timestamp - INTERVAL ${criteria.minAgeDays} DAY)
-        AND valid_to IS NULL -- Active nodes only
-      LIMIT 50 -- Batch size
-    `;
-    
-    const candidates = await this.graph.db.query(sql, [criteria.targetLabel]);
-    if (candidates.length === 0) return;
-
-    // 2. Synthesize (Judge)
-    const prompt: JudgePrompt = {
-      goal: `Summarize these ${criteria.targetLabel} logs into a single concise insight.`,
-      nodeContent: candidates.map(c => typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties)
-    };
-    
-    const artifact = await this.askJudge(prompt);
-    
-    if (!artifact) return; // Judge failed
-
-    // 3. Identification of Anchor (Parent)
-    const candidateIds = candidates.map(c => c.id);
-    const potentialParents = await this.graph.native.traverse(candidateIds, undefined, 'in', undefined);
-    
-    if (potentialParents.length === 0) return; // Orphaned
-    
-    const anchorId = potentialParents[0];
-
-    // 4. Rewire & Prune
-    const summaryId = `summary:${randomUUID()}`;
-    const summaryProps = {
-      content: artifact.answer,
-      source_count: candidates.length,
-      generated_at: new Date().toISOString()
-    };
-    
-    await this.graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
-    await this.graph.addEdge(anchorId, summaryId, 'HAS_SUMMARY');
-    
-    for (const id of candidateIds) {
-      await this.graph.deleteNode(id);
-    }
-  }
-
-  // --- LLM Interaction ---
-
-  private async askScout(promptCtx: ScoutPrompt): Promise<ScoutDecision> {
-    const prompt = `
-      You are a Graph Scout navigating a blind topology.
-      Goal: "${promptCtx.goal}"
-      Current Node: ${promptCtx.currentNodeId} (Labels: ${promptCtx.currentNodeLabels.join(', ')})
-      Path History: ${promptCtx.pathHistory.join(' -> ')}
-      Available Edges: ${JSON.stringify(promptCtx.availableEdgeTypes)}
-      
-      Decide your next move.
-      - If you strongly believe this current node contains the answer, action: "CHECK".
-      - If you want to explore, action: "MOVE" and specify the "edgeType".
-      - If stuck, "ABORT".
-      - If you see multiple promising paths, you can provide "alternativeMoves".
-      
-      Return ONLY a JSON object:
-      { 
-        "action": "MOVE", 
-        "edgeType": "KNOWS", 
-        "confidence": 0.9, 
-        "reasoning": "...",
-        "alternativeMoves": [
-           { "edgeType": "WORKS_WITH", "confidence": 0.5, "reasoning": "..." }
-        ]
-      }
-    `;
-
-    try {
-      const raw = await this.config.llmProvider.generate(prompt);
-      // Basic JSON extraction attempt
-      const jsonStr = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
-      return JSON.parse(jsonStr) as ScoutDecision;
-    } catch (e) {
-      return { action: 'ABORT', confidence: 0, reasoning: 'LLM Parsing Error' };
-    }
-  }
-
-  private async askJudge(promptCtx: JudgePrompt): Promise<LabyrinthArtifact | null> {
-    const prompt = `
-      You are a Judge evaluating data.
-      Goal: "${promptCtx.goal}"
-      Data: ${JSON.stringify(promptCtx.nodeContent)}
-      
-      Does this data answer the goal?
-      Return ONLY a JSON object:
-      { "isAnswer": true, "answer": "The user is...", "confidence": 0.95 }
-    `;
-
-    try {
-      const raw = await this.config.llmProvider.generate(prompt);
-      const jsonStr = raw.match(/\{[\s\S]*\}/)?.[0] || raw;
-      // biome-ignore lint/suspicious/noExplicitAny: Weak schema for LLM response
-      const result = JSON.parse(jsonStr) as any;
-      
-      if (result.isAnswer) {
-        return {
-          answer: result.answer,
-          confidence: result.confidence,
-          traceId: '', // Filled by caller
-          sources: [] // Filled by caller
-        };
-      }
-      return null;
-    } catch (e) {
-      return null;
-    }
+  // --- Wrapper for Chronos ---
+  
+  async analyzeCorrelation(anchorNodeId: string, targetLabel: string, windowMinutes: number): Promise<CorrelationResult> {
+    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
   }
 }
