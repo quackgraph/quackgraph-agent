@@ -19,7 +19,6 @@ export const routerAgent = new Agent({
     }
   `,
   model: {
-    provider: 'GROQ',
-    name: 'llama-3.3-70b-versatile',
+    id: 'groq/llama-3.3-70b-versatile',
   }
 });

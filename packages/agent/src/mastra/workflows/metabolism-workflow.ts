@@ -29,9 +29,9 @@ const identifyCandidates = createStep({
       LIMIT 100
     `;
     const rows = await graph.db.query(sql, [inputData.targetLabel]);
-    
+
     const candidatesContent = rows.map((c) =>
-        typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
+      typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
     );
     const candidateIds = rows.map(c => c.id);
 
@@ -64,16 +64,16 @@ const synthesizeInsight = createStep({
 
     const response = await judge.generate(prompt);
     let summaryText = '';
-    
+
     try {
-        const jsonStr = response.text.match(/\{[\s\S]*\}/)?.[0] || response.text;
-        const result = JSON.parse(jsonStr);
-        if (result.isAnswer || result.answer) {
-            summaryText = result.answer;
-        }
-    } catch(e) {
-        // Fallback or just log, but don't crash workflow if one synthesis fails
-        console.error("Metabolism synthesis failed parsing", e);
+      const jsonStr = response.text.match(/\{[\s\S]*\}/)?.[0] || response.text;
+      const result = JSON.parse(jsonStr);
+      if (result.isAnswer || result.answer) {
+        summaryText = result.answer;
+      }
+    } catch (e) {
+      // Fallback or just log, but don't crash workflow if one synthesis fails
+      console.error("Metabolism synthesis failed parsing", e);
     }
 
     return { summaryText, candidateIds: inputData.candidateIds };
@@ -95,16 +95,16 @@ const applySummary = createStep({
     if (!inputData.summaryText || inputData.candidateIds.length === 0) return { success: false };
 
     const graph = getGraphInstance();
-    
+
     // Find parents
     const allParents = await graph.native.traverse(
-        inputData.candidateIds,
-        undefined,
-        'in',
-        undefined,
-        undefined
+      inputData.candidateIds,
+      undefined,
+      'in',
+      undefined,
+      undefined
     );
-    
+
     const candidateSet = new Set(inputData.candidateIds);
     const externalParents = allParents.filter(p => !candidateSet.has(p));
 
@@ -112,27 +112,29 @@ const applySummary = createStep({
 
     const summaryId = `summary:${randomUUID()}`;
     const summaryProps = {
-        content: inputData.summaryText,
-        source_count: inputData.candidateIds.length,
-        generated_at: new Date().toISOString(),
-        period_end: new Date().toISOString()
+      content: inputData.summaryText,
+      source_count: inputData.candidateIds.length,
+      generated_at: new Date().toISOString(),
+      period_end: new Date().toISOString()
     };
 
     await graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
 
     for (const parentId of externalParents) {
-        await graph.addEdge(parentId, summaryId, 'HAS_SUMMARY');
+      await graph.addEdge(parentId, summaryId, 'HAS_SUMMARY');
     }
 
     for (const id of inputData.candidateIds) {
-        await graph.deleteNode(id);
+      await graph.deleteNode(id);
     }
 
     return { success: true };
   },
 });
 
-export const metabolismWorkflow = createWorkflow({
+import { Workflow } from '@mastra/core/workflows';
+
+const workflow = createWorkflow({
   id: 'metabolism-workflow',
   inputSchema: z.object({
     minAgeDays: z.number(),
@@ -146,4 +148,6 @@ export const metabolismWorkflow = createWorkflow({
   .then(synthesizeInsight)
   .then(applySummary);
 
-metabolismWorkflow.commit();
+workflow.commit();
+
+export { workflow as metabolismWorkflow };

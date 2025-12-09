@@ -4,11 +4,12 @@ export enum ZoomLevel {
   CONTENT = 2    // Street View: Full JSON Data
 }
 
-// Interface for Injected Agents (Mastra or custom)
-export interface MastraAgent {
-  // biome-ignore lint/suspicious/noExplicitAny: Prompt can be string or structured
-  generate(prompt: string | any, options?: { signal?: AbortSignal }): Promise<{ text: string }>;
-}
+// Type alias for Mastra Agent - imports the actual Agent type from @mastra/core
+import type { Agent, ToolsInput } from '@mastra/core/agent';
+import type { Metric } from '@mastra/core/eval';
+
+// Re-export as an alias for cleaner internal usage
+export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
 
 export interface AgentConfig {
   llmProvider: {
@@ -80,9 +81,9 @@ export interface ScoutPrompt {
   activeDomain: string; // The semantic domain grounding this search
   currentNodeId: string;
   currentNodeLabels: string[];
-  sectorSummary: SectorSummary[]; 
-  pathHistory: string[]; 
-  timeContext?: string; 
+  sectorSummary: SectorSummary[];
+  pathHistory: string[];
+  timeContext?: string;
 }
 
 export interface JudgePrompt {

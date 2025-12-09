@@ -8,7 +8,7 @@ export { mastra } from './mastra';
 
 import { QuackGraph } from '@quackgraph/graph';
 import { Labyrinth } from './labyrinth';
-import { AgentConfig } from './types';
+import type { AgentConfig } from './types';
 import { mastra } from './mastra';
 
 /**
@@ -16,22 +16,29 @@ import { mastra } from './mastra';
  * Uses default Mastra agents (Scout, Judge, Router) unless overridden.
  */
 export function createAgent(graph: QuackGraph, config: AgentConfig) {
+  const scout = mastra.getAgent('scoutAgent');
+  const judge = mastra.getAgent('judgeAgent');
+  const router = mastra.getAgent('routerAgent');
+
+  if (!scout || !judge || !router) {
+    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
+  }
+
   return new Labyrinth(
     graph,
-    {
-      scout: mastra.getAgent('scoutAgent'),
-      judge: mastra.getAgent('judgeAgent'),
-      router: mastra.getAgent('routerAgent'),
-    },
+    { scout, judge, router },
     config
   );
 }
+
+
 
 /**
  * Runs the Metabolism (Dreaming) cycle to prune and summarize old nodes.
  */
 export async function runMetabolism(targetLabel: string, minAgeDays: number = 30) {
-    const workflow = mastra.getWorkflow('metabolismWorkflow');
-    if (!workflow) throw new Error("Metabolism workflow not found.");
-    return await workflow.execute({ triggerData: { targetLabel, minAgeDays } });
+  const workflow = mastra.getWorkflow('metabolismWorkflow');
+  if (!workflow) throw new Error("Metabolism workflow not found.");
+  const run = await workflow.createRunAsync();
+  return run.start({ inputData: { targetLabel, minAgeDays } });
 }

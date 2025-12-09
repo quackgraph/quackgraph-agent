@@ -34,9 +34,7 @@ export const scoutAgent = new Agent({
     }
   `,
   model: {
-    provider: 'GROQ',
-    name: 'llama-3.3-70b-versatile',
-    toolChoice: 'auto',
+    id: 'groq/llama-3.3-70b-versatile',
   },
   tools: {
     sectorScanTool,

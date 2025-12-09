@@ -96,7 +96,7 @@ export class Labyrinth {
         `;
 
       try {
-        const res = await this.agents.router.generate(routerPrompt, { signal: rootSignal });
+        const res = await this.agents.router.generate(routerPrompt, { abortSignal: rootSignal });
         const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
         const decision = JSON.parse(jsonStr);
         const valid = availableDomains.find(
@@ -145,8 +145,8 @@ export class Labyrinth {
     }
 
     if (startNodes.length === 0) {
-        log.outcome = 'EXHAUSTED';
-        return null;
+      log.outcome = 'EXHAUSTED';
+      return null;
     }
 
     // Initialize Root Cursor
@@ -229,7 +229,7 @@ export class Labyrinth {
             // biome-ignore lint/suspicious/noExplicitAny: decision blob
             let decision: any;
             try {
-              const res = await this.agents.scout.generate(scoutPrompt, { signal: rootSignal });
+              const res = await this.agents.scout.generate(scoutPrompt, { abortSignal: rootSignal });
               const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
               decision = JSON.parse(jsonStr);
             } catch (e) {
@@ -267,7 +267,7 @@ export class Labyrinth {
               `;
 
               try {
-                const res = await this.agents.judge.generate(judgePrompt, { signal: rootSignal });
+                const res = await this.agents.judge.generate(judgePrompt, { abortSignal: rootSignal });
                 const jsonStr = res.text.match(/\{[\s\S]*\}/)?.[0] || res.text;
                 // biome-ignore lint/suspicious/noExplicitAny: artifact shape
                 const artifact = JSON.parse(jsonStr) as any;
@@ -277,9 +277,9 @@ export class Labyrinth {
                   artifact.confidence >= (this.config.confidenceThreshold || 0.7)
                 ) {
                   const finalArtifact = {
-                      ...artifact,
-                      traceId,
-                      sources: [cursor.currentNodeId]
+                    ...artifact,
+                    traceId,
+                    sources: [cursor.currentNodeId]
                   };
                   foundArtifact = { type: 'FOUND', artifact: finalArtifact, finalStepId: currentStepId };
                   rootController.abort(); // KILL SWITCH
@@ -372,7 +372,7 @@ export class Labyrinth {
         await Promise.allSettled(processingPromises);
 
         if (foundArtifact) {
-            break;
+          break;
         }
 
         // Pruning
@@ -408,14 +408,14 @@ export class Labyrinth {
   getTrace(traceId: string): TraceLog | undefined {
     return this.traces.get(traceId);
   }
-  
+
   /**
    * Returns a JSON-serializable version of the trace for debugging or frontend rendering.
    */
   getTraceJSON(traceId: string): string | undefined {
-      const trace = this.traces.get(traceId);
-      if(!trace) return undefined;
-      return JSON.stringify(trace, null, 2);
+    const trace = this.traces.get(traceId);
+    if (!trace) return undefined;
+    return JSON.stringify(trace, null, 2);
   }
 
   private reconstructPath(allSteps: TraceStep[], finalStepId: number): TraceStep[] {
