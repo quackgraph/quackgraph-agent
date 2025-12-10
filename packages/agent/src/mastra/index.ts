@@ -4,12 +4,14 @@ import { DefaultExporter, SensitiveDataFilter } from '@mastra/core/ai-tracing';
 import { scoutAgent } from './agents/scout-agent';
 import { judgeAgent } from './agents/judge-agent';
 import { routerAgent } from './agents/router-agent';
+import { scribeAgent } from './agents/scribe-agent';
 import { metabolismWorkflow } from './workflows/metabolism-workflow';
 import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
+import { mutationWorkflow } from './workflows/mutation-workflow';
 
 export const mastra = new Mastra({
-  agents: { scoutAgent, judgeAgent, routerAgent },
-  workflows: { metabolismWorkflow, labyrinthWorkflow },
+  agents: { scoutAgent, judgeAgent, routerAgent, scribeAgent },
+  workflows: { metabolismWorkflow, labyrinthWorkflow, mutationWorkflow },
   storage: new LibSQLStore({
     url: ':memory:',
   }),

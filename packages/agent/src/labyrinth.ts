@@ -162,4 +162,39 @@ export class Labyrinth {
   ): Promise<CorrelationResult> {
     return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
   }
+
+  /**
+   * Execute a Natural Language Mutation.
+   * Uses the Scribe Agent to parse intent and apply graph operations.
+   */
+  async mutate(query: string, timeContext?: TimeContext): Promise<{ success: boolean; summary: string }> {
+    return this.tracer.startActiveSpan('labyrinth.mutate', async (span: Span) => {
+      try {
+        const workflow = mastra.getWorkflow('mutationWorkflow');
+        if (!workflow) throw new Error("Mutation Workflow not registered.");
+
+        const inputData = {
+          query,
+          asOf: timeContext?.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext?.asOf,
+          userId: 'Me' // Default context
+        };
+
+        const run = await workflow.createRunAsync();
+        const result = await run.start({ inputData });
+        if (result.status === 'failed') {
+          throw new Error(`Mutation failed: ${result.error.message}`);
+        }
+        if (result.status !== 'success') {
+          throw new Error(`Mutation failed with status: ${result.status}`);
+        }
+        return result.result as { success: boolean; summary: string };
+          } catch (e) {
+            this.logger.error("Mutation failed", { error: e });
+            span.recordException(e as Error);
+            return { success: false, summary: `Mutation failed: ${(e as Error).message}` };
+          } finally {
+            span.end();
+          }
+    });
+  }
 }

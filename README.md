@@ -255,3 +255,48 @@ graph LR
     3.  **Aggregation:** Rust counts the occurrences of "Sugar" in those windows.
     4.  **Judge LLM:** Receives the stats: "Sugar appeared in the 4-hour pre-window of 85% of migraines."
     5.  **Why it wins:** The LLM didn't have to look at 1,000 meal logs and calculate time deltas. Rust did the math; LLM did the storytelling.
+
+---
+
+## 12. The Scribe: Semantic Mutations & Time Travel
+
+Most Graph Agents are read-only because letting an LLM write directly to a database is dangerous. It hallucinates IDs and messes up timestamps.
+
+**QuackGraph introduces The Scribe:** A specialized agent for "Safe Mutations."
+
+### 12.1 The "Resolve-then-Mutate" Workflow
+
+When a user says: *"I sold Susi yesterday."*
+
+1.  **Entity Resolution (Trace Awareness):**
+    *   Scribe checks the `TraceHistory` from the Scout.
+    *   It identifies that "Susi" refers to Node `cat:991` (Context: "My Cat"), not `person:susi` (Context: "Coworker").
+
+2.  **Temporal Grounding (System 2 Thinking):**
+    *   The LLM is **not** allowed to write `yesterday` into the database.
+    *   Scribe uses a deterministic utility to parse "Yesterday" relative to `SystemTime`.
+    *   Output: `valid_to: "2023-12-07T12:00:00Z"`.
+
+3.  **The Atomic Patch:**
+    *   Scribe generates a JSON Patch, not SQL.
+    ```json
+    {
+      "op": "CLOSE_EDGE",
+      "source": "user:me",
+      "target": "cat:991",
+      "type": "OWNED",
+      "valid_to": "2023-12-07T12:00:00Z"
+    }
+    ```
+
+4.  **Batch Execution:**
+    *   QuackGraph applies the patch in a single ACID transaction.
+
+### 12.2 Handling Ambiguity
+
+If the user says *"Delete the blue car,"* and the graph contains two blue cars:
+*   **Scout:** Finds `car:1` (Blue Ford) and `car:2` (Blue Chevy).
+*   **Scribe:** Detects ambiguity.
+*   **Action:** Instead of guessing (and deleting the wrong car), Scribe returns `requiresClarification: "Which blue car? The Ford or the Chevy?"`.
+
+This prevents data corruption in long-running graphs.
