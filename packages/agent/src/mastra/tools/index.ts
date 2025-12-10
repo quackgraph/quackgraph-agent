@@ -26,8 +26,10 @@ export const sectorScanTool = createTool({
     const tools = new GraphTools(graph);
 
     // 1. Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
     
     // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
     const asOf = context.asOf ?? ctxAsOf;
@@ -62,8 +64,11 @@ export const topologyScanTool = createTool({
     const tools = new GraphTools(graph);
     
     // Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
+
     const asOf = context.asOf ?? ctxAsOf;
     
     // Enforce Domain Governance if implicit
@@ -120,7 +125,9 @@ export const temporalScanTool = createTool({
     const tools = new GraphTools(graph);
     
     // Enforce Governance
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
+
     if (ctxDomain && context.edgeType) {
        const registry = getSchemaRegistry();
        if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {

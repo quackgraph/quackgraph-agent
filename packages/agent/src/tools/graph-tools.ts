@@ -7,8 +7,10 @@ export class GraphTools {
 
   private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
     if (typeof contextOrAsOf === 'number') return contextOrAsOf;
-    if (!contextOrAsOf?.asOf) return undefined;
-    return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
+    if (contextOrAsOf?.asOf) {
+      return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
+    }
+    return undefined;
   }
 
   /**

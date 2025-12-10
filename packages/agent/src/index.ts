@@ -8,7 +8,6 @@ export * from './agent-schemas';
 // Utilities
 export * from './agent/chronos';
 export * from './governance/schema-registry';
-export * from './tools/graph-tools';
 
 // Mastra Internals (Exposed for advanced configuration)
 export { mastra } from './mastra';
