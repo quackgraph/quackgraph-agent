@@ -353,11 +353,34 @@ export class Labyrinth {
                     }
                     return;
                   } else if (decision.action === 'MOVE') {
+                    // Multi-Hop Path (Ghost Map Navigation)
+                    if (decision.path && decision.path.length > 0) {
+                        // The path is a sequence of node IDs to visit. 
+                        const targetId = decision.path[decision.path.length - 1];
+                        // Calculate confidence decay based on path length (0.9 per hop)
+                        const decay = 0.9 ** decision.path.length;
+                        
+                        nextCursors.push({
+                            id: randomUUID(),
+                            currentNodeId: targetId,
+                            path: [...cursor.path, ...decision.path],
+                            // We don't have exact edges for multi-hop yet without querying, using placeholder
+                            pathEdges: [...cursor.pathEdges, ...decision.path.map(() => 'GHOST_JUMP')],
+                            traceHistory: [...cursor.traceHistory, `[MOVE] Path: ${decision.path.join(' -> ')}`],
+                            stepCount: cursor.stepCount + decision.path.length,
+                            confidence: cursor.confidence * decision.confidence * decay,
+                            lastEdgeType: 'GHOST_JUMP'
+                        });
+                        // If path is provided, we skip single-edge processing
+                        return;
+                    }
+
                     // biome-ignore lint/suspicious/noExplicitAny: flexible move structure
                     const moves: any[] = [];
                     // Using discriminated union access
-                    if (decision.edgeType)
+                    if (decision.edgeType) {
                       moves.push({ edge: decision.edgeType, conf: decision.confidence });
+                    }
                     if (decision.alternativeMoves) {
                       for (const alt of decision.alternativeMoves) {
                         moves.push({ edge: alt.edgeType, conf: alt.confidence });

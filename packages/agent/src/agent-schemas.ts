@@ -15,7 +15,8 @@ export const JudgeDecisionSchema = z.object({
 // Discriminated Union for Scout Actions
 const MoveAction = z.object({
   action: z.literal('MOVE'),
-  edgeType: z.string().describe("The edge type to traverse"),
+  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
+  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
   confidence: z.number().min(0).max(1),
   reasoning: z.string(),
   alternativeMoves: z.array(z.object({

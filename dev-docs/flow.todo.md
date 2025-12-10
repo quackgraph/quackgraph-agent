@@ -6,6 +6,10 @@ I want feature so that external agent can see whole graph and relationship of a 
 
 ===
 
+graph UI
+
+===
+
 setup biome to packages/agent which runnable from monorepo root
 
 ===

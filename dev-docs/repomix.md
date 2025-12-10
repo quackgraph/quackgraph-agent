@@ -2998,146 +2998,6 @@ git add -A && git commit -m "message" && git push
 The Agent extends and orchestrates the Core, not the other way around.
 ````
 
-## File: packages/agent/src/agent/chronos.ts
-````typescript
-import type { QuackGraph } from '@quackgraph/graph';
-import type { CorrelationResult, EvolutionResult, SectorSummary, TimeStepDiff } from '../types';
-import type { GraphTools } from '../tools/graph-tools';
-
-export class Chronos {
-  constructor(private graph: QuackGraph, private tools: GraphTools) { }
-
-  /**
-   * Finds events connected to the anchor node that occurred or overlapped
-   * with the specified time window.
-   */
-  async findEventsDuring(
-    anchorNodeId: string,
-    windowStart: Date,
-    windowEnd: Date,
-    constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'
-  ): Promise<string[]> {
-    // Use native directly for granular control
-    return await this.graph.native.traverseInterval(
-      [anchorNodeId],
-      undefined,
-      'out',
-      windowStart.getTime(),
-      windowEnd.getTime(),
-      constraint
-    );
-  }
-
-  /**
-   * Analyze correlation between an anchor node and a target label within a time window.
-   * Uses DuckDB SQL window functions.
-   */
-  async analyzeCorrelation(
-    anchorNodeId: string,
-    targetLabel: string,
-    windowMinutes: number
-  ): Promise<CorrelationResult> {
-    const anchorRows = await this.graph.db.query(
-      "SELECT valid_from FROM nodes WHERE id = ?",
-      [anchorNodeId]
-    );
-
-    if (anchorRows.length === 0) {
-      throw new Error(`Anchor node ${anchorNodeId} not found`);
-    }
-
-    const sql = `
-      WITH Anchor AS (
-        SELECT valid_from as t_anchor 
-        FROM nodes 
-        WHERE id = ?
-      ),
-      Targets AS (
-        SELECT id, valid_from as t_target 
-        FROM nodes 
-        WHERE list_contains(labels, ?)
-      )
-      SELECT count(*) as count
-      FROM Targets, Anchor
-      WHERE t_target >= (t_anchor - INTERVAL ${windowMinutes} MINUTE)
-        AND t_target <= t_anchor
-    `;
-
-    // biome-ignore lint/suspicious/noExplicitAny: SQL result
-    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
-    // biome-ignore lint/suspicious/noExplicitAny: SQL result row check
-    const count = Number(result[0]?.count || 0);
-
-    return {
-      anchorLabel: 'Unknown',
-      targetLabel,
-      windowSizeMinutes: windowMinutes,
-      correlationScore: count > 0 ? 1.0 : 0.0, // Simplified boolean correlation
-      sampleSize: count,
-      description: `Found ${count} instances of ${targetLabel} in the ${windowMinutes}m window.`
-    };
-  }
-
-  /**
-   * Evolutionary Diffing: Watches how the topology around a node changes over time.
-   * Returns a diff of edges (Added, Removed, Persisted) between time snapshots.
-   */
-  async evolutionaryDiff(anchorNodeId: string, timestamps: Date[]): Promise<EvolutionResult> {
-    const sortedTimes = timestamps.sort((a, b) => a.getTime() - b.getTime());
-    const timeline: TimeStepDiff[] = [];
-
-    // Initial state (baseline)
-    let prevSummary: Map<string, number> = new Map();
-
-    for (const ts of sortedTimes) {
-      const micros = ts.getTime() * 1000;
-      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
-
-      const currentSummary = new Map<string, number>();
-      for (const s of currentSummaryList) {
-        currentSummary.set(s.edgeType, s.count);
-      }
-
-      const addedEdges: SectorSummary[] = [];
-      const removedEdges: SectorSummary[] = [];
-      const persistedEdges: SectorSummary[] = [];
-
-      // Compare Current vs Prev
-      for (const [type, count] of currentSummary) {
-        if (prevSummary.has(type)) {
-          persistedEdges.push({ edgeType: type, count });
-        } else {
-          addedEdges.push({ edgeType: type, count });
-        }
-      }
-
-      for (const [type, count] of prevSummary) {
-        if (!currentSummary.has(type)) {
-          removedEdges.push({ edgeType: type, count });
-        }
-      }
-
-      const prevTotal = Array.from(prevSummary.values()).reduce((a, b) => a + b, 0);
-      const currTotal = Array.from(currentSummary.values()).reduce((a, b) => a + b, 0);
-
-      const densityChange = prevTotal === 0 ? (currTotal > 0 ? 100 : 0) : ((currTotal - prevTotal) / prevTotal) * 100;
-
-      timeline.push({
-        timestamp: ts,
-        addedEdges,
-        removedEdges,
-        persistedEdges,
-        densityChange
-      });
-
-      prevSummary = currentSummary;
-    }
-
-    return { anchorNodeId, timeline };
-  }
-}
-````
-
 ## File: packages/agent/src/lib/graph-instance.ts
 ````typescript
 import type { QuackGraph } from '@quackgraph/graph';
@@ -3175,7 +3035,8 @@ export const JudgeDecisionSchema = z.object({
 // Discriminated Union for Scout Actions
 const MoveAction = z.object({
   action: z.literal('MOVE'),
-  edgeType: z.string().describe("The edge type to traverse"),
+  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
+  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
   confidence: z.number().min(0).max(1),
   reasoning: z.string(),
   alternativeMoves: z.array(z.object({
@@ -3217,44 +3078,6 @@ export const ScoutDecisionSchema = z.discriminatedUnion('action', [
 ]);
 ````
 
-## File: packages/agent/biome.json
-````json
-{
-  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
-  "vcs": {
-    "enabled": true,
-    "clientKind": "git",
-    "useIgnoreFile": false
-  },
-  "files": {
-    "ignoreUnknown": true,
-    "includes": [
-      "**",
-      "!**/dist",
-      "!**/node_modules"
-    ]
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
-  },
-  "linter": {
-    "enabled": true,
-    "rules": {
-      "recommended": true
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "single",
-      "trailingCommas": "es5"
-    }
-  }
-}
-````
-
 ## File: packages/agent/tsconfig.json
 ````json
 {
@@ -3280,91 +3103,6 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-});
-````
-
-## File: scripts/git-pull.ts
-````typescript
-#!/usr/bin/env bun
-/**
- * Git Pull Script - Federated Pull for Nested Repositories
- * 
- * Usage:
- *   bun run scripts/git-pull.ts
- *   bun run pull:all
- */
-
-import { $ } from "bun";
-
-const INNER_REPO_PATH = "packages/quackgraph";
-const ROOT_DIR = import.meta.dir.replace("/scripts", "");
-
-async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
-    console.log(`\n⬇️ [${repoName}] Processing...`);
-
-    // Check if directory exists and has .git
-    const fs = await import("node:fs/promises");
-    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
-
-    if (!hasGit && repoUrl) {
-        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
-        try {
-            // Ensure parent dir exists
-            await $`mkdir -p ${cwd}`;
-            // Remove the empty dir if it exists so clone works (or clone into it if empty)
-            // Safest is to remove checking uniqueness or just run git clone
-            // If cwd exists but is empty, git clone <url> <dir> works.
-
-            await $`git clone ${repoUrl} ${cwd}`;
-            console.log(`   ✅ Successfully cloned ${repoName}`);
-            return;
-        } catch (error) {
-            console.error(`   ❌ Failed to clone ${repoName}:`, error);
-            throw error;
-        }
-    }
-
-    console.log(`   ⬇️ Pulling changes...`);
-    try {
-        await $`git -C ${cwd} pull`.quiet();
-        console.log(`   ✅ Successfully pulled ${repoName}`);
-    } catch (error) {
-        console.error(`   ❌ Failed to pull ${repoName}:`, error);
-        throw error;
-    }
-}
-
-async function pullAll(): Promise<void> {
-    console.log("🔄 Git Pull - Federated Repository Update");
-    console.log("=========================================");
-
-    // Pull parent first
-    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
-    await pullRepo(ROOT_DIR, "quackgraph-agent");
-
-    // Pull inner repo
-    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
-    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
-    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
-
-    // Custom logic to ensure 'agent' branch
-    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
-    // Force checkout agent branch if not already
-    try {
-        await $`git -C ${innerRepoPath} checkout agent`.quiet();
-        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
-    } catch (e) {
-        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
-    }
-
-    console.log("\n\n=========================================");
-    console.log("✅ Git pull completed successfully!");
-    console.log("=========================================\n");
-}
-
-pullAll().catch((error) => {
-    console.error("\n❌ Pull failed:", error);
-    process.exit(1);
 });
 ````
 
@@ -3590,6 +3328,144 @@ SOFTWARE.
 }
 ````
 
+## File: packages/agent/src/agent/chronos.ts
+````typescript
+import type { QuackGraph } from '@quackgraph/graph';
+import type { CorrelationResult, EvolutionResult, SectorSummary, TimeStepDiff } from '../types';
+import type { GraphTools } from '../tools/graph-tools';
+
+export class Chronos {
+  constructor(private graph: QuackGraph, private tools: GraphTools) { }
+
+  /**
+   * Finds events connected to the anchor node that occurred or overlapped
+   * with the specified time window.
+   */
+  async findEventsDuring(
+    anchorNodeId: string,
+    windowStart: Date,
+    windowEnd: Date,
+    constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'
+  ): Promise<string[]> {
+    // Use native directly for granular control
+    return await this.graph.native.traverseInterval(
+      [anchorNodeId],
+      undefined,
+      'out',
+      windowStart.getTime(),
+      windowEnd.getTime(),
+      constraint
+    );
+  }
+
+  /**
+   * Analyze correlation between an anchor node and a target label within a time window.
+   * Uses DuckDB SQL window functions.
+   */
+  async analyzeCorrelation(
+    anchorNodeId: string,
+    targetLabel: string,
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
+    const anchorRows = await this.graph.db.query(
+      "SELECT valid_from FROM nodes WHERE id = ?",
+      [anchorNodeId]
+    );
+
+    if (anchorRows.length === 0) {
+      throw new Error(`Anchor node ${anchorNodeId} not found`);
+    }
+
+    const sql = `
+      WITH Anchor AS (
+        SELECT valid_from as t_anchor 
+        FROM nodes 
+        WHERE id = ?
+      ),
+      Targets AS (
+        SELECT id, valid_from as t_target 
+        FROM nodes 
+        WHERE list_contains(labels, ?)
+      )
+      SELECT count(*) as count
+      FROM Targets, Anchor
+      WHERE t_target >= (t_anchor - INTERVAL ${windowMinutes} MINUTE)
+        AND t_target <= t_anchor
+    `;
+
+    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
+    const count = Number(result[0]?.count || 0);
+
+    return {
+      anchorLabel: 'Unknown',
+      targetLabel,
+      windowSizeMinutes: windowMinutes,
+      correlationScore: count > 0 ? 1.0 : 0.0, // Simplified boolean correlation
+      sampleSize: count,
+      description: `Found ${count} instances of ${targetLabel} in the ${windowMinutes}m window.`
+    };
+  }
+
+  /**
+   * Evolutionary Diffing: Watches how the topology around a node changes over time.
+   * Returns a diff of edges (Added, Removed, Persisted) between time snapshots.
+   */
+  async evolutionaryDiff(anchorNodeId: string, timestamps: Date[]): Promise<EvolutionResult> {
+    const sortedTimes = timestamps.sort((a, b) => a.getTime() - b.getTime());
+    const timeline: TimeStepDiff[] = [];
+
+    // Initial state (baseline)
+    let prevSummary: Map<string, number> = new Map();
+
+    for (const ts of sortedTimes) {
+      const micros = ts.getTime() * 1000;
+      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
+
+      const currentSummary = new Map<string, number>();
+      for (const s of currentSummaryList) {
+        currentSummary.set(s.edgeType, s.count);
+      }
+
+      const addedEdges: SectorSummary[] = [];
+      const removedEdges: SectorSummary[] = [];
+      const persistedEdges: SectorSummary[] = [];
+
+      // Compare Current vs Prev
+      for (const [type, count] of currentSummary) {
+        if (prevSummary.has(type)) {
+          persistedEdges.push({ edgeType: type, count });
+        } else {
+          addedEdges.push({ edgeType: type, count });
+        }
+      }
+
+      for (const [type, count] of prevSummary) {
+        if (!currentSummary.has(type)) {
+          removedEdges.push({ edgeType: type, count });
+        }
+      }
+
+      const prevTotal = Array.from(prevSummary.values()).reduce((a, b) => a + b, 0);
+      const currTotal = Array.from(currentSummary.values()).reduce((a, b) => a + b, 0);
+
+      const densityChange = prevTotal === 0 ? (currTotal > 0 ? 100 : 0) : ((currTotal - prevTotal) / prevTotal) * 100;
+
+      timeline.push({
+        timestamp: ts,
+        addedEdges,
+        removedEdges,
+        persistedEdges,
+        densityChange
+      });
+
+      prevSummary = currentSummary;
+    }
+
+    return { anchorNodeId, timeline };
+  }
+}
+````
+
 ## File: packages/agent/src/mastra/tools/index.ts
 ````typescript
 import { createTool } from '@mastra/core/tools';
@@ -3627,16 +3503,42 @@ export const topologyScanTool = createTool({
   description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
-    edgeType: z.string(),
+    edgeType: z.string().optional(),
     asOf: z.number().optional(),
     minValidFrom: z.number().optional(),
+    depth: z.number().min(1).max(4).optional(),
   }),
   outputSchema: z.object({
-    neighborIds: z.array(z.string()),
+    neighborIds: z.array(z.string()).optional(),
+    map: z.string().optional(),
+    truncated: z.boolean().optional(),
   }),
   execute: async ({ context }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
+
+    if (context.depth && context.depth > 1) {
+      // Ghost Map Mode (LOD 1.5)
+      const maps = [];
+      let truncated = false;
+      for (const id of context.nodeIds) {
+        const res = await tools.getNavigationalMap(id, context.depth);
+        maps.push(res.map);
+        if (res.truncated) truncated = true;
+      }
+      return { map: maps.join('\n\n'), truncated };
+    }
+
+    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
+    if (!context.edgeType) {
+        const maps = [];
+        for (const id of context.nodeIds) {
+            const res = await tools.getNavigationalMap(id, 1);
+            maps.push(res.map);
+        }
+        return { map: maps.join('\n\n') };
+    }
+
     const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, context.asOf, context.minValidFrom);
     return { neighborIds };
   },
@@ -3680,6 +3582,129 @@ export const contentRetrievalTool = createTool({
     const content = await tools.contentRetrieval(context.nodeIds);
     return { content };
   },
+});
+````
+
+## File: packages/agent/biome.json
+````json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "es5"
+    }
+  }
+}
+````
+
+## File: scripts/git-pull.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * Git Pull Script - Federated Pull for Nested Repositories
+ * 
+ * Usage:
+ *   bun run scripts/git-pull.ts
+ *   bun run pull:all
+ */
+
+import { $ } from "bun";
+
+const INNER_REPO_PATH = "packages/quackgraph";
+const ROOT_DIR = import.meta.dir.replace("/scripts", "");
+
+async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
+    console.log(`\n⬇️ [${repoName}] Processing...`);
+
+    // Check if directory exists and has .git
+    const fs = await import("node:fs/promises");
+    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
+
+    if (!hasGit && repoUrl) {
+        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
+        try {
+            // Ensure parent dir exists
+            await $`mkdir -p ${cwd}`;
+            // Remove the empty dir if it exists so clone works (or clone into it if empty)
+            // Safest is to remove checking uniqueness or just run git clone
+            // If cwd exists but is empty, git clone <url> <dir> works.
+
+            await $`git clone ${repoUrl} ${cwd}`;
+            console.log(`   ✅ Successfully cloned ${repoName}`);
+            return;
+        } catch (error) {
+            console.error(`   ❌ Failed to clone ${repoName}:`, error);
+            throw error;
+        }
+    }
+
+    console.log(`   ⬇️ Pulling changes...`);
+    try {
+        await $`git -C ${cwd} pull`.quiet();
+        console.log(`   ✅ Successfully pulled ${repoName}`);
+    } catch (error) {
+        console.error(`   ❌ Failed to pull ${repoName}:`, error);
+        throw error;
+    }
+}
+
+async function pullAll(): Promise<void> {
+    console.log("🔄 Git Pull - Federated Repository Update");
+    console.log("=========================================");
+
+    // Pull parent first
+    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
+    await pullRepo(ROOT_DIR, "quackgraph-agent");
+
+    // Pull inner repo
+    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
+    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
+    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
+
+    // Custom logic to ensure 'agent' branch
+    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
+    // Force checkout agent branch if not already
+    try {
+        await $`git -C ${innerRepoPath} checkout agent`.quiet();
+        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
+    } catch (e) {
+        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
+    }
+
+    console.log("\n\n=========================================");
+    console.log("✅ Git pull completed successfully!");
+    console.log("=========================================\n");
+}
+
+pullAll().catch((error) => {
+    console.error("\n❌ Pull failed:", error);
+    process.exit(1);
 });
 ````
 
@@ -3734,7 +3759,7 @@ By decoupling **Topology (Structure)** from **Content (Data)**, QuackLabyrinth t
 
 Standard RAG systems fail because they lack "Altitude." They search the entire database at ground level. QuackLabyrinth implements a **Semantic Level of Detail (S-LOD)** system, using ephemeral "Ghost Nodes" to guide the LLM from global context to specific data.
 
-### 2.1 The Three-Layer Zoom
+### 2.1 The Semantic Zoom (LODs)
 
 1.  **LOD 0: Satellite View (The Ghost Layer)**
     *   **Data:** Dynamic Cluster Centroids (Virtual Nodes).
@@ -3745,6 +3770,12 @@ Standard RAG systems fail because they lack "Altitude." They search the entire d
     *   **Data:** The "Spine" (Entities & Relationships). No chunks.
     *   **Action:** The Scout navigates the topology. "Path: `(User) --[LOGGED]--> (Symptom: Headache) --[COINCIDES_WITH]--> (Diet: Caffeine)`."
     *   **Mechanism:** Integer-only traversal in Rust.
+
+1.5 **LOD 1.5: The Ghost Map (Navigational Radar)**
+    *   **Data:** ASCII Tree with geometric pruning (Depth 1-4).
+    *   **Action:** The Scout requests `topology-scan(depth: 3)`.
+    *   **Output:** `[ROOT] User:Alex ├──[HAS_SYMPTOM]──> (Migraine) 🔥 ...`
+    *   **Benefit:** Enables multi-hop planning in a single inference step.
 
 3.  **LOD 2: Street View (The Data Layer)**
     *   **Data:** Rich Text, PDF Chunks, JSON Blobs.
@@ -3967,6 +3998,49 @@ graph LR
     5.  **Why it wins:** The LLM didn't have to look at 1,000 meal logs and calculate time deltas. Rust did the math; LLM did the storytelling.
 ````
 
+## File: packages/agent/src/mastra/agents/judge-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+
+export const judgeAgent = new Agent({
+  name: 'Judge Agent',
+  instructions: `
+    You are a Judge evaluating data from a Knowledge Graph.
+    
+    Input provided:
+    - Goal: The user's question.
+    - Data: Content of the nodes found.
+    - Time Context: Relevant timeframe.
+    
+    Task: Determine if the data answers the goal.
+  `,
+  model: {
+    id: 'groq/llama-3.3-70b-versatile',
+  }
+});
+````
+
+## File: packages/agent/src/mastra/agents/router-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+
+export const routerAgent = new Agent({
+  name: 'Router Agent',
+  instructions: `
+    You are a Semantic Router for a Knowledge Graph.
+    
+    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
+    
+    Input provided:
+    - Goal: User query.
+    - Available Domains: List of domains and descriptions.
+  `,
+  model: {
+    id: 'groq/llama-3.3-70b-versatile',
+  }
+});
+````
+
 ## File: packages/agent/src/governance/schema-registry.ts
 ````typescript
 import type { DomainConfig } from '../types';
@@ -4039,45 +4113,47 @@ export class SchemaRegistry {
 }
 ````
 
-## File: packages/agent/src/mastra/agents/judge-agent.ts
+## File: packages/agent/src/mastra/agents/scout-agent.ts
 ````typescript
 import { Agent } from '@mastra/core/agent';
+import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
 
-export const judgeAgent = new Agent({
-  name: 'Judge Agent',
+export const scoutAgent = new Agent({
+  name: 'Scout Agent',
   instructions: `
-    You are a Judge evaluating data from a Knowledge Graph.
+    You are a Graph Scout navigating a topology.
     
-    Input provided:
-    - Goal: The user's question.
-    - Data: Content of the nodes found.
-    - Time Context: Relevant timeframe.
+    Your goal is to decide the next move based on the provided context.
     
-    Task: Determine if the data answers the goal.
+    Context provided in user message:
+    - Goal: The user's query.
+    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
+    - Current Node: ID and Labels.
+    - Path History: Nodes visited so far.
+    - Satellite View: A summary of outgoing edges (LOD 0).
+    - Time Context: Relevant timestamps.
+
+    Decide your next move:
+    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using `topology-scan` with `depth: 2` or `3`.
+      - Use Depth 1 to check immediate neighbors.
+      - Use Depth 2-3 to explore structure without moving.
+      - The map shows "🔥" for hot paths (high pheromones).
+
+    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
+    - **Exploration:** 
+      - Single Hop: Action "MOVE" with `edgeType`.
+      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with `path: [id1, id2]`.
+    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
+    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
+    - **Abort:** If stuck or exhausted, action: "ABORT".
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',
-  }
-});
-````
-
-## File: packages/agent/src/mastra/agents/router-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-
-export const routerAgent = new Agent({
-  name: 'Router Agent',
-  instructions: `
-    You are a Semantic Router for a Knowledge Graph.
-    
-    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
-    
-    Input provided:
-    - Goal: User query.
-    - Available Domains: List of domains and descriptions.
-  `,
-  model: {
-    id: 'groq/llama-3.3-70b-versatile',
+  },
+  tools: {
+    sectorScanTool,
+    topologyScanTool,
+    temporalScanTool
   }
 });
 ````
@@ -4136,10 +4212,67 @@ export class GraphTools {
   }
 
   /**
+   * LOD 1.5: Ghost Map / Navigational Map
+   * Generates an ASCII tree of the topology up to a certain depth.
+   * Uses geometric pruning to keep the map readable.
+   */
+  async getNavigationalMap(rootId: string, depth: number = 1): Promise<{ map: string, truncated: boolean }> {
+    const maxDepth = Math.min(depth, 4);
+    const treeLines: string[] = [`[ROOT] ${rootId}`];
+    let isTruncated = false;
+
+    // Helper for recursion
+    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
+      if (currentDepth >= maxDepth) return;
+
+      // Geometric pruning: 10 -> 5 -> 3 -> 1
+      const branchLimit = Math.floor(10 / (currentDepth + 1));
+      let branchesCount = 0;
+
+      // 1. Get stats to find "hot" edges
+      const stats = await this.getSectorSummary([currentId]);
+      
+      for (const stat of stats) {
+        if (branchesCount >= branchLimit) {
+            isTruncated = true;
+            break;
+        }
+
+        const edgeType = stat.edgeType;
+        const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
+        
+        // 2. Traverse to get samples (fetch just enough to display)
+        const neighbors = await this.topologyScan([currentId], edgeType);
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+        
+        for (let i = 0; i < displayNeighbors.length; i++) {
+             if (branchesCount >= branchLimit) { isTruncated = true; break; }
+             const neighborId = displayNeighbors[i];
+             const connector = (i === displayNeighbors.length - 1 && branchesCount === branchLimit - 1) ? '└──' : '├──';
+             
+             treeLines.push(`${prefix}${connector}[${edgeType}]──> (${neighborId})${heatMarker}`);
+             
+             const nextPrefix = prefix + (connector === '└──' ? '    ' : '│   ');
+             await buildTree(neighborId, currentDepth + 1, nextPrefix);
+             branchesCount++;
+        }
+      }
+    };
+
+    await buildTree(rootId, 0, ' ');
+    
+    return {
+        map: treeLines.join('\n'),
+        truncated: isTruncated
+    };
+  }
+
+  /**
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType?: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
     // Native traverse does not support minValidFrom yet
     return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
@@ -4248,44 +4381,6 @@ export class GraphTools {
     }
   }
 }
-````
-
-## File: packages/agent/src/mastra/agents/scout-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
-
-export const scoutAgent = new Agent({
-  name: 'Scout Agent',
-  instructions: `
-    You are a Graph Scout navigating a topology.
-    
-    Your goal is to decide the next move based on the provided context.
-    
-    Context provided in user message:
-    - Goal: The user's query.
-    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
-    - Current Node: ID and Labels.
-    - Path History: Nodes visited so far.
-    - Satellite View: A summary of outgoing edges (LOD 0).
-    - Time Context: Relevant timestamps.
-
-    Decide your next move:
-    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
-    - **Exploration:** To explore, action: "MOVE" with "edgeType".
-    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
-    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
-    - **Abort:** If stuck, action: "ABORT".
-  `,
-  model: {
-    id: 'groq/llama-3.3-70b-versatile',
-  },
-  tools: {
-    sectorScanTool,
-    topologyScanTool,
-    temporalScanTool
-  }
-});
 ````
 
 ## File: packages/agent/src/mastra/workflows/metabolism-workflow.ts
@@ -4495,6 +4590,47 @@ export async function runMetabolism(targetLabel: string, minAgeDays: number = 30
 }
 ````
 
+## File: packages/agent/package.json
+````json
+{
+  "name": "@quackgraph/agent",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/loggers": "^0.1.0",
+    "@mastra/memory": "^0.15.12",
+    "@opentelemetry/api": "^1.8.0",
+    "zod": "^3.23.0",
+    "@quackgraph/graph": "workspace:*",
+    "@quackgraph/native": "workspace:*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "typescript": "^5.0.0",
+    "tsup": "^8.0.0"
+  }
+}
+````
+
 ## File: package.json
 ````json
 {
@@ -4607,7 +4743,7 @@ export enum ZoomLevel {
 import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { Metric } from '@mastra/core/eval';
 import type { z } from 'zod';
-import type { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from './agent-schemas';
+import type { RouterDecisionSchema, ScoutDecisionSchema } from './agent-schemas';
 
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
@@ -4720,50 +4856,9 @@ export interface TimeStepDiff {
 }
 ````
 
-## File: packages/agent/package.json
-````json
-{
-  "name": "@quackgraph/agent",
-  "version": "0.1.0",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "clean": "rm -rf dist",
-    "format": "biome format --write .",
-    "lint": "biome lint .",
-    "check": "biome check .",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@mastra/core": "^0.24.6",
-    "@mastra/loggers": "^0.1.0",
-    "@mastra/memory": "^0.15.12",
-    "@opentelemetry/api": "^1.8.0",
-    "zod": "^3.23.0",
-    "@quackgraph/graph": "workspace:*",
-    "@quackgraph/native": "workspace:*"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "typescript": "^5.0.0",
-    "tsup": "^8.0.0"
-  }
-}
-````
-
 ## File: packages/agent/src/labyrinth.ts
 ````typescript
-import { QuackGraph } from '@quackgraph/graph';
+import type { QuackGraph } from '@quackgraph/graph';
 import type {
   AgentConfig,
   LabyrinthArtifact,
@@ -5069,8 +5164,7 @@ export class Labyrinth {
                       const artifact = res.object;
 
                       if (
-                        artifact &&
-                        artifact.isAnswer &&
+                        artifact?.isAnswer &&
                         artifact.confidence >= (this.config.confidenceThreshold || 0.7)
                       ) {
                         const finalArtifact = {
@@ -5083,7 +5177,7 @@ export class Labyrinth {
                         rootController.abort(); // KILL SWITCH
                         return;
                       }
-                    } catch (e) {
+                    } catch (_e) {
                       /* ignore judge fail */
                     }
 
@@ -5119,11 +5213,34 @@ export class Labyrinth {
                     }
                     return;
                   } else if (decision.action === 'MOVE') {
+                    // Multi-Hop Path (Ghost Map Navigation)
+                    if (decision.path && decision.path.length > 0) {
+                        // The path is a sequence of node IDs to visit. 
+                        const targetId = decision.path[decision.path.length - 1];
+                        // Calculate confidence decay based on path length (0.9 per hop)
+                        const decay = Math.pow(0.9, decision.path.length);
+                        
+                        nextCursors.push({
+                            id: randomUUID(),
+                            currentNodeId: targetId,
+                            path: [...cursor.path, ...decision.path],
+                            // We don't have exact edges for multi-hop yet without querying, using placeholder
+                            pathEdges: [...cursor.pathEdges, ...decision.path.map(() => 'GHOST_JUMP')],
+                            traceHistory: [...cursor.traceHistory, `[MOVE] Path: ${decision.path.join(' -> ')}`],
+                            stepCount: cursor.stepCount + decision.path.length,
+                            confidence: cursor.confidence * decision.confidence * decay,
+                            lastEdgeType: 'GHOST_JUMP'
+                        });
+                        // If path is provided, we skip single-edge processing
+                        return;
+                    }
+
                     // biome-ignore lint/suspicious/noExplicitAny: flexible move structure
                     const moves: any[] = [];
                     // Using discriminated union access
-                    if (decision.edgeType)
+                    if (decision.edgeType) {
                       moves.push({ edge: decision.edgeType, conf: decision.confidence });
+                    }
                     if (decision.alternativeMoves) {
                       for (const alt of decision.alternativeMoves) {
                         moves.push({ edge: alt.edgeType, conf: alt.confidence });

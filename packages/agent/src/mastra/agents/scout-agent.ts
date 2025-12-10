@@ -17,11 +17,18 @@ export const scoutAgent = new Agent({
     - Time Context: Relevant timestamps.
 
     Decide your next move:
+    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
+      - Use Depth 1 to check immediate neighbors.
+      - Use Depth 2-3 to explore structure without moving.
+      - The map shows "🔥" for hot paths (high pheromones).
+
     - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
-    - **Exploration:** To explore, action: "MOVE" with "edgeType".
+    - **Exploration:** 
+      - Single Hop: Action "MOVE" with \`edgeType\`.
+      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with \`path: [id1, id2]\`.
     - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
     - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
-    - **Abort:** If stuck, action: "ABORT".
+    - **Abort:** If stuck or exhausted, action: "ABORT".
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',

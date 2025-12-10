@@ -28,10 +28,68 @@ export class GraphTools {
   }
 
   /**
+   * LOD 1.5: Ghost Map / Navigational Map
+   * Generates an ASCII tree of the topology up to a certain depth.
+   * Uses geometric pruning to keep the map readable.
+   */
+  async getNavigationalMap(rootId: string, depth: number = 1): Promise<{ map: string, truncated: boolean }> {
+    const maxDepth = Math.min(depth, 4);
+    const treeLines: string[] = [`[ROOT] ${rootId}`];
+    let isTruncated = false;
+
+    // Helper for recursion
+    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
+      if (currentDepth >= maxDepth) return;
+
+      // Geometric pruning: 10 -> 5 -> 3 -> 1
+      const branchLimit = Math.floor(10 / (currentDepth + 1));
+      let branchesCount = 0;
+
+      // 1. Get stats to find "hot" edges
+      const stats = await this.getSectorSummary([currentId]);
+      
+      for (const stat of stats) {
+        if (branchesCount >= branchLimit) {
+            isTruncated = true;
+            break;
+        }
+
+        const edgeType = stat.edgeType;
+        const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
+        
+        // 2. Traverse to get samples (fetch just enough to display)
+        const neighbors = await this.topologyScan([currentId], edgeType);
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+        
+        for (let i = 0; i < displayNeighbors.length; i++) {
+             if (branchesCount >= branchLimit) { isTruncated = true; break; }
+             const neighborId = displayNeighbors[i];
+             if (!neighborId) continue;
+             const connector = (i === displayNeighbors.length - 1 && branchesCount === branchLimit - 1) ? '└──' : '├──';
+             
+             treeLines.push(`${prefix}${connector}[${edgeType}]──> (${neighborId})${heatMarker}`);
+             
+             const nextPrefix = prefix + (connector === '└──' ? '    ' : '│   ');
+             await buildTree(neighborId, currentDepth + 1, nextPrefix);
+             branchesCount++;
+        }
+      }
+    };
+
+    await buildTree(rootId, 0, ' ');
+    
+    return {
+        map: treeLines.join('\n'),
+        truncated: isTruncated
+    };
+  }
+
+  /**
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType?: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
     // Native traverse does not support minValidFrom yet
     return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);

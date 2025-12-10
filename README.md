@@ -18,7 +18,7 @@ By decoupling **Topology (Structure)** from **Content (Data)**, QuackLabyrinth t
 
 Standard RAG systems fail because they lack "Altitude." They search the entire database at ground level. QuackLabyrinth implements a **Semantic Level of Detail (S-LOD)** system, using ephemeral "Ghost Nodes" to guide the LLM from global context to specific data.
 
-### 2.1 The Three-Layer Zoom
+### 2.1 The Semantic Zoom (LODs)
 
 1.  **LOD 0: Satellite View (The Ghost Layer)**
     *   **Data:** Dynamic Cluster Centroids (Virtual Nodes).
@@ -29,6 +29,12 @@ Standard RAG systems fail because they lack "Altitude." They search the entire d
     *   **Data:** The "Spine" (Entities & Relationships). No chunks.
     *   **Action:** The Scout navigates the topology. "Path: `(User) --[LOGGED]--> (Symptom: Headache) --[COINCIDES_WITH]--> (Diet: Caffeine)`."
     *   **Mechanism:** Integer-only traversal in Rust.
+
+1.5 **LOD 1.5: The Ghost Map (Navigational Radar)**
+    *   **Data:** ASCII Tree with geometric pruning (Depth 1-4).
+    *   **Action:** The Scout requests `topology-scan(depth: 3)`.
+    *   **Output:** `[ROOT] User:Alex ├──[HAS_SYMPTOM]──> (Migraine) 🔥 ...`
+    *   **Benefit:** Enables multi-hop planning in a single inference step.
 
 3.  **LOD 2: Street View (The Data Layer)**
     *   **Data:** Rich Text, PDF Chunks, JSON Blobs.

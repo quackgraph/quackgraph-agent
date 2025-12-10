@@ -33,16 +33,42 @@ export const topologyScanTool = createTool({
   description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
-    edgeType: z.string(),
+    edgeType: z.string().optional(),
     asOf: z.number().optional(),
     minValidFrom: z.number().optional(),
+    depth: z.number().min(1).max(4).optional(),
   }),
   outputSchema: z.object({
-    neighborIds: z.array(z.string()),
+    neighborIds: z.array(z.string()).optional(),
+    map: z.string().optional(),
+    truncated: z.boolean().optional(),
   }),
   execute: async ({ context }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
+
+    if (context.depth && context.depth > 1) {
+      // Ghost Map Mode (LOD 1.5)
+      const maps = [];
+      let truncated = false;
+      for (const id of context.nodeIds) {
+        const res = await tools.getNavigationalMap(id, context.depth);
+        maps.push(res.map);
+        if (res.truncated) truncated = true;
+      }
+      return { map: maps.join('\n\n'), truncated };
+    }
+
+    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
+    if (!context.edgeType) {
+        const maps = [];
+        for (const id of context.nodeIds) {
+            const res = await tools.getNavigationalMap(id, 1);
+            maps.push(res.map);
+        }
+        return { map: maps.join('\n\n') };
+    }
+
     const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, context.asOf, context.minValidFrom);
     return { neighborIds };
   },
