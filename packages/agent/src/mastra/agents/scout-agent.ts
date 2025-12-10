@@ -1,4 +1,5 @@
 import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
 import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
 
 export const scoutAgent = new Agent({
@@ -33,6 +34,7 @@ export const scoutAgent = new Agent({
   model: {
     id: 'groq/llama-3.3-70b-versatile',
   },
+  memory: new Memory(),
   tools: {
     sectorScanTool,
     topologyScanTool,

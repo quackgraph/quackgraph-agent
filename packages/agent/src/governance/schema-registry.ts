@@ -66,3 +66,6 @@ export class SchemaRegistry {
     return !!domain?.isCausal;
   }
 }
+
+export const schemaRegistry = new SchemaRegistry();
+export const getSchemaRegistry = () => schemaRegistry;

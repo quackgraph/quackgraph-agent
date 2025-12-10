@@ -1,4 +1,5 @@
 import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
 
 export const routerAgent = new Agent({
   name: 'Router Agent',
@@ -13,5 +14,6 @@ export const routerAgent = new Agent({
   `,
   model: {
     id: 'groq/llama-3.3-70b-versatile',
-  }
+  },
+  memory: new Memory(),
 });

@@ -33,6 +33,7 @@
     "useGitignore": true,
     "useDefaultPatterns": true,
     "customPatterns": [
+            "packages/quackgraph",
       "dev-docs/flow.todo.md",
       "packages/quackgraph/.git",
       "packages/quackgraph/repomix.config.json",

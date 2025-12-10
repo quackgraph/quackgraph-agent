@@ -13,6 +13,22 @@ import type { RouterDecisionSchema, ScoutDecisionSchema } from './agent-schemas'
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
 
+// Labyrinth Runtime Context (Injected via Mastra)
+export interface LabyrinthContext {
+  // Temporal: The "Now" for the graph traversal (Unix Timestamp in seconds or Date)
+  // If undefined, defaults to real-time.
+  asOf?: number | Date;
+
+  // Governance: The semantic lens restricting traversal (e.g., "Medical", "Financial")
+  domain?: string;
+
+  // Traceability: The distributed trace ID for this execution
+  traceId?: string;
+
+  // Threading: The specific cursor/thread ID for parallel speculation
+  threadId?: string;
+}
+
 export interface AgentConfig {
   llmProvider: {
     generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
@@ -86,8 +102,35 @@ export interface LabyrinthArtifact {
   confidence: number;
   traceId: string;
   sources: string[];
-  // biome-ignore lint/suspicious/noExplicitAny: metadata
-  metadata?: Record<string, any>;
+  metadata?: LabyrinthMetadata;
+}
+
+export interface LabyrinthMetadata {
+  duration_ms: number;
+  tokens_used: number;
+  governance: {
+    query: string;
+    selected_domain: string;
+    rejected_domains: string[];
+    reasoning: string;
+  };
+  execution: ThreadTrace[];
+  judgment?: {
+    verdict: string;
+    confidence: number;
+  };
+}
+
+export interface ThreadTrace {
+  thread_id: string;
+  status: 'COMPLETED' | 'KILLED' | 'ACTIVE';
+  steps: {
+    step: number;
+    node_id: string;
+    ghost_view?: string; // Snapshot of what the agent saw
+    action: string;
+    reasoning: string;
+  }[];
 }
 
 // Temporal Logic Types
@@ -118,4 +161,24 @@ export interface TimeStepDiff {
   removedEdges: SectorSummary[];
   persistedEdges: SectorSummary[];
   densityChange: number; // percentage
+}
+
+export interface StepEvent {
+  step: number;
+  node_id: string;
+  ghost_view?: string;
+  action: string;
+  reasoning: string;
+}
+
+export interface LabyrinthCursor {
+  id: string;
+  currentNodeId: string;
+  path: string[];
+  pathEdges: (string | undefined)[];
+  stepHistory: StepEvent[];
+  stepCount: number;
+  confidence: number;
+  lastEdgeType?: string;
+  lastTimestamp?: number;
 }

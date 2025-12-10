@@ -32,7 +32,7 @@ export class GraphTools {
    * Generates an ASCII tree of the topology up to a certain depth.
    * Uses geometric pruning to keep the map readable.
    */
-  async getNavigationalMap(rootId: string, depth: number = 1): Promise<{ map: string, truncated: boolean }> {
+  async getNavigationalMap(rootId: string, depth: number = 1, asOf?: number): Promise<{ map: string, truncated: boolean }> {
     const maxDepth = Math.min(depth, 4);
     const treeLines: string[] = [`[ROOT] ${rootId}`];
     let isTruncated = false;
@@ -46,7 +46,7 @@ export class GraphTools {
       let branchesCount = 0;
 
       // 1. Get stats to find "hot" edges
-      const stats = await this.getSectorSummary([currentId]);
+      const stats = await this.getSectorSummary([currentId], asOf);
       
       for (const stat of stats) {
         if (branchesCount >= branchLimit) {
@@ -58,7 +58,7 @@ export class GraphTools {
         const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
         
         // 2. Traverse to get samples (fetch just enough to display)
-        const neighbors = await this.topologyScan([currentId], edgeType);
+        const neighbors = await this.topologyScan([currentId], edgeType, asOf);
         const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
         const displayNeighbors = neighbors.slice(0, neighborLimit);
         

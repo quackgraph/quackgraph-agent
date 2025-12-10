@@ -2,12 +2,13 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
+import { getSchemaRegistry } from '../../governance/schema-registry';
 
 // We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
 
 export const sectorScanTool = createTool({
   id: 'sector-scan',
-  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0)',
+  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
     asOf: z.number().optional(),
@@ -20,10 +21,21 @@ export const sectorScanTool = createTool({
       avgHeat: z.number().optional(),
     })),
   }),
-  execute: async ({ context }) => {
+  execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
-    const summary = await tools.getSectorSummary(context.nodeIds, context.asOf, context.allowedEdgeTypes);
+
+    // 1. Resolve Context
+    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    const effectiveAsOf = context.asOf ?? ctxAsOf;
+
+    // 2. Resolve Governance
+    const registry = getSchemaRegistry();
+    const allowedFromDomain = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
+    const effectiveAllowed = context.allowedEdgeTypes ?? allowedFromDomain;
+
+    const summary = await tools.getSectorSummary(context.nodeIds, effectiveAsOf, effectiveAllowed);
     return { summary };
   },
 });
@@ -43,16 +55,21 @@ export const topologyScanTool = createTool({
     map: z.string().optional(),
     truncated: z.boolean().optional(),
   }),
-  execute: async ({ context }) => {
+  execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
+    
+    // Resolve Context
+    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
+    const effectiveAsOf = context.asOf ?? ctxAsOf;
 
     if (context.depth && context.depth > 1) {
       // Ghost Map Mode (LOD 1.5)
       const maps = [];
       let truncated = false;
       for (const id of context.nodeIds) {
-        const res = await tools.getNavigationalMap(id, context.depth);
+        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
+        const res = await tools.getNavigationalMap(id, context.depth, effectiveAsOf);
         maps.push(res.map);
         if (res.truncated) truncated = true;
       }
@@ -63,13 +80,13 @@ export const topologyScanTool = createTool({
     if (!context.edgeType) {
         const maps = [];
         for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1);
+            const res = await tools.getNavigationalMap(id, 1, effectiveAsOf);
             maps.push(res.map);
         }
         return { map: maps.join('\n\n') };
     }
 
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, context.asOf, context.minValidFrom);
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, effectiveAsOf, context.minValidFrom);
     return { neighborIds };
   },
 });

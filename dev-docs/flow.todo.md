@@ -1,3 +1,10 @@
+I feel like labyrint doing too much on its own where mastra natively provide everything to implement like runtimeContext, worfklow, step, memory
+
+
+I feel like labyrint doing too much on its own where mastra natively provide everything to implement like runtimeContext, worfklow, step, memory, agent network... so now please make mastra as High super first class-netizen... all to comply with readme.md expectations
+
+===
+
 the ram usage must be consuming, what if beside ram mode can also duckdb mode which is saving the graph arrows in duckdb. so become friendly for device with low ram
 
 ===
