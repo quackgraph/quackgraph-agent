@@ -1,7 +1,7 @@
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
-import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
+import { sectorScanTool, topologyScanTool, temporalScanTool, evolutionaryScanTool } from '../tools';
 
 export const scoutAgent = new Agent({
   name: 'Scout Agent',
@@ -24,6 +24,9 @@ export const scoutAgent = new Agent({
       - Use Depth 2-3 to explore structure without moving.
       - The map shows "🔥" for hot paths (high pheromones).
 
+    - **Time Travel:** 
+      - Use \`evolutionary-scan\` with specific ISO timestamps to see how connections changed over time (e.g., "What changed between 2023 and 2024?").
+
     - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
     - **Exploration:** 
       - Single Hop: Action "MOVE" with \`edgeType\`.
@@ -43,6 +46,7 @@ export const scoutAgent = new Agent({
   tools: {
     sectorScanTool,
     topologyScanTool,
-    temporalScanTool
+    temporalScanTool,
+    evolutionaryScanTool
   }
 });

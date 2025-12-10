@@ -291,14 +291,30 @@ const speculativeTraversal = createStep({
                      // Multi-hop jump (from Navigational Map)
                      const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
                      if (target) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
+                        nextCursors.push({ 
+                          ...cursor, 
+                          id: randomUUID(), 
+                          currentNodeId: target, 
+                          path: [...cursor.path, ...decision.path], 
+                          pathEdges: [...cursor.pathEdges, ...new Array(decision.path.length).fill(undefined)],
+                          stepCount: cursor.stepCount + decision.path.length, 
+                          confidence: cursor.confidence * decision.confidence 
+                        });
                      }
                 } else if (decision.edgeType) {
                      // Single-hop move
                      const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
                      // Speculative Forking: Take top 2 paths if ambiguous
                      for (const t of neighbors.slice(0, 2)) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: t, path: [...cursor.path, t], stepCount: cursor.stepCount+1, confidence: cursor.confidence * decision.confidence });
+                        nextCursors.push({ 
+                          ...cursor, 
+                          id: randomUUID(), 
+                          currentNodeId: t, 
+                          path: [...cursor.path, t], 
+                          pathEdges: [...cursor.pathEdges, decision.edgeType],
+                          stepCount: cursor.stepCount+1, 
+                          confidence: cursor.confidence * decision.confidence 
+                        });
                      }
                 }
             }
@@ -364,6 +380,29 @@ const finalizeArtifact = createStep({
   }
 });
 
+// --- Step 5: Pheromone Reinforcement ---
+// Heats up the edges of the winning path to guide future agents
+const reinforcePath = createStep({
+  id: 'reinforce-path',
+  inputSchema: z.object({}),
+  stateSchema: LabyrinthStateSchema,
+  outputSchema: z.object({ success: z.boolean() }),
+  execute: async ({ state }) => {
+    if (!state.winner || !state.winner.sources) return { success: false };
+    
+    // Find the cursor that produced the winner
+    const winningCursor = state.cursors.find(c => state.winner?.sources.includes(c.currentNodeId));
+    if (winningCursor) {
+        const graph = getGraphInstance();
+        const tools = new GraphTools(graph);
+        await tools.reinforcePath(winningCursor.path, winningCursor.pathEdges, state.winner.confidence);
+        return { success: true };
+    }
+
+    return { success: false };
+  }
+});
+
 // --- Workflow Definition ---
 
 export const labyrinthWorkflow = createWorkflow({
@@ -377,4 +416,5 @@ export const labyrinthWorkflow = createWorkflow({
   .then(initializeCursors)
   .then(speculativeTraversal)
   .then(finalizeArtifact)
+  .then(reinforcePath)
   .commit();

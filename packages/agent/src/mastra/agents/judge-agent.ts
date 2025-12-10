@@ -10,6 +10,7 @@ export const judgeAgent = new Agent({
     Input provided:
     - Goal: The user's question.
     - Data: Content of the nodes found.
+    - Evolution: Timeline of changes (if applicable).
     - Time Context: Relevant timeframe.
     
     Task: Determine if the data answers the goal.

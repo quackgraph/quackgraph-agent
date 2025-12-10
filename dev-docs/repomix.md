@@ -549,6 +549,220 @@ export class Chronos {
 }
 ````
 
+## File: packages/agent/src/agent-schemas.ts
+````typescript
+import { z } from 'zod';
+
+export const RouterDecisionSchema = z.object({
+  domain: z.string(),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
+
+export const JudgeDecisionSchema = z.object({
+  isAnswer: z.boolean(),
+  answer: z.string(),
+  confidence: z.number().min(0).max(1),
+});
+
+// Discriminated Union for Scout Actions
+const MoveAction = z.object({
+  action: z.literal('MOVE'),
+  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
+  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+  alternativeMoves: z.array(z.object({
+    edgeType: z.string(),
+    confidence: z.number(),
+    reasoning: z.string()
+  })).optional()
+});
+
+const CheckAction = z.object({
+  action: z.literal('CHECK'),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
+
+const MatchAction = z.object({
+  action: z.literal('MATCH'),
+  pattern: z.array(z.object({
+    srcVar: z.number(),
+    tgtVar: z.number(),
+    edgeType: z.string(),
+    direction: z.string().optional()
+  })),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
+
+const AbortAction = z.object({
+  action: z.literal('ABORT'),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
+
+export const ScoutDecisionSchema = z.discriminatedUnion('action', [
+  MoveAction,
+  CheckAction,
+  MatchAction,
+  AbortAction
+]);
+````
+
+## File: packages/agent/biome.json
+````json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "es5"
+    }
+  }
+}
+````
+
+## File: scripts/git-pull.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * Git Pull Script - Federated Pull for Nested Repositories
+ * 
+ * Usage:
+ *   bun run scripts/git-pull.ts
+ *   bun run pull:all
+ */
+
+import { $ } from "bun";
+
+const INNER_REPO_PATH = "packages/quackgraph";
+const ROOT_DIR = import.meta.dir.replace("/scripts", "");
+
+async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
+    console.log(`\n⬇️ [${repoName}] Processing...`);
+
+    // Check if directory exists and has .git
+    const fs = await import("node:fs/promises");
+    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
+
+    if (!hasGit && repoUrl) {
+        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
+        try {
+            // Ensure parent dir exists
+            await $`mkdir -p ${cwd}`;
+            // Remove the empty dir if it exists so clone works (or clone into it if empty)
+            // Safest is to remove checking uniqueness or just run git clone
+            // If cwd exists but is empty, git clone <url> <dir> works.
+
+            await $`git clone ${repoUrl} ${cwd}`;
+            console.log(`   ✅ Successfully cloned ${repoName}`);
+            return;
+        } catch (error) {
+            console.error(`   ❌ Failed to clone ${repoName}:`, error);
+            throw error;
+        }
+    }
+
+    console.log(`   ⬇️ Pulling changes...`);
+    try {
+        await $`git -C ${cwd} pull`.quiet();
+        console.log(`   ✅ Successfully pulled ${repoName}`);
+    } catch (error) {
+        console.error(`   ❌ Failed to pull ${repoName}:`, error);
+        throw error;
+    }
+}
+
+async function pullAll(): Promise<void> {
+    console.log("🔄 Git Pull - Federated Repository Update");
+    console.log("=========================================");
+
+    // Pull parent first
+    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
+    await pullRepo(ROOT_DIR, "quackgraph-agent");
+
+    // Pull inner repo
+    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
+    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
+    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
+
+    // Custom logic to ensure 'agent' branch
+    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
+    // Force checkout agent branch if not already
+    try {
+        await $`git -C ${innerRepoPath} checkout agent`.quiet();
+        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
+    } catch (e) {
+        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
+    }
+
+    console.log("\n\n=========================================");
+    console.log("✅ Git pull completed successfully!");
+    console.log("=========================================\n");
+}
+
+pullAll().catch((error) => {
+    console.error("\n❌ Pull failed:", error);
+    process.exit(1);
+});
+````
+
+## File: .gitignore
+````
+# Dependencies
+node_modules/
+bun.lock
+
+# Build outputs
+dist/
+*.node
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Relay state
+/.relay/
+
+# Logs
+*.log
+npm-debug.log*
+````
+
 ## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
 ````typescript
 import { createStep, createWorkflow } from '@mastra/core/workflows';
@@ -844,14 +1058,30 @@ const speculativeTraversal = createStep({
                      // Multi-hop jump (from Navigational Map)
                      const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
                      if (target) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
+                        nextCursors.push({ 
+                          ...cursor, 
+                          id: randomUUID(), 
+                          currentNodeId: target, 
+                          path: [...cursor.path, ...decision.path], 
+                          pathEdges: [...cursor.pathEdges, ...new Array(decision.path.length).fill(undefined)],
+                          stepCount: cursor.stepCount + decision.path.length, 
+                          confidence: cursor.confidence * decision.confidence 
+                        });
                      }
                 } else if (decision.edgeType) {
                      // Single-hop move
                      const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
                      // Speculative Forking: Take top 2 paths if ambiguous
                      for (const t of neighbors.slice(0, 2)) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: t, path: [...cursor.path, t], stepCount: cursor.stepCount+1, confidence: cursor.confidence * decision.confidence });
+                        nextCursors.push({ 
+                          ...cursor, 
+                          id: randomUUID(), 
+                          currentNodeId: t, 
+                          path: [...cursor.path, t], 
+                          pathEdges: [...cursor.pathEdges, decision.edgeType],
+                          stepCount: cursor.stepCount+1, 
+                          confidence: cursor.confidence * decision.confidence 
+                        });
                      }
                 }
             }
@@ -917,6 +1147,29 @@ const finalizeArtifact = createStep({
   }
 });
 
+// --- Step 5: Pheromone Reinforcement ---
+// Heats up the edges of the winning path to guide future agents
+const reinforcePath = createStep({
+  id: 'reinforce-path',
+  inputSchema: z.object({}),
+  stateSchema: LabyrinthStateSchema,
+  outputSchema: z.object({ success: z.boolean() }),
+  execute: async ({ state }) => {
+    if (!state.winner || !state.winner.sources) return { success: false };
+    
+    // Find the cursor that produced the winner
+    const winningCursor = state.cursors.find(c => state.winner?.sources.includes(c.currentNodeId));
+    if (winningCursor) {
+        const graph = getGraphInstance();
+        const tools = new GraphTools(graph);
+        await tools.reinforcePath(winningCursor.path, winningCursor.pathEdges, state.winner.confidence);
+        return { success: true };
+    }
+
+    return { success: false };
+  }
+});
+
 // --- Workflow Definition ---
 
 export const labyrinthWorkflow = createWorkflow({
@@ -930,221 +1183,8 @@ export const labyrinthWorkflow = createWorkflow({
   .then(initializeCursors)
   .then(speculativeTraversal)
   .then(finalizeArtifact)
+  .then(reinforcePath)
   .commit();
-````
-
-## File: packages/agent/src/agent-schemas.ts
-````typescript
-import { z } from 'zod';
-
-export const RouterDecisionSchema = z.object({
-  domain: z.string(),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
-
-export const JudgeDecisionSchema = z.object({
-  isAnswer: z.boolean(),
-  answer: z.string(),
-  confidence: z.number().min(0).max(1),
-});
-
-// Discriminated Union for Scout Actions
-const MoveAction = z.object({
-  action: z.literal('MOVE'),
-  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
-  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-  alternativeMoves: z.array(z.object({
-    edgeType: z.string(),
-    confidence: z.number(),
-    reasoning: z.string()
-  })).optional()
-});
-
-const CheckAction = z.object({
-  action: z.literal('CHECK'),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
-
-const MatchAction = z.object({
-  action: z.literal('MATCH'),
-  pattern: z.array(z.object({
-    srcVar: z.number(),
-    tgtVar: z.number(),
-    edgeType: z.string(),
-    direction: z.string().optional()
-  })),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
-
-const AbortAction = z.object({
-  action: z.literal('ABORT'),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
-
-export const ScoutDecisionSchema = z.discriminatedUnion('action', [
-  MoveAction,
-  CheckAction,
-  MatchAction,
-  AbortAction
-]);
-````
-
-## File: packages/agent/biome.json
-````json
-{
-  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
-  "vcs": {
-    "enabled": true,
-    "clientKind": "git",
-    "useIgnoreFile": false
-  },
-  "files": {
-    "ignoreUnknown": true,
-    "includes": [
-      "**",
-      "!**/dist",
-      "!**/node_modules"
-    ]
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
-  },
-  "linter": {
-    "enabled": true,
-    "rules": {
-      "recommended": true
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "single",
-      "trailingCommas": "es5"
-    }
-  }
-}
-````
-
-## File: scripts/git-pull.ts
-````typescript
-#!/usr/bin/env bun
-/**
- * Git Pull Script - Federated Pull for Nested Repositories
- * 
- * Usage:
- *   bun run scripts/git-pull.ts
- *   bun run pull:all
- */
-
-import { $ } from "bun";
-
-const INNER_REPO_PATH = "packages/quackgraph";
-const ROOT_DIR = import.meta.dir.replace("/scripts", "");
-
-async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
-    console.log(`\n⬇️ [${repoName}] Processing...`);
-
-    // Check if directory exists and has .git
-    const fs = await import("node:fs/promises");
-    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
-
-    if (!hasGit && repoUrl) {
-        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
-        try {
-            // Ensure parent dir exists
-            await $`mkdir -p ${cwd}`;
-            // Remove the empty dir if it exists so clone works (or clone into it if empty)
-            // Safest is to remove checking uniqueness or just run git clone
-            // If cwd exists but is empty, git clone <url> <dir> works.
-
-            await $`git clone ${repoUrl} ${cwd}`;
-            console.log(`   ✅ Successfully cloned ${repoName}`);
-            return;
-        } catch (error) {
-            console.error(`   ❌ Failed to clone ${repoName}:`, error);
-            throw error;
-        }
-    }
-
-    console.log(`   ⬇️ Pulling changes...`);
-    try {
-        await $`git -C ${cwd} pull`.quiet();
-        console.log(`   ✅ Successfully pulled ${repoName}`);
-    } catch (error) {
-        console.error(`   ❌ Failed to pull ${repoName}:`, error);
-        throw error;
-    }
-}
-
-async function pullAll(): Promise<void> {
-    console.log("🔄 Git Pull - Federated Repository Update");
-    console.log("=========================================");
-
-    // Pull parent first
-    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
-    await pullRepo(ROOT_DIR, "quackgraph-agent");
-
-    // Pull inner repo
-    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
-    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
-    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
-
-    // Custom logic to ensure 'agent' branch
-    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
-    // Force checkout agent branch if not already
-    try {
-        await $`git -C ${innerRepoPath} checkout agent`.quiet();
-        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
-    } catch (e) {
-        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
-    }
-
-    console.log("\n\n=========================================");
-    console.log("✅ Git pull completed successfully!");
-    console.log("=========================================\n");
-}
-
-pullAll().catch((error) => {
-    console.error("\n❌ Pull failed:", error);
-    process.exit(1);
-});
-````
-
-## File: .gitignore
-````
-# Dependencies
-node_modules/
-bun.lock
-
-# Build outputs
-dist/
-*.node
-target/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Relay state
-/.relay/
-
-# Logs
-*.log
-npm-debug.log*
 ````
 
 ## File: README.md
@@ -1497,6 +1537,7 @@ export const judgeAgent = new Agent({
     Input provided:
     - Goal: The user's question.
     - Data: Content of the nodes found.
+    - Evolution: Timeline of changes (if applicable).
     - Time Context: Relevant timeframe.
     
     Task: Determine if the data answers the goal.
@@ -1537,163 +1578,6 @@ export const routerAgent = new Agent({
       url: ':memory:'
     })
   }),
-});
-````
-
-## File: packages/agent/src/mastra/tools/index.ts
-````typescript
-import { createTool } from '@mastra/core/tools';
-import { z } from 'zod';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
-import { getSchemaRegistry } from '../../governance/schema-registry';
-
-// We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
-
-export const sectorScanTool = createTool({
-  id: 'sector-scan',
-  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    asOf: z.number().optional(),
-    allowedEdgeTypes: z.array(z.string()).optional(),
-  }),
-  outputSchema: z.object({
-    summary: z.array(z.object({
-      edgeType: z.string(),
-      count: z.number(),
-      avgHeat: z.number().optional(),
-    })),
-  }),
-  execute: async ({ context, runtimeContext }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-
-    // 1. Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
-    
-    // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
-    const asOf = context.asOf ?? ctxAsOf;
-
-    // 2. Resolve Governance
-    const registry = getSchemaRegistry();
-    const domainEdges = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
-    const effectiveAllowed = context.allowedEdgeTypes ?? domainEdges;
-
-    const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
-    return { summary };
-  },
-});
-
-export const topologyScanTool = createTool({
-  id: 'topology-scan',
-  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    edgeType: z.string().optional(),
-    asOf: z.number().optional(),
-    minValidFrom: z.number().optional(),
-    depth: z.number().min(1).max(4).optional(),
-  }),
-  outputSchema: z.object({
-    neighborIds: z.array(z.string()).optional(),
-    map: z.string().optional(),
-    truncated: z.boolean().optional(),
-  }),
-  execute: async ({ context, runtimeContext }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    
-    // Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
-    const asOf = context.asOf ?? ctxAsOf;
-    
-    // Enforce Domain Governance if implicit
-    if (ctxDomain && context.edgeType) {
-      const registry = getSchemaRegistry();
-      if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
-        return { neighborIds: [] }; // Silently block restricted edges
-      }
-    }
-
-    if (context.depth && context.depth > 1) {
-      // Ghost Map Mode (LOD 1.5)
-      const maps = [];
-      let truncated = false;
-      for (const id of context.nodeIds) {
-        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
-        const res = await tools.getNavigationalMap(id, context.depth, asOf);
-        maps.push(res.map);
-        if (res.truncated) truncated = true;
-      }
-      return { map: maps.join('\n\n'), truncated };
-    }
-
-    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
-    if (!context.edgeType) {
-        const maps = [];
-        for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1, asOf);
-            maps.push(res.map);
-        }
-        return { map: maps.join('\n\n') };
-    }
-
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf, context.minValidFrom);
-    return { neighborIds };
-  },
-});
-
-export const temporalScanTool = createTool({
-  id: 'temporal-scan',
-  description: 'Find neighbors connected via edges overlapping a specific time window',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    windowStart: z.string().describe('ISO Date String'),
-    windowEnd: z.string().describe('ISO Date String'),
-    edgeType: z.string().optional(),
-    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
-  }),
-  outputSchema: z.object({
-    neighborIds: z.array(z.string()),
-  }),
-  execute: async ({ context, runtimeContext }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    
-    // Enforce Governance
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
-    if (ctxDomain && context.edgeType) {
-       const registry = getSchemaRegistry();
-       if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
-         return { neighborIds: [] };
-       }
-    }
-    
-    const s = new Date(context.windowStart).getTime();
-    const e = new Date(context.windowEnd).getTime();
-    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
-    return { neighborIds };
-  },
-});
-
-export const contentRetrievalTool = createTool({
-  id: 'content-retrieval',
-  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-  }),
-  outputSchema: z.object({
-    content: z.array(z.record(z.any())),
-  }),
-  execute: async ({ context }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    const content = await tools.contentRetrieval(context.nodeIds);
-    return { content };
-  },
 });
 ````
 
@@ -1919,51 +1803,6 @@ export const mastra = new Mastra({
 }
 ````
 
-## File: packages/agent/src/index.ts
-````typescript
-// Core Facade
-export { Labyrinth } from './labyrinth';
-
-// Types & Schemas
-export * from './types';
-export * from './agent-schemas';
-
-// Utilities
-export * from './agent/chronos';
-export * from './governance/schema-registry';
-export * from './tools/graph-tools';
-
-// Mastra Internals (Exposed for advanced configuration)
-export { mastra } from './mastra';
-export { labyrinthWorkflow } from './mastra/workflows/labyrinth-workflow';
-
-// Factory
-import type { QuackGraph } from '@quackgraph/graph';
-import { Labyrinth } from './labyrinth';
-import type { AgentConfig } from './types';
-import { mastra } from './mastra';
-
-/**
- * Factory to create a fully wired Labyrinth Agent.
- * Checks for required Mastra agents (Scout, Judge, Router) before instantiation.
- */
-export function createAgent(graph: QuackGraph, config: AgentConfig) {
-  const scout = mastra.getAgent('scoutAgent');
-  const judge = mastra.getAgent('judgeAgent');
-  const router = mastra.getAgent('routerAgent');
-
-  if (!scout || !judge || !router) {
-    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
-  }
-
-  return new Labyrinth(
-    graph,
-    { scout, judge, router },
-    config
-  );
-}
-````
-
 ## File: packages/agent/package.json
 ````json
 {
@@ -2076,7 +1915,7 @@ export function createAgent(graph: QuackGraph, config: AgentConfig) {
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
-import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
+import { sectorScanTool, topologyScanTool, temporalScanTool, evolutionaryScanTool } from '../tools';
 
 export const scoutAgent = new Agent({
   name: 'Scout Agent',
@@ -2099,6 +1938,9 @@ export const scoutAgent = new Agent({
       - Use Depth 2-3 to explore structure without moving.
       - The map shows "🔥" for hot paths (high pheromones).
 
+    - **Time Travel:** 
+      - Use \`evolutionary-scan\` with specific ISO timestamps to see how connections changed over time (e.g., "What changed between 2023 and 2024?").
+
     - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
     - **Exploration:** 
       - Single Hop: Action "MOVE" with \`edgeType\`.
@@ -2118,224 +1960,215 @@ export const scoutAgent = new Agent({
   tools: {
     sectorScanTool,
     topologyScanTool,
-    temporalScanTool
+    temporalScanTool,
+    evolutionaryScanTool
   }
 });
 ````
 
-## File: packages/agent/src/tools/graph-tools.ts
+## File: packages/agent/src/mastra/tools/index.ts
 ````typescript
-import type { QuackGraph } from '@quackgraph/graph';
-import type { SectorSummary, LabyrinthContext } from '../types';
-import type { JsPatternEdge } from '@quackgraph/native';
+import { createTool } from '@mastra/core/tools';
+import { z } from 'zod';
+import { getGraphInstance } from '../../lib/graph-instance';
+import { GraphTools } from '../../tools/graph-tools';
+import { getSchemaRegistry } from '../../governance/schema-registry';
+import { Chronos } from '../../agent/chronos';
 
-export class GraphTools {
-  constructor(private graph: QuackGraph) { }
+// We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
 
-  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
-    if (typeof contextOrAsOf === 'number') return contextOrAsOf;
-    if (!contextOrAsOf?.asOf) return undefined;
-    return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
-  }
+export const sectorScanTool = createTool({
+  id: 'sector-scan',
+  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    asOf: z.number().optional(),
+    allowedEdgeTypes: z.array(z.string()).optional(),
+  }),
+  outputSchema: z.object({
+    summary: z.array(z.object({
+      edgeType: z.string(),
+      count: z.number(),
+      avgHeat: z.number().optional(),
+    })),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
 
-  /**
-   * LOD 0: Sector Scan / Satellite View
-   * Returns a summary of available moves from the current nodes.
-   */
-  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
-    if (currentNodes.length === 0) return [];
-
-    const asOf = this.resolveAsOf(contextOrAsOf);
-
-    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
-    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-
-    // 2. Filter if explicit allowed list provided (double check)
-    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
-    // Note: optimization - native filtering is faster, but we rely on caller to pass correct allowedEdgeTypes from registry.getValidEdges()
-    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
-      // redundant but safe if native implementation varies
-      // no-op if native did its job
-    }
-
-    // 3. Sort by count (descending)
-    return results.sort((a, b) => b.count - a.count);
-  }
-
-  /**
-   * LOD 1.5: Ghost Map / Navigational Map
-   * Generates an ASCII tree of the topology up to a certain depth.
-   * Uses geometric pruning to keep the map readable.
-   */
-  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
-    const maxDepth = Math.min(depth, 4);
-    const treeLines: string[] = [`[ROOT] ${rootId}`];
-    let isTruncated = false;
-    const _asOf = this.resolveAsOf(contextOrAsOf);
-
-    // Helper for recursion
-    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
-      if (currentDepth >= maxDepth) return;
-
-      // Geometric pruning: 10 -> 5 -> 3 -> 1
-      const branchLimit = Math.floor(10 / (currentDepth + 1));
-      let branchesCount = 0;
-
-      // 1. Get stats to find "hot" edges
-      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
-      
-      for (const stat of stats) {
-        if (branchesCount >= branchLimit) {
-            isTruncated = true;
-            break;
-        }
-
-        const edgeType = stat.edgeType;
-        const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
-        
-        // 2. Traverse to get samples (fetch just enough to display)
-        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
-        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
-        const displayNeighbors = neighbors.slice(0, neighborLimit);
-        
-        for (let i = 0; i < displayNeighbors.length; i++) {
-             if (branchesCount >= branchLimit) { isTruncated = true; break; }
-             const neighborId = displayNeighbors[i];
-             if (!neighborId) continue;
-             const connector = (i === displayNeighbors.length - 1 && branchesCount === branchLimit - 1) ? '└──' : '├──';
-             
-             treeLines.push(`${prefix}${connector}[${edgeType}]──> (${neighborId})${heatMarker}`);
-             
-             const nextPrefix = prefix + (connector === '└──' ? '    ' : '│   ');
-             await buildTree(neighborId, currentDepth + 1, nextPrefix);
-             branchesCount++;
-        }
-      }
-    };
-
-    await buildTree(rootId, 0, ' ');
+    // 1. Resolve Context
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
     
-    return {
-        map: treeLines.join('\n'),
-        truncated: isTruncated
-    };
-  }
+    // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
+    const asOf = context.asOf ?? ctxAsOf;
 
-  /**
-   * LOD 1: Topology Scan
-   * Returns the IDs of neighbors reachable via a specific edge type.
-   */
-  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
-    if (currentNodes.length === 0) return [];
-    // Native traverse does not support minValidFrom yet
-    const asOf = this.resolveAsOf(contextOrAsOf);
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
-  }
+    // 2. Resolve Governance
+    const registry = getSchemaRegistry();
+    const domainEdges = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
+    const effectiveAllowed = context.allowedEdgeTypes ?? domainEdges;
 
-  /**
-   * LOD 1: Temporal Interval Scan
-   * Finds neighbors connected via edges overlapping/contained in the window.
-   */
-  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
-  }
+    const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
+    return { summary };
+  },
+});
 
-  /**
-   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
-   */
-  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    if (currentNodes.length === 0) return [];
-    // We use the native traverseInterval which accepts edgeType
-    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
-  }
+export const topologyScanTool = createTool({
+  id: 'topology-scan',
+  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    edgeType: z.string().optional(),
+    asOf: z.number().optional(),
+    minValidFrom: z.number().optional(),
+    depth: z.number().min(1).max(4).optional(),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()).optional(),
+    map: z.string().optional(),
+    truncated: z.boolean().optional(),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    
+    // Resolve Context
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
 
-  /**
-   * LOD 1.5: Pattern Matching (Structural Inference)
-   * Finds subgraphs matching a specific shape.
-   */
-  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
-    if (startNodes.length === 0) return [];
-    const nativePattern = pattern.map(p => ({
-      srcVar: p.srcVar || 0,
-      tgtVar: p.tgtVar || 0,
-      edgeType: p.edgeType || '',
-      direction: p.direction || 'out'
-    }));
-    const asOf = this.resolveAsOf(contextOrAsOf);
-    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
-  }
-
-  /**
-   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
-   * If nodes are part of a document chain (NEXT/PREV), fetch context.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
-  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
-    if (nodeIds.length === 0) return [];
-
-    // 1. Fetch Primary Content
-    const primaryNodes = await this.graph.match([])
-      .where({ id: nodeIds })
-      .select();
-
-    // 2. Virtual Spine Expansion
-    // Check for "NEXT" or "PREV" connections to provide document flow context.
-    const spineContextIds = new Set<string>();
-
-    for (const id of nodeIds) {
-      // Look ahead
-      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach(nid => { spineContextIds.add(nid); });
-
-      // Look back
-      const _prev = await this.graph.native.traverse([id], 'PREV', 'out');
-      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach(nid => { spineContextIds.add(nid); });
-
-      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach(nid => { spineContextIds.add(nid); });
-    }
-
-    // Remove duplicates (original nodes)
-    nodeIds.forEach(id => { spineContextIds.delete(id); });
-
-    if (spineContextIds.size > 0) {
-      const contextNodes = await this.graph.match([])
-        .where({ id: Array.from(spineContextIds) })
-        .select();
-
-      // Merge and Annotate
-      return primaryNodes.map(node => {
-        return {
-          ...node,
-          _isPrimary: true,
-          _context: contextNodes
-        };
-      });
-    }
-
-    return primaryNodes;
-  }
-
-  /**
-   * Pheromones: Reinforce a successful path by increasing edge heat.
-   */
-  async reinforcePath(trace: { source: string; incomingEdge?: string }[], qualityScore: number = 1.0) {
-    // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
-    // We assume native handles saturation at 255.
-    const _heatDelta = Math.floor(qualityScore * 50);
-
-    for (let i = 1; i < trace.length; i++) {
-      const prev = trace[i - 1];
-      const curr = trace[i];
-      if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
-      if (curr.incomingEdge) {
-        // await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
-        console.warn('Pheromones not implemented in V1 native graph');
+    const asOf = context.asOf ?? ctxAsOf;
+    
+    // Enforce Domain Governance if implicit
+    if (ctxDomain && context.edgeType) {
+      const registry = getSchemaRegistry();
+      if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+        return { neighborIds: [] }; // Silently block restricted edges
       }
     }
+
+    if (context.depth && context.depth > 1) {
+      // Ghost Map Mode (LOD 1.5)
+      const maps = [];
+      let truncated = false;
+      for (const id of context.nodeIds) {
+        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
+        const res = await tools.getNavigationalMap(id, context.depth, asOf);
+        maps.push(res.map);
+        if (res.truncated) truncated = true;
+      }
+      return { map: maps.join('\n\n'), truncated };
+    }
+
+    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
+    if (!context.edgeType) {
+        const maps = [];
+        for (const id of context.nodeIds) {
+            const res = await tools.getNavigationalMap(id, 1, asOf);
+            maps.push(res.map);
+        }
+        return { map: maps.join('\n\n') };
+    }
+
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf, context.minValidFrom);
+    return { neighborIds };
+  },
+});
+
+export const temporalScanTool = createTool({
+  id: 'temporal-scan',
+  description: 'Find neighbors connected via edges overlapping a specific time window',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    windowStart: z.string().describe('ISO Date String'),
+    windowEnd: z.string().describe('ISO Date String'),
+    edgeType: z.string().optional(),
+    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    
+    // Enforce Governance
+    // @ts-expect-error - Runtime context typing overlap
+    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
+
+    if (ctxDomain && context.edgeType) {
+       const registry = getSchemaRegistry();
+       if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+         return { neighborIds: [] };
+       }
+    }
+    
+    const s = new Date(context.windowStart).getTime();
+    const e = new Date(context.windowEnd).getTime();
+    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
+    return { neighborIds };
+  },
+});
+
+export const contentRetrievalTool = createTool({
+  id: 'content-retrieval',
+  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+  }),
+  outputSchema: z.object({
+    content: z.array(z.record(z.any())),
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const content = await tools.contentRetrieval(context.nodeIds);
+    return { content };
+  },
+});
+
+export const evolutionaryScanTool = createTool({
+  id: 'evolutionary-scan',
+  description: 'Analyze how the topology around a node changed over specific timepoints (LOD 4 - Time). Useful for trend analysis.',
+  inputSchema: z.object({
+    nodeId: z.string(),
+    timestamps: z.array(z.string()).describe('ISO Date Strings to compare (e.g. ["2020-01-01", "2021-01-01"])'),
+  }),
+  outputSchema: z.object({
+    timeline: z.array(z.object({
+      timestamp: z.string(),
+      added: z.array(z.string()),
+      removed: z.array(z.string()),
+      persisted: z.array(z.string()),
+      densityChange: z.string()
+    })),
+    summary: z.string()
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const chronos = new Chronos(graph, tools);
+
+    const dates = context.timestamps.map(t => new Date(t));
+    const result = await chronos.evolutionaryDiff(context.nodeId, dates);
+
+    // Format for LLM consumption
+    const timeline = result.timeline.map(t => ({
+      timestamp: t.timestamp.toISOString(),
+      added: t.addedEdges.map(e => `${e.edgeType} (${e.count})`),
+      removed: t.removedEdges.map(e => `${e.edgeType} (${e.count})`),
+      persisted: t.persistedEdges.map(e => `${e.edgeType} (${e.count})`),
+      densityChange: `${t.densityChange.toFixed(1)}%`
+    }));
+
+    const summary = `Evolution of ${context.nodeId} across ${dates.length} points. Net density change: ${timeline[timeline.length - 1]?.densityChange || '0%'}.`;
+
+    return { timeline, summary };
   }
-}
+});
 ````
 
 ## File: packages/agent/src/types.ts
@@ -2526,13 +2359,277 @@ export interface LabyrinthCursor {
 }
 ````
 
+## File: packages/agent/src/index.ts
+````typescript
+// Core Facade
+export { Labyrinth } from './labyrinth';
+
+// Types & Schemas
+export * from './types';
+export * from './agent-schemas';
+
+// Utilities
+export * from './agent/chronos';
+export * from './governance/schema-registry';
+
+// Mastra Internals (Exposed for advanced configuration)
+export { mastra } from './mastra';
+export { labyrinthWorkflow } from './mastra/workflows/labyrinth-workflow';
+
+// Factory
+import type { QuackGraph } from '@quackgraph/graph';
+import { Labyrinth } from './labyrinth';
+import type { AgentConfig } from './types';
+import { mastra } from './mastra';
+
+/**
+ * Factory to create a fully wired Labyrinth Agent.
+ * Checks for required Mastra agents (Scout, Judge, Router) before instantiation.
+ */
+export function createAgent(graph: QuackGraph, config: AgentConfig) {
+  const scout = mastra.getAgent('scoutAgent');
+  const judge = mastra.getAgent('judgeAgent');
+  const router = mastra.getAgent('routerAgent');
+
+  if (!scout || !judge || !router) {
+    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
+  }
+
+  return new Labyrinth(
+    graph,
+    { scout, judge, router },
+    config
+  );
+}
+````
+
+## File: packages/agent/src/tools/graph-tools.ts
+````typescript
+import type { QuackGraph } from '@quackgraph/graph';
+import type { SectorSummary, LabyrinthContext } from '../types';
+import type { JsPatternEdge } from '@quackgraph/native';
+
+export class GraphTools {
+  constructor(private graph: QuackGraph) { }
+
+  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
+    if (typeof contextOrAsOf === 'number') return contextOrAsOf;
+    if (contextOrAsOf?.asOf) {
+      return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
+    }
+    return undefined;
+  }
+
+  /**
+   * LOD 0: Sector Scan / Satellite View
+   * Returns a summary of available moves from the current nodes.
+   */
+  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+    if (currentNodes.length === 0) return [];
+
+    const asOf = this.resolveAsOf(contextOrAsOf);
+
+    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
+    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
+
+    // 2. Filter if explicit allowed list provided (double check)
+    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
+    // Note: optimization - native filtering is faster, but we rely on caller to pass correct allowedEdgeTypes from registry.getValidEdges()
+    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
+      // redundant but safe if native implementation varies
+      // no-op if native did its job
+    }
+
+    // 3. Sort by count (descending)
+    return results.sort((a, b) => b.count - a.count);
+  }
+
+  /**
+   * LOD 1.5: Ghost Map / Navigational Map
+   * Generates an ASCII tree of the topology up to a certain depth.
+   * Uses geometric pruning to keep the map readable.
+   */
+  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
+    const maxDepth = Math.min(depth, 4);
+    const treeLines: string[] = [`[ROOT] ${rootId}`];
+    let isTruncated = false;
+    const _asOf = this.resolveAsOf(contextOrAsOf);
+
+    // Helper for recursion
+    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
+      if (currentDepth >= maxDepth) return;
+
+      // Geometric pruning: 10 -> 5 -> 3 -> 1
+      const branchLimit = Math.floor(10 / (currentDepth + 1));
+      let branchesCount = 0;
+
+      // 1. Get stats to find "hot" edges
+      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
+      
+      for (const stat of stats) {
+        if (branchesCount >= branchLimit) {
+            isTruncated = true;
+            break;
+        }
+
+        const edgeType = stat.edgeType;
+        const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
+        
+        // 2. Traverse to get samples (fetch just enough to display)
+        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+        
+        for (let i = 0; i < displayNeighbors.length; i++) {
+             if (branchesCount >= branchLimit) { isTruncated = true; break; }
+             const neighborId = displayNeighbors[i];
+             if (!neighborId) continue;
+             const connector = (i === displayNeighbors.length - 1 && branchesCount === branchLimit - 1) ? '└──' : '├──';
+             
+             treeLines.push(`${prefix}${connector}[${edgeType}]──> (${neighborId})${heatMarker}`);
+             
+             const nextPrefix = prefix + (connector === '└──' ? '    ' : '│   ');
+             await buildTree(neighborId, currentDepth + 1, nextPrefix);
+             branchesCount++;
+        }
+      }
+    };
+
+    await buildTree(rootId, 0, ' ');
+    
+    return {
+        map: treeLines.join('\n'),
+        truncated: isTruncated
+    };
+  }
+
+  /**
+   * LOD 1: Topology Scan
+   * Returns the IDs of neighbors reachable via a specific edge type.
+   */
+  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    // Native traverse does not support minValidFrom yet
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
+  }
+
+  /**
+   * LOD 1: Temporal Interval Scan
+   * Finds neighbors connected via edges overlapping/contained in the window.
+   */
+  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
+   */
+  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    // We use the native traverseInterval which accepts edgeType
+    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1.5: Pattern Matching (Structural Inference)
+   * Finds subgraphs matching a specific shape.
+   */
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
+    if (startNodes.length === 0) return [];
+    const nativePattern = pattern.map(p => ({
+      srcVar: p.srcVar || 0,
+      tgtVar: p.tgtVar || 0,
+      edgeType: p.edgeType || '',
+      direction: p.direction || 'out'
+    }));
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
+  }
+
+  /**
+   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
+   * If nodes are part of a document chain (NEXT/PREV), fetch context.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
+  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
+    if (nodeIds.length === 0) return [];
+
+    // 1. Fetch Primary Content
+    const primaryNodes = await this.graph.match([])
+      .where({ id: nodeIds })
+      .select();
+
+    // 2. Virtual Spine Expansion
+    // Check for "NEXT" or "PREV" connections to provide document flow context.
+    const spineContextIds = new Set<string>();
+
+    for (const id of nodeIds) {
+      // Look ahead
+      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
+      next.forEach(nid => { spineContextIds.add(nid); });
+
+      // Look back
+      const _prev = await this.graph.native.traverse([id], 'PREV', 'out');
+      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
+      incomingNext.forEach(nid => { spineContextIds.add(nid); });
+
+      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
+      explicitPrev.forEach(nid => { spineContextIds.add(nid); });
+    }
+
+    // Remove duplicates (original nodes)
+    nodeIds.forEach(id => { spineContextIds.delete(id); });
+
+    if (spineContextIds.size > 0) {
+      const contextNodes = await this.graph.match([])
+        .where({ id: Array.from(spineContextIds) })
+        .select();
+
+      // Merge and Annotate
+      return primaryNodes.map(node => {
+        return {
+          ...node,
+          _isPrimary: true,
+          _context: contextNodes
+        };
+      });
+    }
+
+    return primaryNodes;
+  }
+
+  /**
+   * Pheromones: Reinforce a successful path by increasing edge heat.
+   */
+  async reinforcePath(nodes: string[], edges: (string | undefined)[], qualityScore: number = 1.0) {
+    if (nodes.length < 2) return;
+
+    // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
+    // We assume native handles saturation at 255.
+    const heatDelta = Math.floor(qualityScore * 50);
+
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const source = nodes[i];
+      const target = nodes[i + 1];
+      const edge = edges[i + 1]; // edges[0] is undefined (start)
+
+      if (source && target && edge) {
+        // Mock native call for now as V1 native might not expose it yet
+        // In production: await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
+        // console.log(`[Pheromones] Reinforced: ${source} --[${edge}]--> ${target} (+${heatDelta})`);
+      }
+    }
+  }
+}
+````
+
 ## File: packages/agent/src/labyrinth.ts
 ````typescript
 import type { QuackGraph } from '@quackgraph/graph';
 import type {
   AgentConfig,
   LabyrinthArtifact,
-  CorrelationResult,
   TimeContext,
   DomainConfig,
   MastraAgent
@@ -2542,22 +2639,22 @@ import { trace, type Span } from '@opentelemetry/api';
 // Core Dependencies
 import { setGraphInstance } from './lib/graph-instance';
 import { mastra } from './mastra';
-import { Chronos } from './agent/chronos';
-import { GraphTools } from './tools/graph-tools';
-import { SchemaRegistry } from './governance/schema-registry';
+import { schemaRegistry } from './governance/schema-registry';
 
 /**
  * The QuackGraph Agent Facade.
  * 
- * In the new "Native Mastra" architecture, this class acts as a thin client
- * that orchestrates the `labyrinth-workflow` and injects the RuntimeContext
- * (Time Travel & Governance) into the Mastra execution environment.
+ * A Native Mastra implementation.
+ * This class acts as a thin client that orchestrates the `labyrinth-workflow` 
+ * and injects the RuntimeContext (Time Travel & Governance).
  */
 export class Labyrinth {
   public chronos: Chronos;
   public tools: GraphTools;
   public registry: SchemaRegistry;
   
+  // Simulating persistence layer for traces (In production, use Redis/DB via Mastra Storage)
+  private traceCache = new Map<string, LabyrinthArtifact>();
   private logger = mastra.getLogger();
   private tracer = trace.getTracer('quackgraph-agent');
 
@@ -2570,9 +2667,10 @@ export class Labyrinth {
     },
     private config: AgentConfig
   ) {
-    // Initialize Singleton for legacy tools support
+    // Bridge Pattern: Inject the graph instance into the global scope
+    // so Mastra Tools can access it without passing it through every step.
     setGraphInstance(graph);
-    
+
     // Utilities
     this.tools = new GraphTools(graph);
     this.chronos = new Chronos(graph, this.tools);
@@ -2581,6 +2679,7 @@ export class Labyrinth {
 
   /**
    * Registers a semantic domain (LOD 0 governance).
+   * Direct proxy to the singleton registry used by tools.
    */
   registerDomain(config: DomainConfig) {
     this.registry.register(config);
@@ -2603,7 +2702,7 @@ export class Labyrinth {
             const workflow = mastra.getWorkflow('labyrinthWorkflow');
             if (!workflow) throw new Error("Labyrinth Workflow not registered in Mastra.");
 
-            // 1. Prepare Input Data
+            // 1. Prepare Input Data & Configuration
             const inputData = {
                 goal,
                 start,
@@ -2613,7 +2712,7 @@ export class Labyrinth {
                 maxCursors: this.config.maxCursors,
                 confidenceThreshold: this.config.confidenceThreshold,
                 timeContext: timeContext ? {
-                    asOf: timeContext.asOf?.getTime(),
+                    asOf: timeContext.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext.asOf,
                     windowStart: timeContext.windowStart?.toISOString(),
                     windowEnd: timeContext.windowEnd?.toISOString()
                 } : undefined
@@ -2622,11 +2721,8 @@ export class Labyrinth {
             // 2. Execute Workflow
             const run = await workflow.createRunAsync();
             
-            // Note: We pass strict inputs. The workflow steps handle State initialization.
-            // RuntimeContext for 'asOf' is passed via the inputData.timeContext mostly,
-            // but we can also inject it if the run start supported context overrides directly.
-            // For now, the workflow steps extract timeContext from inputData and pass it 
-            // to agents via runtimeContext.
+            // The workflow steps are responsible for extracting timeContext from input
+            // and passing it to agents via runtimeContext injection in the 'speculative-traversal' step.
             const result = await run.start({ inputData });
             
             // 3. Extract Result
@@ -2634,8 +2730,22 @@ export class Labyrinth {
             const artifact = result.results?.artifact as LabyrinthArtifact | null;
             
             if (artifact) {
+              // Sync traceId with the actual Run ID for retrievability
+              // @ts-expect-error - runId access
+              const runId = run.runId || run.id;
+              artifact.traceId = runId;
+
               span.setAttribute('labyrinth.confidence', artifact.confidence);
               span.setAttribute('labyrinth.traceId', artifact.traceId);
+
+              // Cache the full artifact (with heavy execution trace)
+              this.traceCache.set(runId, JSON.parse(JSON.stringify(artifact)));
+
+              // Return "Executive Briefing" version (strip execution logs)
+              if (artifact.metadata) {
+                 // @ts-expect-error - modifying readonly property concept
+                 artifact.metadata.execution = []; 
+              }
             }
 
             return artifact;
@@ -2648,6 +2758,23 @@ export class Labyrinth {
             span.end();
         }
     });
+  }
+
+  /**
+   * Retrieve the full reasoning trace for a specific run.
+   * Useful for auditing or "Show your work" features.
+   */
+  async getTrace(traceId: string): Promise<LabyrinthArtifact | undefined> {
+    // 1. Try Memory Cache
+    if (this.traceCache.has(traceId)) {
+        return this.traceCache.get(traceId);
+    }
+
+    // 2. Future: Try Mastra Storage (DB)
+    // const run = await mastra.getRun(traceId);
+    // return run?.result?.artifact;
+
+    return undefined;
   }
 
   /**

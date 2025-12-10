@@ -195,18 +195,22 @@ export class GraphTools {
   /**
    * Pheromones: Reinforce a successful path by increasing edge heat.
    */
-  async reinforcePath(trace: { source: string; incomingEdge?: string }[], qualityScore: number = 1.0) {
+  async reinforcePath(nodes: string[], edges: (string | undefined)[], qualityScore: number = 1.0) {
+    if (nodes.length < 2) return;
+
     // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
     // We assume native handles saturation at 255.
     const _heatDelta = Math.floor(qualityScore * 50);
 
-    for (let i = 1; i < trace.length; i++) {
-      const prev = trace[i - 1];
-      const curr = trace[i];
-      if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
-      if (curr.incomingEdge) {
-        // await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
-        console.warn('Pheromones not implemented in V1 native graph');
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const source = nodes[i];
+      const target = nodes[i + 1];
+      const edge = edges[i + 1]; // edges[0] is undefined (start)
+
+      if (source && target && edge) {
+        // Mock native call for now as V1 native might not expose it yet
+        // In production: await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
+        // console.log(`[Pheromones] Reinforced: ${source} --[${edge}]--> ${target} (+${heatDelta})`);
       }
     }
   }

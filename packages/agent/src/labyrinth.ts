@@ -2,6 +2,7 @@ import type { QuackGraph } from '@quackgraph/graph';
 import type {
   AgentConfig,
   LabyrinthArtifact,
+  CorrelationResult,
   TimeContext,
   DomainConfig,
   MastraAgent
@@ -11,7 +12,9 @@ import { trace, type Span } from '@opentelemetry/api';
 // Core Dependencies
 import { setGraphInstance } from './lib/graph-instance';
 import { mastra } from './mastra';
-import { schemaRegistry } from './governance/schema-registry';
+import { Chronos } from './agent/chronos';
+import { GraphTools } from './tools/graph-tools';
+import { SchemaRegistry } from './governance/schema-registry';
 
 /**
  * The QuackGraph Agent Facade.
@@ -21,6 +24,12 @@ import { schemaRegistry } from './governance/schema-registry';
  * and injects the RuntimeContext (Time Travel & Governance).
  */
 export class Labyrinth {
+  public chronos: Chronos;
+  public tools: GraphTools;
+  public registry: SchemaRegistry;
+  
+  // Simulating persistence layer for traces (In production, use Redis/DB via Mastra Storage)
+  private traceCache = new Map<string, LabyrinthArtifact>();
   private logger = mastra.getLogger();
   private tracer = trace.getTracer('quackgraph-agent');
 
@@ -36,6 +45,11 @@ export class Labyrinth {
     // Bridge Pattern: Inject the graph instance into the global scope
     // so Mastra Tools can access it without passing it through every step.
     setGraphInstance(graph);
+
+    // Utilities
+    this.tools = new GraphTools(graph);
+    this.chronos = new Chronos(graph, this.tools);
+    this.registry = new SchemaRegistry();
   }
 
   /**
@@ -43,7 +57,7 @@ export class Labyrinth {
    * Direct proxy to the singleton registry used by tools.
    */
   registerDomain(config: DomainConfig) {
-    schemaRegistry.register(config);
+    this.registry.register(config);
   }
 
   /**
@@ -67,6 +81,8 @@ export class Labyrinth {
             const inputData = {
                 goal,
                 start,
+                // Domain is left undefined here; the 'route-domain' step will decide it
+                // unless we wanted to force it via config.
                 maxHops: this.config.maxHops,
                 maxCursors: this.config.maxCursors,
                 confidenceThreshold: this.config.confidenceThreshold,
@@ -89,8 +105,21 @@ export class Labyrinth {
             const artifact = result.results?.artifact as LabyrinthArtifact | null;
             
             if (artifact) {
+              // Sync traceId with the actual Run ID for retrievability
+              // @ts-expect-error - runId access
+              const runId = run.runId || run.id;
+              artifact.traceId = runId;
+
               span.setAttribute('labyrinth.confidence', artifact.confidence);
               span.setAttribute('labyrinth.traceId', artifact.traceId);
+
+              // Cache the full artifact (with heavy execution trace)
+              this.traceCache.set(runId, JSON.parse(JSON.stringify(artifact)));
+
+              // Return "Executive Briefing" version (strip execution logs)
+              if (artifact.metadata) {
+                 artifact.metadata.execution = []; 
+              }
             }
 
             return artifact;
@@ -103,5 +132,34 @@ export class Labyrinth {
             span.end();
         }
     });
+  }
+
+  /**
+   * Retrieve the full reasoning trace for a specific run.
+   * Useful for auditing or "Show your work" features.
+   */
+  async getTrace(traceId: string): Promise<LabyrinthArtifact | undefined> {
+    // 1. Try Memory Cache
+    if (this.traceCache.has(traceId)) {
+        return this.traceCache.get(traceId);
+    }
+
+    // 2. Future: Try Mastra Storage (DB)
+    // const run = await mastra.getRun(traceId);
+    // return run?.result?.artifact;
+
+    return undefined;
+  }
+
+  /**
+   * Direct access to Chronos for temporal analytics.
+   * Useful for "Life Coach" dashboards that need raw stats without full agent traversal.
+   */
+  async analyzeCorrelation(
+    anchorNodeId: string,
+    targetLabel: string,
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
+    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
   }
 }
