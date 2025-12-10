@@ -20,7 +20,8 @@
     "build:core": "bun run --cwd packages/quackgraph build",
     "build:agent": "bun run --cwd packages/agent build",
     "build:watch": "bun run --cwd packages/agent build --watch",
-    "push:all": "bun run scripts/git-sync.ts"
+    "push:all": "bun run scripts/git-sync.ts",
+    "pull:all": "bun run scripts/git-pull.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "latest",
