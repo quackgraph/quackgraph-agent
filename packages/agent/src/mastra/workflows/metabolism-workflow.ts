@@ -1,7 +1,7 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
 import { JudgeDecisionSchema } from '../../agent-schemas';
 
 // Step 1: Identify Candidates
@@ -135,8 +135,6 @@ const applySummary = createStep({
     return { success: true };
   },
 });
-
-import { Workflow } from '@mastra/core/workflows';
 
 const workflow = createWorkflow({
   id: 'metabolism-workflow',

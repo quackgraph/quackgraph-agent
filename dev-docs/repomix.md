@@ -27,6 +27,7 @@ packages/
       index.ts
       labyrinth.ts
       types.ts
+    biome.json
     package.json
     tsconfig.json
     tsup.config.ts
@@ -59,11 +60,10 @@ packages/
     biome.json
     Cargo.toml
     package.json
-    README.md
-    RFC.README.md
     tsconfig.json
     tsup.config.ts
 scripts/
+  git-pull.ts
   git-sync.ts
 .gitignore
 LICENSE
@@ -2849,665 +2849,6 @@ resolver = "2"
 }
 ````
 
-## File: packages/quackgraph/README.md
-````markdown
-# QuackGraph 🦆🕸️
-
-[![npm version](https://img.shields.io/npm/v/quack-graph.svg?style=flat-square)](https://www.npmjs.com/package/quack-graph)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/your-repo/quack-graph/ci.yml?style=flat-square)](https://github.com/your-repo/quack-graph/actions)
-[![Runtime: Bun](https://img.shields.io/badge/Runtime-Bun%20%2F%20Node-black.svg?style=flat-square)](https://bun.sh)
-[![Engine: Rust](https://img.shields.io/badge/Accelerator-Rust%20(CSR)-orange.svg?style=flat-square)](https://www.rust-lang.org/)
-[![Storage: DuckDB](https://img.shields.io/badge/Storage-DuckDB-brightgreen.svg?style=flat-square)](https://duckdb.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
-
-> **The Embedded Graph Analytics Engine.**
->
-> **Postgres is for records. QuackGraph is for relationships.**
->
-> QuackGraph is a **serverless, infrastructure-less** graph index that runs alongside your app. It combines **DuckDB** (Columnar Storage) with a **Rust/Wasm CSR Index** (O(1) Traversal) via **Zero-Copy Apache Arrow**.
->
-> No Docker containers. No JVM. Just `npm install` and raw speed.
-
----
-
-## 📖 Table of Contents
-
-1.  [**Why QuackGraph? (The Pitch)**](#-why-quackgraph-the-pitch)
-2.  [**The Architecture: A "Split-Brain" Engine**](#-the-architecture-a-split-brain-engine)
-3.  [**Installation**](#-installation)
-4.  [**Quick Start (5 Minutes)**](#-quick-start-5-minutes)
-5.  [**Core Concepts**](#-core-concepts)
-    *   [Schemaless & Gradual Typing](#1-schemaless--gradual-typing)
-    *   [GraphRAG (Vector Search)](#2-graphrag-vector-search)
-    *   [Temporal Time-Travel](#3-temporal-time-travel)
-    *   [Complex Patterns & Recursion](#4-complex-patterns--recursion)
-    *   [Declarative Mutations](#5-declarative-mutations)
-6.  [**Advanced Usage & Performance Tuning**](#-advanced-usage--performance-tuning)
-    *   [Property Promotion](#property-promotion-json--native)
-    *   [Topology Snapshots](#topology-snapshots-for-instant-boot)
-    *   [Server-Side Aggregations](#server-side-aggregations)
-    *   [Cypher Compatibility](#cypher-compatibility)
-7.  [**Runtime Targets: Native vs. Edge**](#-runtime-targets-native-vs-edge)
-8.  [**Comparison with Alternatives**](#-comparison-with-alternatives)
-9.  [**Known Limits & Trade-offs**](#-known-limits--trade-offs)
-10. [**Contributing**](#-contributing)
-11. [**Roadmap**](#-roadmap)
-
----
-
-## 💡 Why QuackGraph?
-
-**The "SQLite for Graphs" Moment.**
-
-Enterprises run Neo4j Clusters. Startups and Local-First apps don't have that luxury. You shouldn't need to deploy a heavy Java-based server just to query "friends of friends" or build a RAG pipeline.
-
-QuackGraph is **CQRS in a box**:
-1.  **Ingest:** Data lands in **DuckDB**. It's cheap, ACID-compliant, and handles millions of rows on a laptop.
-2.  **Index:** We project the topology into a **Rust Compressed Sparse Row (CSR)** structure in RAM.
-3.  **Query:** Graph traversals happen in nanoseconds (memory pointers), while heavy aggregations happen in DuckDB (vectorized SQL).
-
-**Use Cases:**
-*   **GraphRAG:** Combine Vector Search (HNSW) with Knowledge Graph traversal in a single process.
-*   **Fraud Detection:** Detect cycles and rings in transaction logs without network latency.
-*   **Local-First SaaS:** Ship complex analytics in Electron apps or Edge workers.
-
----
-
-## 📐 Architecture: Zero-Copy Hybrid Engine
-
-QuackGraph is not a database replacement; it is a **Read-Optimized View**. It leverages **Apache Arrow** to stream data from Disk to RAM at ~1GB/s.
-
-```ascii
-[ Your App (Bun / Node / Wasm) ]
-     │
-     ▼
-[ QuackGraph DX Layer (TypeScript) ]
-     │
-     ├── Writes ───────────────┐
-     │                         ▼
-     │                 [ DuckDB Storage ] (Persistent Source of Truth)
-     │                 (Parquet / JSON / WAL)
-     │                         │
-     ├── Reads (Filters) ◄─────┤
-     │                         │
-     │                 (Arrow IPC Stream for Hydration)
-     │                         ▼
-     └── Reads (Hops) ◄── [ Rust Index ] (Transient In-Memory Cache)
-                          (CSR Topology)
-```
-
-1.  **DuckDB is King:** All writes (`addNode`, `addEdge`) go immediately and atomically to DuckDB.
-2.  **Rust is a View:** The In-Memory Graph Index is a *read-optimized, transient view* of the data on disk.
-3.  **Hydration:** On startup, we stream edges from DuckDB to Rust via Arrow IPC (~1M edges/sec).
-4.  **Consistency:** If the process crashes, the RAM index is gone. No data loss occurs because the data is safely in `.duckdb`.
-
----
-
-## 📦 Installation
-
-Choose your runtime target.
-
-### 🏎️ Native (Backend / CLI)
-*Best for: Bun, Node.js, Electron, Tauri.*
-Uses `napi-rs` for native C++ performance.
-
-```bash
-bun add quack-graph
-```
-
-### 🌍 Edge (Serverless / Browser)
-*Best for: Cloudflare Workers, Vercel Edge, Local-First Web Apps.*
-Uses WebAssembly.
-
-```bash
-bun add quack-graph @duckdb/duckdb-wasm apache-arrow
-```
-
----
-
-## ⚡ The API: Graph Topology meets SQL Analytics
-
-Stop writing 50-line `WITH RECURSIVE` SQL queries.
-QuackGraph gives you a Fluent TypeScript API for the topology, but lets you drop into raw SQL for the heavy lifting.
-
-**The "Hybrid" Query Pattern:**
-1.  **Graph Layer:** Use Rust to traverse hops instantly.
-2.  **SQL Layer:** Use DuckDB to aggregate the results.
-
-```typescript
-import { QuackGraph } from 'quack-graph';
-const g = new QuackGraph('./supply-chain.duckdb');
-
-// Scenario: "Find all downstream products affected by a bad Lithium batch,
-// and calculate the total inventory value at risk."
-
-const results = await g
-  // 1. Start: DuckDB Index Scan
-  .match(['Material'])
-  .where({ batch: 'BAD-BATCH-001' })
-
-  // 2. Traversal: Rust In-Memory CSR (Nanoseconds)
-  // Find everything this material flows into, up to 10 hops deep
-  .out('PART_OF').depth(1, 10)
-
-  // 3. Filter: Apply logic to the found nodes
-  .node(['Product'])
-  .where({ status: 'active' })
-
-  // 4. Analytics: Push aggregation down to DuckDB (Zero Data Transfer)
-  // We can write raw SQL inside .select()!
-  .select(`
-    id,
-    properties->>'name' as product_name,
-    (properties->>'price')::FLOAT * (properties->>'stock')::INT as value_at_risk
-  `);
-
-console.table(results);
-/*
-┌────────────┬──────────────┬───────────────┐
-│ id         │ product_name │ value_at_risk │
-├────────────┼──────────────┼───────────────┤
-│ prod:ev_1  │ Tesla Model3 │ 1500000       │
-│ prod:bat_x │ PowerWall    │ 45000         │
-└────────────┴──────────────┴───────────────┘
-*/
-```
-
----
-
-## 🧠 Core Concepts
-
-### 1. Schemaless & Gradual Typing
-Start with `any`. Harden with `Zod`. QuackGraph stores properties as a `JSON` column in DuckDB, allowing instant iteration. When you need safety, bind a Schema.
-
-```typescript
-import { z } from 'zod';
-const UserSchema = z.object({ name: z.string(), role: z.enum(['Admin', 'User']) });
-
-const g = new QuackGraph('db.duckdb').withSchemas({ User: UserSchema });
-// TypeScript now provides strict autocomplete and runtime validation
-```
-
-### 2. GraphRAG (Vector Search)
-Build **Local-First AI** apps. QuackGraph bundles `duckdb_vss` (HNSW Indexing). Your graph *is* your vector store.
-
-```typescript
-// Find documents similar to [Query], then find who wrote them
-const authors = await g
-  .nearText(['Document'], queryVector, { limit: 10 }) // HNSW Search
-  .in('AUTHORED_BY')                                  // Graph Hop
-  .node(['User'])
-  .select(u => u.name);
-```
-
-### 3. Temporal Time-Travel
-The database is **Append-Only**. We never overwrite data; we version it. This gives you Git-like history for your data.
-
-```typescript
-// Oops, someone deleted the edges? Query the graph as it existed 10 minutes ago.
-const snapshot = g.asOf(new Date(Date.now() - 10 * 60 * 1000));
-const count = await snapshot.match(['User']).count();
-```
-
-### 4. Complex Patterns & Recursion
-Match Neo4j's expressiveness with fluent ergonomics.
-
-**Variable-Length Paths (Recursive):**
-```typescript
-// Find friends of friends (1 to 5 hops away)
-const network = await g.match(['User'])
-  .where({ id: 'Alice' })
-  .out('KNOWS').depth(1, 5)
-  .select(u => u.name);
-```
-
-**Pattern Matching (Isomorphism):**
-```typescript
-// Find a "Triangle" (A knows B, B knows C, C knows A)
-const triangles = await g.match(['User']).as('a')
-  .out('KNOWS').as('b')
-  .out('KNOWS').as('c')
-  .matchEdge('c', 'a', 'KNOWS') // Close the loop
-  .return(row => ({
-    a: row.a.name,
-    b: row.b.name,
-    c: row.c.name
-  }));
-```
-
-### 5. Declarative Mutations (Upserts)
-Don't write race-condition-prone check-then-insert code. We provide atomic `MERGE` semantics equivalent to Neo4j.
-
-```typescript
-// Idempotent Ingestion
-const userId = await g.mergeNode('User', { email: 'alice@corp.com' })
-  .match({ email: 'alice@corp.com' })   // Look up by unique key
-  .set({ last_seen: new Date() })       // Update if exists
-  .run();
-```
-
-### 6. Batch Ingestion
-For high-throughput scenarios, use batch operations to minimize transaction overhead.
-
-```typescript
-// Insert 10,000 nodes in one transaction
-await g.addNodes([
-  { id: 'u:1', labels: ['User'], properties: { name: 'Alice' } },
-  { id: 'u:2', labels: ['User'], properties: { name: 'Bob' } }
-]);
-
-// Insert 50,000 edges
-await g.addEdges([
-  { source: 'u:1', target: 'u:2', type: 'KNOWS', properties: { since: 2022 } }
-]);
-```
-
----
-
-## 🛠️ Advanced Usage & Performance Tuning
-
-### Property Promotion (JSON -> Native)
-Filtering inside large JSON blobs is slower than native columns. QuackGraph can materialize hot fields for you.
-
-```typescript
-// Background migration: pulls 'age' out of the JSON blob into a native INTEGER column for 50x faster reads.
-await g.optimize.promoteProperty('User', 'age', 'INTEGER');
-```
-
-### Topology Snapshots (for Instant Boot)
-The "Hydration" phase can be slow for huge graphs. You can snapshot the in-memory Rust index to disk.
-
-```typescript
-// Save the RAM index to disk
-await g.optimize.saveTopologySnapshot('./topology.snapshot');
-
-// On next boot, load the snapshot instead of re-reading from DuckDB
-const g = new QuackGraph('./data.duckdb', { topologySnapshot: './topology.snapshot' });
-```
-
-### Server-Side Aggregations
-Don't pull data back to JS just to count it. Push the math to DuckDB.
-
-```typescript
-// "MATCH (u:User) RETURN u.city, count(u) as pop"
-const stats = await g.match(['User'])
-  .groupBy(u => u.city)
-  .count()
-  .as('pop')
-  .run();
-```
-
-### Cypher Compatibility
-For easy migration and interoperability, you can run raw Cypher queries.
-
-```typescript
-// (Roadmap v1.0)
-const results = await g.query(`
-  MATCH (u:User {name: 'Alice'})-[:MENTORS]->(mentee:User)
-  WHERE mentee.age < 30
-  RETURN mentee.name
-`);```
-
----
-
-## 🎯 Runtime Targets: Native vs. Edge
-
-| Feature | **Native (Bun/Node)** | **Edge (Wasm)** |
-| :--- | :--- | :--- |
-| **Engine** | Rust (Napi-rs) | Rust (Wasm) |
-| **Performance** | 🚀 **Highest** | 🐇 Fast |
-| **Cold Start** | ~50ms | ~400ms (Wasm boot) |
-| **Max Memory** | System RAM | ~128MB (CF Workers) |
-| **Best For** | Backends, CLI, Desktop | Serverless, Browser, Local-First |
-
----
-
-## 🆚 Comparison with Alternatives
-
-| Feature | QuackGraph 🦆 | Neo4j / TigerGraph | Raw SQL (Postgres/DuckDB) |
-| :--- | :--- | :--- | :--- |
-| **Deployment** | **`npm install`** | Docker / K8s Cluster | Docker / RDS |
-| **Architecture** | **Embedded Library** | Standalone Server | Database Engine |
-| **Latency** | **Nanoseconds (In-Proc)** | Milliseconds (Network) | Microseconds (IO) |
-| **Vector RAG**| **Native (HNSW)** | Plugin Required | Extension (pgvector) |
-| **Traversal** | **O(1) RAM Pointers** | O(1) RAM Pointers | O(log n) Index Joins |
-| **Cost** | **$0 / Compute Only** | $$ License / Cloud | $ Instance Cost |
-
----
-
-## ⚠️ Known Limits & Trade-offs
-
-1.  **Memory Wall (Edge):**
-    *   On Cloudflare Workers (128MB limit), the Graph Index can hold **~200k edges** before OOM.
-    *   *Workaround:* Use integer IDs (`1001` vs `"user_uuid_v4"`) to save ~60% RAM.
-2.  **Concurrency:**
-    *   DuckDB is **Single-Writer**. This is not for high-concurrency OLTP (e.g., a Banking Ledger).
-    *   It is designed for **Read-Heavy / Analytic** workloads (RAG, Recommendations, Dashboards).
-3.  **Deep Pattern Matching:**
-    *   While we support basic isomorphism (triangles, rings), extremely large subgraph queries (>10 node patterns) are computationally expensive in any engine. We optimize for "OLTP-style" pattern matching (small local patterns) rather than whole-graph analytics.
-
----
-
-## 🤝 Contributing
-
-We are building the standard library for Graph Data in TypeScript.
-This project is a Bun Workspace monorepo.
-
-1.  **Install:** `bun install`
-2.  **Build Native:** `cd packages/native && bun build`
-3.  **Run Tests:** `bun test`
-
-All contributions are welcome. Please open an issue to discuss your ideas.
-
----
-
-## 🗓️ Roadmap
-
-*   ✅ **v0.1:** Core Engine (Native + Wasm).
-*   🟡 **v0.5:** **Recursion & Patterns.** Rust-side VF2 solver and Recursive DFS.
-*   ⚪️ **v1.0:** **Auto-Columnarization.** Background job that detects hot JSON fields and promotes them to native DuckDB columns.
-*   ⚪️ **v1.1:** **Cypher Parser.** `g.query('MATCH (n)-[:KNOWS]->(m) RETURN m')` for easy migration.
-*   ⚪️ **v1.2:** **Replication.** `g.sync('s3://bucket/graph')` for multi-device sync.
-
----
-
-## 📄 License
-
-**MIT**
-````
-
-## File: packages/quackgraph/RFC.README.md
-````markdown
-# RCC.README.md 🏗️
-
-> **Project:** QuackGraph (Core Engine)
-> **Stack:** Bun (Runtime) + Rust (Compute) + DuckDB (Storage)
-> **Architecture:** "Split-Brain" (In-Memory CSR + On-Disk Columnar)
-> **License:** MIT
-
----
-
-## 1. The Core Philosophy (Engineering Constraints)
-
-To maintain performance and the "Embedded" promise, we strictly adhere to these constraints:
-
-1.  **NO Garbage Collection in the Hot Path:** The traversal index must live in Rust `Vec<T>` (Native) or Wasm Linear Memory. We never store topology in JS Objects (`{ id: 'a', neighbors: [...] }`) to avoid V8 GC pauses.
-2.  **NO Random Disk I/O:** Topology lives in RAM. Disk is only for sequential columnar scans (DuckDB).
-3.  **NO Serialization Overhead:** We do not serialize JSON between DuckDB and Rust. We use **Apache Arrow** (IPC) pointers for Zero-Copy transfer.
-4.  **DuckDB is the Source of Truth:** If the process crashes, RAM is lost. On restart, we Hydrate RAM from DuckDB. Rust is a *Transient Cache*.
-5.  **Append-Only Storage:** We never `UPDATE` or `DELETE` rows in DuckDB. We insert new versions with `valid_from` timestamps.
-
----
-
-## 2. Monorepo Structure
-
-We use a **Bun Workspace** combined with a **Cargo Workspace**.
-
-```text
-/quack-graph
-├── /packages
-│   ├── /quack-graph        # Public TS API (The entry point)
-│   ├── /native             # Napi-rs bindings (Node/Bun glue)
-│   └── /wasm               # Wasm-bindgen bindings (Browser/Edge glue)
-├── /crates
-│   └── /quack_core         # Shared Rust Logic (The "Brain")
-│       ├── /src/topology.rs  # CSR Index
-│       └── /src/interner.rs  # String <-> u32
-├── /benchmarks             # Performance testing suite
-├── Cargo.toml              # Rust Workspace
-├── package.json            # Bun Workspace
-└── bun.lockb
-```
-
----
-
-## 3. The Rust Core Spec (`/crates/quack_core`)
-
-This code must compile to both **CDYLIB** (Native) and **WASM32-UNKNOWN-UNKNOWN** (Edge).
-
-### 3.1 The String Interner
-Since DuckDB uses `TEXT` IDs (UUIDs), but fast traversal requires `u32` integers, we map them.
-
-*   **Struct:** `BiMap` (Bidirectional Map).
-*   **Forward:** `HashMap<String, u32>` (O(1) lookup).
-*   **Reverse:** `Vec<String>` (Index lookup).
-*   **Edge constraint:** On Cloudflare, `HashMap` overhead is significant.
-    *   *Optimization V2:* Use a Double-Array Trie or enforce integer IDs for large graphs.
-
-### 3.2 The Topology (Mutable CSR)
-We use a hybrid Adjacency List that acts like a Compressed Sparse Row (CSR).
-
-```rust
-pub struct GraphIndex {
-    // Forward Graph: Source u32 -> [(Target u32, Type u8)]
-    // We use Vec<Vec<>> for O(1) appends during hydration.
-    // Ideally, we compact this to flat Vec<u32> (CSR) after hydration.
-    outgoing: Vec<Vec<(u32, u8)>>, 
-    
-    // Reverse Graph: Target u32 -> [(Source u32, Type u8)]
-    // Required for .in() traversals
-    incoming: Vec<Vec<(u32, u8)>>,
-    
-    // Bitmask for soft-deleted nodes (to avoid checking DuckDB for every hop)
-    tombstones: BitVec,
-}
-
-### 3.3 The Graph Solver (Pattern Matching)
-To match Neo4j's isomorphism capabilities (e.g., finding triangles or specific shapes), we implement a **Subgraph Isomorphism Solver** in Rust.
-*   **Algorithm:** VF2 or Backtracking DFS with state pruning.
-*   **Input:** A query graph (small topology of what we look for).
-*   **Execution:**
-    1.  Candidate Selection: Identify potential start nodes based on labels/properties (filtered by DuckDB).
-    2.  Matching: Rust engine expands candidates, checking structural constraints.
-    3.  Output: A set of matching path tuples `[(NodeA, NodeB, NodeC), ...]`.
-
-### 3.4 Recursive Engine
-To support `MATCH (n)-[:KNOWS*1..5]->(m)`, the CSR index must support depth-bounded traversals.
-*   **Function:** `traverse_recursive(starts, type, min_depth, max_depth)`.
-*   **Visited Set:** Essential to prevent cycles in infinite recursions.
-*   **Memory:** Using a bitset for `visited` is efficient given we intern everything to `u32`.
-```
-
----
-
-## 4. The Storage Spec (DuckDB)
-
-We treat DuckDB as a **Log-Structured Merge Tree (LSM)** style store.
-
-### 4.1 Schema Definition
-
-```sql
--- NODES
-CREATE TABLE nodes (
-    row_id UBIGINT PRIMARY KEY, -- Internal sequence for fast joins
-    id TEXT NOT NULL,           -- Public ID
-    labels TEXT[],              -- Multi-label support
-    properties JSON,            -- Schemaless payload
-    embedding FLOAT[1536],      -- Vector (HNSW)
-    
-    -- TEMPORAL COLUMNS
-    valid_from TIMESTAMP DEFAULT current_timestamp,
-    valid_to TIMESTAMP DEFAULT NULL -- NULL means 'Active'
-);
-
--- EDGES
-CREATE TABLE edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    type TEXT NOT NULL,
-    properties JSON,
-    valid_from TIMESTAMP DEFAULT current_timestamp,
-    valid_to TIMESTAMP DEFAULT NULL
-);
-```
-
-### 4.2 The Hydration Flow (Critical Path)
-Startup time is the #1 KPI.
-
-1.  **TS Layer:** Calls `duckdb.stream("SELECT source, target, type FROM edges WHERE valid_to IS NULL")`.
-2.  **TS Layer:** Receives **Apache Arrow RecordBatch** (C++ memory pointer).
-3.  **Bridge:** Passes the pointer to Rust via Napi/Wasm.
-4.  **Rust Layer:**
-    *   Reads `source` column (String View). Interns to `u32`.
-    *   Reads `target` column (String View). Interns to `u32`.
-    *   Updates `GraphIndex`.
-5.  **Target Speed:** 1 Million Edges / second processing rate.
-
----
-
-## 5. The Query Planner (`/packages/quack-graph`)
-
-The TypeScript layer compiles the Fluent API into an **Execution Plan (AST V2)**.
-
-**User Query:**
-```typescript
-g.match(['User']).as('a')
- .out('KNOWS').as('b')
- .out('KNOWS').as('c')
- .matchEdge('c', 'a', 'KNOWS') // Cycle
- .return('a', 'b', 'c')
-```
-
-**Compilation Pipeline (The "Solver" Model):**
-
-1.  **Symbolic AST:** We track aliases (`a`, `b`) and their relationships.
-2.  **Hybrid Optimization:**
-    *   **Filter Pushdown:** DuckDB narrows the candidate sets for `a`, `b`, and `c` based on properties.
-    *   **Pattern Extraction:** The topological constraints (`a->b`, `b->c`, `c->a`) are extracted into a "Pattern Query" for Rust.
-3.  **Execution (Iterative Solver):**
-    *   **Step 1 (Candidates):** DuckDB fetches IDs for start nodes.
-    *   **Step 2 (Rust Solver):** The Rust engine runs VF2/Backtracking on the in-memory graph to find valid tuples `(id_a, id_b, id_c)`.
-    *   **Step 3 (Projection):** The resulting tuples are joined back with DuckDB to fetch properties (`RETURN a.name, c.age`).
-
-**Aggregations & Grouping:**
-Aggregations (`count`, `avg`, `collect`) are pushed down to DuckDB's SQL engine on the final result set.
-
----
-
-## 6. The Native Bridge (`/packages/native`)
-
-We use `napi-rs` to expose Rust to Bun/Node.
-
-```rust
-// packages/native/src/lib.rs
-use napi_derive::napi;
-use quack_core::GraphIndex;
-
-#[napi]
-pub struct NativeGraph {
-    inner: GraphIndex
-}
-
-#[napi]
-impl NativeGraph {
-    #[napi(constructor)]
-    pub fn new() -> Self { ... }
-
-    // Fast Bulk Load via Arrow
-    #[napi]
-    pub fn load_arrow_batch(&mut self, buffer_ptr: BigInt) {
-        // Unsafe pointer magic to read Arrow batch from DuckDB
-    }
-
-    #[napi]
-    pub fn traverse(&self, start_ids: Vec<String>, edge_type: String) -> Vec<String> {
-        // Delegates to quack_core
-    }
-}
-```
-
----
-
-## 7. Development Workflow
-
-### Prerequisites
-1.  **Bun:** `curl -fsSL https://bun.sh/install | bash`
-2.  **Rust:** `rustup update`
-3.  **LLVM/Clang:** Required for building DuckDB extensions (if compiling from source).
-
-### Setup
-
-```bash
-# 1. Install JS dependencies
-bun install
-
-# 2. Build the Rust Core & Bindings
-# This runs cargo build inside /packages/native and /packages/wasm
-bun run build:all
-
-# 3. Run the Test Suite
-# Uses Bun's native test runner (extremely fast)
-bun test
-```
-
-### Running Benchmarks
-We use a dedicated benchmark script to track regression in "Hydration" and "Traversal" speeds.
-
-```bash
-bun run bench
-# Output:
-# [Ingest] 100k nodes: 85ms
-# [Hop] 3-depth traversal: 4ms
-```
-
----
-
-## 8. Cross-Platform Strategy
-
-### Native (Backend)
-*   **Tool:** `napi-rs`.
-*   **Output:** `.node` binary file.
-*   **Architecture:** We ship pre-built binaries for `linux-x64-gnu`, `linux-x64-musl`, `darwin-x64`, `darwin-arm64`, `win32-x64`.
-
-### Edge (Wasm)
-*   **Tool:** `wasm-pack`.
-*   **Output:** `.wasm` file + JS glue.
-*   **Constraint:** Wasm is single-threaded (mostly) and 32-bit address space (4GB limit).
-*   **Storage:** On Edge, DuckDB uses `HTTPFS` to read Parquet from S3/R2, or `OPFS` in the browser.
-
----
-
-## 9. Debugging & Profiling
-
-### Rust Panics
-Rust panics will crash the Bun process. To debug:
-```bash
-export RUST_BACKTRACE=1
-bun test
-```
-
-### Memory Leaks
-If `GraphIndex` grows indefinitely:
-1.  Check `interner.rs`. Are we removing strings when nodes are deleted? (Current design: No, we tombstone. Strings leak until restart).
-2.  Check Napi `External` references. Are we properly dropping Rust structs when JS objects are GC'd?
-
----
-
-## 10. Future Proofing (Roadmap Specs)
-
-### v0.5: Topology Snapshots
-*   **Problem:** Hydration takes too long for 10M+ edges.
-*   **Spec:** Implement `GraphIndex::serialize()` using `bincode` or `rkyv` (Zero-Copy deserialization framework).
-*   **Flow:** Save `graph.bin` alongside `db.duckdb`. On boot, `mmap` `graph.bin` directly into memory.
-
-### v0.8: Declarative Mutations (Merge)
-*   **Problem:** "Check-then-Act" logic in JS is slow and race-condition prone.
-*   **Spec:** Implement `MERGE` logic.
-    *   Locking: Optimistic concurrency control or single-threaded writer queue.
-    *   Logic: `INSERT ON CONFLICT DO UPDATE` generated in DuckDB.
-
-### v1.0: Cypher Parser
-*   **Problem:** DSL lock-in.
-*   **Spec:** Use a PEG parser in Rust to parse Cypher strings into our internal AST.
-*   **Goal:** `g.query("MATCH (n)-[:KNOWS]->(m) RETURN m")`.
-
-### v1.0: Replication
-*   **Problem:** Local-only limits usage.
-*   **Spec:** Simple S3 sync.
-*   **Command:** `g.sync.push('s3://bucket/latest')`.
-*   **Logic:** Upload the `.duckdb` file and the `.bin` topology snapshot. Clients pull and hot-reload.
-````
-
 ## File: packages/quackgraph/tsconfig.json
 ````json
 {
@@ -3724,6 +3065,7 @@ export class Chronos {
 
     // biome-ignore lint/suspicious/noExplicitAny: SQL result
     const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
+    // biome-ignore lint/suspicious/noExplicitAny: SQL result row check
     const count = Number(result[0]?.count || 0);
 
     return {
@@ -3752,7 +3094,9 @@ export class Chronos {
       const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
 
       const currentSummary = new Map<string, number>();
-      currentSummaryList.forEach(s => currentSummary.set(s.edgeType, s.count));
+      for (const s of currentSummaryList) {
+        currentSummary.set(s.edgeType, s.count);
+      }
 
       const addedEdges: SectorSummary[] = [];
       const removedEdges: SectorSummary[] = [];
@@ -3873,6 +3217,44 @@ export const ScoutDecisionSchema = z.discriminatedUnion('action', [
 ]);
 ````
 
+## File: packages/agent/biome.json
+````json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "es5"
+    }
+  }
+}
+````
+
 ## File: packages/agent/tsconfig.json
 ````json
 {
@@ -3898,6 +3280,91 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
+});
+````
+
+## File: scripts/git-pull.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * Git Pull Script - Federated Pull for Nested Repositories
+ * 
+ * Usage:
+ *   bun run scripts/git-pull.ts
+ *   bun run pull:all
+ */
+
+import { $ } from "bun";
+
+const INNER_REPO_PATH = "packages/quackgraph";
+const ROOT_DIR = import.meta.dir.replace("/scripts", "");
+
+async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
+    console.log(`\n⬇️ [${repoName}] Processing...`);
+
+    // Check if directory exists and has .git
+    const fs = await import("node:fs/promises");
+    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
+
+    if (!hasGit && repoUrl) {
+        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
+        try {
+            // Ensure parent dir exists
+            await $`mkdir -p ${cwd}`;
+            // Remove the empty dir if it exists so clone works (or clone into it if empty)
+            // Safest is to remove checking uniqueness or just run git clone
+            // If cwd exists but is empty, git clone <url> <dir> works.
+
+            await $`git clone ${repoUrl} ${cwd}`;
+            console.log(`   ✅ Successfully cloned ${repoName}`);
+            return;
+        } catch (error) {
+            console.error(`   ❌ Failed to clone ${repoName}:`, error);
+            throw error;
+        }
+    }
+
+    console.log(`   ⬇️ Pulling changes...`);
+    try {
+        await $`git -C ${cwd} pull`.quiet();
+        console.log(`   ✅ Successfully pulled ${repoName}`);
+    } catch (error) {
+        console.error(`   ❌ Failed to pull ${repoName}:`, error);
+        throw error;
+    }
+}
+
+async function pullAll(): Promise<void> {
+    console.log("🔄 Git Pull - Federated Repository Update");
+    console.log("=========================================");
+
+    // Pull parent first
+    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
+    await pullRepo(ROOT_DIR, "quackgraph-agent");
+
+    // Pull inner repo
+    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
+    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
+    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
+
+    // Custom logic to ensure 'agent' branch
+    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
+    // Force checkout agent branch if not already
+    try {
+        await $`git -C ${innerRepoPath} checkout agent`.quiet();
+        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
+    } catch (e) {
+        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
+    }
+
+    console.log("\n\n=========================================");
+    console.log("✅ Git pull completed successfully!");
+    console.log("=========================================\n");
+}
+
+pullAll().catch((error) => {
+    console.error("\n❌ Pull failed:", error);
+    process.exit(1);
 });
 ````
 
@@ -4055,41 +3522,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-````
-
-## File: package.json
-````json
-{
-  "name": "quackgraph-agent",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "workspaces": [
-    "packages/agent",
-    "packages/quackgraph/packages/*"
-  ],
-  "scripts": {
-    "format": "bun run --cwd packages/quackgraph format",
-    "clean": "rm -rf node_modules packages/agent/dist && bun run --cwd packages/quackgraph clean",
-    "postinstall": "bun run --cwd packages/quackgraph/packages/native build",
-    "typecheck": "tsc --noEmit && bun run --cwd packages/quackgraph typecheck",
-    "lint": "bun run --cwd packages/quackgraph lint",
-    "check": "bun run typecheck && bun run lint",
-    "dev": "bun test --watch",
-    "test": "bun run build && bun test",
-    "build": "bun run build:core && bun run build:agent",
-    "build:core": "bun run --cwd packages/quackgraph build",
-    "build:agent": "bun run --cwd packages/agent build",
-    "build:watch": "bun run --cwd packages/agent build --watch",
-    "push:all": "bun run scripts/git-sync.ts"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "@types/bun": "latest",
-    "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
-  }
-}
 ````
 
 ## File: relay.config.json
@@ -4557,7 +3989,7 @@ export class SchemaRegistry {
   }
 
   loadFromConfig(configs: DomainConfig[]) {
-    configs.forEach(c => this.register(c));
+    configs.forEach(c => { this.register(c); });
   }
 
   getDomain(name: string): DomainConfig | undefined {
@@ -4653,7 +4085,6 @@ export const routerAgent = new Agent({
 ## File: packages/agent/src/mastra/index.ts
 ````typescript
 import { Mastra } from '@mastra/core/mastra';
-import { DefaultExporter } from '@mastra/core/ai-tracing';
 // import { PinoLogger } from '@mastra/loggers';
 import { scoutAgent } from './agents/scout-agent';
 import { judgeAgent } from './agents/judge-agent';
@@ -4666,8 +4097,8 @@ export const mastra = new Mastra({
   observability: {
     default: {
       enabled: true,
-      sampling: { type: 'always' },
-      exporters: [new DefaultExporter()],
+
+      // exporters: [new DefaultExporter()],
     },
   },
 });
@@ -4691,15 +4122,15 @@ export class GraphTools {
 
     // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
     const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-    
+
     // 2. Filter if explicit allowed list provided (double check)
     // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
     // Note: optimization - native filtering is faster, but we rely on caller to pass correct allowedEdgeTypes from registry.getValidEdges()
     if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
-        // redundant but safe if native implementation varies
-        // no-op if native did its job
+      // redundant but safe if native implementation varies
+      // no-op if native did its job
     }
-    
+
     // 3. Sort by count (descending)
     return results.sort((a, b) => b.count - a.count);
   }
@@ -4708,9 +4139,10 @@ export class GraphTools {
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf, minValidFrom);
+    // Native traverse does not support minValidFrom yet
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
   }
 
   /**
@@ -4765,19 +4197,19 @@ export class GraphTools {
     for (const id of nodeIds) {
       // Look ahead
       const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach(nid => spineContextIds.add(nid));
+      next.forEach(nid => { spineContextIds.add(nid); });
 
       // Look back
-      const prev = await this.graph.native.traverse([id], 'PREV', 'out');
+      const _prev = await this.graph.native.traverse([id], 'PREV', 'out');
       const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach(nid => spineContextIds.add(nid));
+      incomingNext.forEach(nid => { spineContextIds.add(nid); });
 
       const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach(nid => spineContextIds.add(nid));
+      explicitPrev.forEach(nid => { spineContextIds.add(nid); });
     }
 
     // Remove duplicates (original nodes)
-    nodeIds.forEach(id => spineContextIds.delete(id));
+    nodeIds.forEach(id => { spineContextIds.delete(id); });
 
     if (spineContextIds.size > 0) {
       const contextNodes = await this.graph.match([])
@@ -4803,114 +4235,17 @@ export class GraphTools {
   async reinforcePath(trace: { source: string; incomingEdge?: string }[], qualityScore: number = 1.0) {
     // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
     // We assume native handles saturation at 255.
-    const heatDelta = Math.floor(qualityScore * 50);
-    
+    const _heatDelta = Math.floor(qualityScore * 50);
+
     for (let i = 1; i < trace.length; i++) {
       const prev = trace[i - 1];
       const curr = trace[i];
       if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
       if (curr.incomingEdge) {
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
+        // await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
+        console.warn('Pheromones not implemented in V1 native graph');
       }
     }
-  }
-}
-````
-
-## File: packages/agent/package.json
-````json
-{
-  "name": "@quackgraph/agent",
-  "version": "0.1.0",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "clean": "rm -rf dist"
-  },
-  "dependencies": {
-    "@mastra/core": "^0.24.6",
-    "@mastra/loggers": "^0.1.0",
-    "@mastra/memory": "^0.15.12",
-    "@opentelemetry/api": "^1.8.0",
-    "zod": "^3.23.0",
-    "@quackgraph/graph": "workspace:*",
-    "@quackgraph/native": "workspace:*"
-  },
-  "devDependencies": {
-    "typescript": "^5.0.0",
-    "tsup": "^8.0.0"
-  }
-}
-````
-
-## File: repomix.config.json
-````json
-{
-  "$schema": "https://repomix.com/schemas/latest/schema.json",
-  "input": {
-    "maxFileSize": 52428800
-  },
-  "output": {
-    "filePath": "dev-docs/repomix.md",
-    "style": "markdown",
-    "parsableStyle": true,
-    "fileSummary": false,
-    "directoryStructure": true,
-    "files": true,
-    "removeComments": false,
-    "removeEmptyLines": false,
-    "compress": false,
-    "topFilesLength": 5,
-    "showLineNumbers": false,
-    "copyToClipboard": true,
-    "git": {
-      "sortByChanges": true,
-      "sortByChangesMaxCommits": 100,
-      "includeDiffs": false
-    }
-  },
-  "include": [
-//"README.md",
-//"test-docs/"
-//"test/",
-//"test-docs/unit.test-plan.
-
-],
-  "ignore": {
-    "useGitignore": true,
-    "useDefaultPatterns": true,
-    "customPatterns": [
-      "dev-docs/flow.todo.md",
-      "packages/quackgraph/.git",
-      "packages/quackgraph/repomix.config.json",
-      "packages/quackgraph/relay.config.json",
-      "packages/quackgraph/.relay",
-      "packages/quackgraph/dev-docs",
-      "packages/quackgraph/LICENSE",
-      "packages/quackgraph/.gitignore",
-      "packages/quackgraph/tsconfig.tsbuildinfo",
-"packages/quackgraph/packages/quack-graph/dist",
-      "packages/quackgraph/test/",
-      "packages/quackgraph/test-docs/",
-      "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src"
-    ]
-  },
-  "security": {
-    "enableSecurityCheck": true
-  },
-  "tokenCount": {
-    "encoding": "o200k_base"
   }
 }
 ````
@@ -4958,7 +4293,7 @@ export const scoutAgent = new Agent({
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
 import { JudgeDecisionSchema } from '../../agent-schemas';
 
 // Step 1: Identify Candidates
@@ -5093,8 +4428,6 @@ const applySummary = createStep({
   },
 });
 
-import { Workflow } from '@mastra/core/workflows';
-
 const workflow = createWorkflow({
   id: 'metabolism-workflow',
   inputSchema: z.object({
@@ -5124,7 +4457,7 @@ export * from './tools/graph-tools';
 // Expose Mastra definitions if needed, but facade prefers hiding them
 export { mastra } from './mastra';
 
-import { QuackGraph } from '@quackgraph/graph';
+import type { QuackGraph } from '@quackgraph/graph';
 import { Labyrinth } from './labyrinth';
 import type { AgentConfig } from './types';
 import { mastra } from './mastra';
@@ -5162,6 +4495,106 @@ export async function runMetabolism(targetLabel: string, minAgeDays: number = 30
 }
 ````
 
+## File: package.json
+````json
+{
+  "name": "quackgraph-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/agent",
+    "packages/quackgraph/packages/*"
+  ],
+  "scripts": {
+    "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
+    "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
+    "postinstall": "bun run build",
+    "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
+    "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
+    "check": "bun run typecheck && bun run lint",
+    "dev": "bun test --watch",
+    "test": "bun run build && bun test",
+    "build": "bun run build:core && bun run build:agent",
+    "build:core": "bun run --cwd packages/quackgraph build",
+    "build:agent": "bun run --cwd packages/agent build",
+    "build:watch": "bun run --cwd packages/agent build --watch",
+    "push:all": "bun run scripts/git-sync.ts",
+    "pull:all": "bun run scripts/git-pull.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
+  }
+}
+````
+
+## File: repomix.config.json
+````json
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "input": {
+    "maxFileSize": 52428800
+  },
+  "output": {
+    "filePath": "dev-docs/repomix.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": false,
+    "directoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": true,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false
+    }
+  },
+  "include": [
+//"README.md",
+//"test-docs/"
+//"test/",
+//"test-docs/unit.test-plan.
+
+],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "dev-docs/flow.todo.md",
+      "packages/quackgraph/.git",
+      "packages/quackgraph/repomix.config.json",
+      "packages/quackgraph/relay.config.json",
+      "packages/quackgraph/.relay",
+      "packages/quackgraph/dev-docs",
+      "packages/quackgraph/LICENSE",
+      "packages/quackgraph/.gitignore",
+      "packages/quackgraph/tsconfig.tsbuildinfo",
+"packages/quackgraph/packages/quack-graph/dist",
+      "packages/quackgraph/test/",
+      "packages/quackgraph/test-docs/",
+      "packages/quackgraph/test/e2e/",
+      "packages/quackgraph/src",
+            "packages/quackgraph/RFC.README.md",
+            "packages/quackgraph/README.md"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
+````
+
 ## File: packages/agent/src/types.ts
 ````typescript
 export enum ZoomLevel {
@@ -5173,8 +4606,8 @@ export enum ZoomLevel {
 // Type alias for Mastra Agent - imports the actual Agent type from @mastra/core
 import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { Metric } from '@mastra/core/eval';
-import { z } from 'zod';
-import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from './agent-schemas';
+import type { z } from 'zod';
+import type { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from './agent-schemas';
 
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
@@ -5240,6 +4673,7 @@ export interface ScoutPrompt {
 
 export interface JudgePrompt {
   goal: string;
+  // biome-ignore lint/suspicious/noExplicitAny: generic content
   nodeContent: Record<string, any>[];
   timeContext?: string;
 }
@@ -5251,6 +4685,7 @@ export interface LabyrinthArtifact {
   confidence: number;
   traceId: string;
   sources: string[];
+  // biome-ignore lint/suspicious/noExplicitAny: metadata
   metadata?: Record<string, any>;
 }
 
@@ -5285,6 +4720,47 @@ export interface TimeStepDiff {
 }
 ````
 
+## File: packages/agent/package.json
+````json
+{
+  "name": "@quackgraph/agent",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/loggers": "^0.1.0",
+    "@mastra/memory": "^0.15.12",
+    "@opentelemetry/api": "^1.8.0",
+    "zod": "^3.23.0",
+    "@quackgraph/graph": "workspace:*",
+    "@quackgraph/native": "workspace:*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "typescript": "^5.0.0",
+    "tsup": "^8.0.0"
+  }
+}
+````
+
 ## File: packages/agent/src/labyrinth.ts
 ````typescript
 import { QuackGraph } from '@quackgraph/graph';
@@ -5296,7 +4772,7 @@ import type {
   DomainConfig,
   MastraAgent
 } from './types';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
 import { trace, type Span } from '@opentelemetry/api';
 
 import { setGraphInstance } from './lib/graph-instance';
@@ -5308,10 +4784,10 @@ import { GraphTools } from './tools/graph-tools';
 import { SchemaRegistry } from './governance/schema-registry';
 
 // Schemas
-import { 
-  RouterDecisionSchema, 
-  ScoutDecisionSchema, 
-  JudgeDecisionSchema 
+import {
+  RouterDecisionSchema,
+  ScoutDecisionSchema,
+  JudgeDecisionSchema
 } from './agent-schemas';
 
 interface Cursor {
@@ -5375,8 +4851,10 @@ export class Labyrinth {
       span.setAttribute('labyrinth.goal', goal);
       const traceId = span.spanContext().traceId;
       const parentSpanId = span.spanContext().spanId;
-      
+
       this.logger.info(`Starting Labyrinth trace: ${goal}`, { traceId, goal });
+
+      let foundArtifact: { artifact: LabyrinthArtifact; cursor: Cursor } | null = null;
 
       try {
         // --- Phase 0: Context Firewall (Routing) ---
@@ -5395,7 +4873,7 @@ export class Labyrinth {
             `;
 
           try {
-            const res = await this.agents.router.generate(routerPrompt, { 
+            const res = await this.agents.router.generate(routerPrompt, {
               abortSignal: rootSignal,
               tracingOptions: { traceId, parentSpanId },
               structuredOutput: {
@@ -5406,11 +4884,11 @@ export class Labyrinth {
             // Use structured output
             const decision = res.object;
             if (decision) {
-                const valid = availableDomains.find(
-                  d => d.name.toLowerCase() === decision.domain.toLowerCase()
-                );
-                if (valid) activeDomain = decision.domain;
-                this.logger.debug(`Router selected domain: ${activeDomain}`, { traceId, domain: activeDomain });
+              const valid = availableDomains.find(
+                d => d.name.toLowerCase() === decision.domain.toLowerCase()
+              );
+              if (valid) activeDomain = decision.domain;
+              this.logger.debug(`Router selected domain: ${activeDomain}`, { traceId, domain: activeDomain });
             }
 
             span.setAttribute('labyrinth.active_domain', activeDomain);
@@ -5449,6 +4927,7 @@ export class Labyrinth {
           return null;
         }
 
+
         // Initialize Root Cursor
         let cursors: Cursor[] = startNodes.map(nodeId => ({
           id: randomUUID(),
@@ -5462,8 +4941,7 @@ export class Labyrinth {
 
         const maxHops = this.config.maxHops || 10;
         const maxCursors = this.config.maxCursors || 3;
-        
-        let foundArtifact: { artifact: LabyrinthArtifact; cursor: Cursor } | null = null;
+
 
         // Speculative Execution Loop
         while (cursors.length > 0 && !foundArtifact && !rootSignal.aborted) {
@@ -5475,13 +4953,13 @@ export class Labyrinth {
 
             const task = async () => {
               if (foundArtifact || rootSignal.aborted) return;
-              
+
               // Create a span for this cursor's step
               await this.tracer.startActiveSpan('labyrinth.cursor_step', async (cursorSpan) => {
                 cursorSpan.setAttribute('cursor.id', cursor.id);
                 cursorSpan.setAttribute('cursor.node_id', cursor.currentNodeId);
                 cursorSpan.setAttribute('cursor.step_count', cursor.stepCount);
-                
+
                 try {
                   // Pruning: Max Depth
                   if (cursor.stepCount >= maxHops) {
@@ -5538,21 +5016,21 @@ export class Labyrinth {
                   // biome-ignore lint/suspicious/noExplicitAny: decision blob
                   let decision: any;
                   try {
-                    const res = await this.agents.scout.generate(scoutPrompt, { 
+                    const res = await this.agents.scout.generate(scoutPrompt, {
                       abortSignal: rootSignal,
                       tracingOptions: { traceId, parentSpanId: cursorSpan.spanContext().spanId },
                       structuredOutput: {
                         schema: ScoutDecisionSchema
                       }
                     });
-                    
+
                     decision = res.object;
-                    
+
                     // Trace tool results if any (post-hoc observability)
                     if (res.toolResults && res.toolResults.length > 0) {
                       cursorSpan.setAttribute('scout.tool_calls_count', res.toolResults.length);
-                      cursorSpan.addEvent('scout_tool_execution', { 
-                        results: JSON.stringify(res.toolResults) 
+                      cursorSpan.addEvent('scout_tool_execution', {
+                        results: JSON.stringify(res.toolResults)
                       });
                     }
 
@@ -5560,7 +5038,7 @@ export class Labyrinth {
                     if (!rootSignal.aborted) this.logger.warn('Scout failed to decide', { traceId, cursorId: cursor.id, error: e });
                     return;
                   }
-                  
+
                   if (!decision) return;
 
                   cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
@@ -5580,14 +5058,14 @@ export class Labyrinth {
                     `;
 
                     try {
-                      const res = await this.agents.judge.generate(judgePrompt, { 
+                      const res = await this.agents.judge.generate(judgePrompt, {
                         abortSignal: rootSignal,
                         tracingOptions: { traceId, parentSpanId: cursorSpan.spanContext().spanId },
                         structuredOutput: {
                           schema: JudgeDecisionSchema
                         }
                       });
-                      
+
                       const artifact = res.object;
 
                       if (
@@ -5709,15 +5187,15 @@ export class Labyrinth {
 
         if (foundArtifact) {
           const { artifact, cursor } = foundArtifact;
-          
+
           // Reconstruct path for reinforcement using cursor history
           const pathTrace = cursor.path.map((nodeId, idx) => ({
             source: nodeId,
             incomingEdge: cursor.pathEdges[idx]
           }));
-          
+
           await this.tools.reinforcePath(pathTrace, artifact.confidence);
-          
+
           return artifact;
         }
 

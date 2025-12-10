@@ -6,7 +6,7 @@ export * from './tools/graph-tools';
 // Expose Mastra definitions if needed, but facade prefers hiding them
 export { mastra } from './mastra';
 
-import { QuackGraph } from '@quackgraph/graph';
+import type { QuackGraph } from '@quackgraph/graph';
 import { Labyrinth } from './labyrinth';
 import type { AgentConfig } from './types';
 import { mastra } from './mastra';

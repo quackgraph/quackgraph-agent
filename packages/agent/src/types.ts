@@ -7,8 +7,8 @@ export enum ZoomLevel {
 // Type alias for Mastra Agent - imports the actual Agent type from @mastra/core
 import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { Metric } from '@mastra/core/eval';
-import { z } from 'zod';
-import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from './agent-schemas';
+import type { z } from 'zod';
+import type { RouterDecisionSchema, ScoutDecisionSchema } from './agent-schemas';
 
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
@@ -74,6 +74,7 @@ export interface ScoutPrompt {
 
 export interface JudgePrompt {
   goal: string;
+  // biome-ignore lint/suspicious/noExplicitAny: generic content
   nodeContent: Record<string, any>[];
   timeContext?: string;
 }
@@ -85,6 +86,7 @@ export interface LabyrinthArtifact {
   confidence: number;
   traceId: string;
   sources: string[];
+  // biome-ignore lint/suspicious/noExplicitAny: metadata
   metadata?: Record<string, any>;
 }
 

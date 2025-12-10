@@ -46,7 +46,9 @@
       "packages/quackgraph/test/",
       "packages/quackgraph/test-docs/",
       "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src"
+      "packages/quackgraph/src",
+            "packages/quackgraph/RFC.README.md",
+            "packages/quackgraph/README.md"
     ]
   },
   "security": {

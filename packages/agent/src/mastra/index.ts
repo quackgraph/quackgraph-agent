@@ -1,5 +1,4 @@
 import { Mastra } from '@mastra/core/mastra';
-import { DefaultExporter } from '@mastra/core/ai-tracing';
 // import { PinoLogger } from '@mastra/loggers';
 import { scoutAgent } from './agents/scout-agent';
 import { judgeAgent } from './agents/judge-agent';
@@ -12,8 +11,8 @@ export const mastra = new Mastra({
   observability: {
     default: {
       enabled: true,
-      sampling: { type: 'always' },
-      exporters: [new DefaultExporter()],
+
+      // exporters: [new DefaultExporter()],
     },
   },
 });

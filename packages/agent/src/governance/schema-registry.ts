@@ -18,7 +18,7 @@ export class SchemaRegistry {
   }
 
   loadFromConfig(configs: DomainConfig[]) {
-    configs.forEach(c => this.register(c));
+    configs.forEach(c => { this.register(c); });
   }
 
   getDomain(name: string): DomainConfig | undefined {

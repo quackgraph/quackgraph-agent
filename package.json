@@ -10,7 +10,7 @@
   "scripts": {
     "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
     "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
-    "postinstall": "bun run --cwd packages/quackgraph/packages/native build",
+    "postinstall": "bun run build",
     "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
     "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
     "check": "bun run typecheck && bun run lint",

@@ -1,4 +1,4 @@
-import { QuackGraph } from '@quackgraph/graph';
+import type { QuackGraph } from '@quackgraph/graph';
 import type {
   AgentConfig,
   LabyrinthArtifact,
@@ -7,7 +7,7 @@ import type {
   DomainConfig,
   MastraAgent
 } from './types';
-import { randomUUID } from 'crypto';
+import { randomUUID } from 'node:crypto';
 import { trace, type Span } from '@opentelemetry/api';
 
 import { setGraphInstance } from './lib/graph-instance';
@@ -19,10 +19,10 @@ import { GraphTools } from './tools/graph-tools';
 import { SchemaRegistry } from './governance/schema-registry';
 
 // Schemas
-import { 
-  RouterDecisionSchema, 
-  ScoutDecisionSchema, 
-  JudgeDecisionSchema 
+import {
+  RouterDecisionSchema,
+  ScoutDecisionSchema,
+  JudgeDecisionSchema
 } from './agent-schemas';
 
 interface Cursor {
@@ -86,8 +86,10 @@ export class Labyrinth {
       span.setAttribute('labyrinth.goal', goal);
       const traceId = span.spanContext().traceId;
       const parentSpanId = span.spanContext().spanId;
-      
+
       this.logger.info(`Starting Labyrinth trace: ${goal}`, { traceId, goal });
+
+      let foundArtifact: { artifact: LabyrinthArtifact; cursor: Cursor } | null = null;
 
       try {
         // --- Phase 0: Context Firewall (Routing) ---
@@ -106,7 +108,7 @@ export class Labyrinth {
             `;
 
           try {
-            const res = await this.agents.router.generate(routerPrompt, { 
+            const res = await this.agents.router.generate(routerPrompt, {
               abortSignal: rootSignal,
               tracingOptions: { traceId, parentSpanId },
               structuredOutput: {
@@ -117,11 +119,11 @@ export class Labyrinth {
             // Use structured output
             const decision = res.object;
             if (decision) {
-                const valid = availableDomains.find(
-                  d => d.name.toLowerCase() === decision.domain.toLowerCase()
-                );
-                if (valid) activeDomain = decision.domain;
-                this.logger.debug(`Router selected domain: ${activeDomain}`, { traceId, domain: activeDomain });
+              const valid = availableDomains.find(
+                d => d.name.toLowerCase() === decision.domain.toLowerCase()
+              );
+              if (valid) activeDomain = decision.domain;
+              this.logger.debug(`Router selected domain: ${activeDomain}`, { traceId, domain: activeDomain });
             }
 
             span.setAttribute('labyrinth.active_domain', activeDomain);
@@ -160,6 +162,7 @@ export class Labyrinth {
           return null;
         }
 
+
         // Initialize Root Cursor
         let cursors: Cursor[] = startNodes.map(nodeId => ({
           id: randomUUID(),
@@ -173,8 +176,7 @@ export class Labyrinth {
 
         const maxHops = this.config.maxHops || 10;
         const maxCursors = this.config.maxCursors || 3;
-        
-        let foundArtifact: { artifact: LabyrinthArtifact; cursor: Cursor } | null = null;
+
 
         // Speculative Execution Loop
         while (cursors.length > 0 && !foundArtifact && !rootSignal.aborted) {
@@ -186,13 +188,13 @@ export class Labyrinth {
 
             const task = async () => {
               if (foundArtifact || rootSignal.aborted) return;
-              
+
               // Create a span for this cursor's step
               await this.tracer.startActiveSpan('labyrinth.cursor_step', async (cursorSpan) => {
                 cursorSpan.setAttribute('cursor.id', cursor.id);
                 cursorSpan.setAttribute('cursor.node_id', cursor.currentNodeId);
                 cursorSpan.setAttribute('cursor.step_count', cursor.stepCount);
-                
+
                 try {
                   // Pruning: Max Depth
                   if (cursor.stepCount >= maxHops) {
@@ -249,21 +251,21 @@ export class Labyrinth {
                   // biome-ignore lint/suspicious/noExplicitAny: decision blob
                   let decision: any;
                   try {
-                    const res = await this.agents.scout.generate(scoutPrompt, { 
+                    const res = await this.agents.scout.generate(scoutPrompt, {
                       abortSignal: rootSignal,
                       tracingOptions: { traceId, parentSpanId: cursorSpan.spanContext().spanId },
                       structuredOutput: {
                         schema: ScoutDecisionSchema
                       }
                     });
-                    
+
                     decision = res.object;
-                    
+
                     // Trace tool results if any (post-hoc observability)
                     if (res.toolResults && res.toolResults.length > 0) {
                       cursorSpan.setAttribute('scout.tool_calls_count', res.toolResults.length);
-                      cursorSpan.addEvent('scout_tool_execution', { 
-                        results: JSON.stringify(res.toolResults) 
+                      cursorSpan.addEvent('scout_tool_execution', {
+                        results: JSON.stringify(res.toolResults)
                       });
                     }
 
@@ -271,7 +273,7 @@ export class Labyrinth {
                     if (!rootSignal.aborted) this.logger.warn('Scout failed to decide', { traceId, cursorId: cursor.id, error: e });
                     return;
                   }
-                  
+
                   if (!decision) return;
 
                   cursor.traceHistory.push(`[${decision.action}] ${decision.reasoning}`);
@@ -291,19 +293,18 @@ export class Labyrinth {
                     `;
 
                     try {
-                      const res = await this.agents.judge.generate(judgePrompt, { 
+                      const res = await this.agents.judge.generate(judgePrompt, {
                         abortSignal: rootSignal,
                         tracingOptions: { traceId, parentSpanId: cursorSpan.spanContext().spanId },
                         structuredOutput: {
                           schema: JudgeDecisionSchema
                         }
                       });
-                      
+
                       const artifact = res.object;
 
                       if (
-                        artifact &&
-                        artifact.isAnswer &&
+                        artifact?.isAnswer &&
                         artifact.confidence >= (this.config.confidenceThreshold || 0.7)
                       ) {
                         const finalArtifact = {
@@ -316,7 +317,7 @@ export class Labyrinth {
                         rootController.abort(); // KILL SWITCH
                         return;
                       }
-                    } catch (e) {
+                    } catch (_e) {
                       /* ignore judge fail */
                     }
 
@@ -420,15 +421,15 @@ export class Labyrinth {
 
         if (foundArtifact) {
           const { artifact, cursor } = foundArtifact;
-          
+
           // Reconstruct path for reinforcement using cursor history
           const pathTrace = cursor.path.map((nodeId, idx) => ({
             source: nodeId,
             incomingEdge: cursor.pathEdges[idx]
           }));
-          
+
           await this.tools.reinforcePath(pathTrace, artifact.confidence);
-          
+
           return artifact;
         }
 

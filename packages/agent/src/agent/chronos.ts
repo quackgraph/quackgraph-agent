@@ -61,7 +61,6 @@ export class Chronos {
         AND t_target <= t_anchor
     `;
 
-    // biome-ignore lint/suspicious/noExplicitAny: SQL result
     const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
     const count = Number(result[0]?.count || 0);
 
@@ -91,7 +90,9 @@ export class Chronos {
       const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
 
       const currentSummary = new Map<string, number>();
-      currentSummaryList.forEach(s => currentSummary.set(s.edgeType, s.count));
+      for (const s of currentSummaryList) {
+        currentSummary.set(s.edgeType, s.count);
+      }
 
       const addedEdges: SectorSummary[] = [];
       const removedEdges: SectorSummary[] = [];

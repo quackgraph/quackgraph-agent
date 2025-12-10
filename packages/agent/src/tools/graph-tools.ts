@@ -14,15 +14,15 @@ export class GraphTools {
 
     // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
     const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-    
+
     // 2. Filter if explicit allowed list provided (double check)
     // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
     // Note: optimization - native filtering is faster, but we rely on caller to pass correct allowedEdgeTypes from registry.getValidEdges()
     if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
-        // redundant but safe if native implementation varies
-        // no-op if native did its job
+      // redundant but safe if native implementation varies
+      // no-op if native did its job
     }
-    
+
     // 3. Sort by count (descending)
     return results.sort((a, b) => b.count - a.count);
   }
@@ -31,9 +31,10 @@ export class GraphTools {
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf, minValidFrom);
+    // Native traverse does not support minValidFrom yet
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
   }
 
   /**
@@ -88,19 +89,19 @@ export class GraphTools {
     for (const id of nodeIds) {
       // Look ahead
       const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach(nid => spineContextIds.add(nid));
+      next.forEach(nid => { spineContextIds.add(nid); });
 
       // Look back
-      const prev = await this.graph.native.traverse([id], 'PREV', 'out');
+      const _prev = await this.graph.native.traverse([id], 'PREV', 'out');
       const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach(nid => spineContextIds.add(nid));
+      incomingNext.forEach(nid => { spineContextIds.add(nid); });
 
       const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach(nid => spineContextIds.add(nid));
+      explicitPrev.forEach(nid => { spineContextIds.add(nid); });
     }
 
     // Remove duplicates (original nodes)
-    nodeIds.forEach(id => spineContextIds.delete(id));
+    nodeIds.forEach(id => { spineContextIds.delete(id); });
 
     if (spineContextIds.size > 0) {
       const contextNodes = await this.graph.match([])
@@ -126,14 +127,15 @@ export class GraphTools {
   async reinforcePath(trace: { source: string; incomingEdge?: string }[], qualityScore: number = 1.0) {
     // Base increment is 50 for a perfect score. Clamped by native logic (u8 wraparound or saturation).
     // We assume native handles saturation at 255.
-    const heatDelta = Math.floor(qualityScore * 50);
-    
+    const _heatDelta = Math.floor(qualityScore * 50);
+
     for (let i = 1; i < trace.length; i++) {
       const prev = trace[i - 1];
       const curr = trace[i];
       if (!prev || !curr) continue; // Satisfy noUncheckedIndexedAccess
       if (curr.incomingEdge) {
-        await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
+        // await this.graph.updateEdgeHeat(prev.source, curr.source, curr.incomingEdge, heatDelta);
+        console.warn('Pheromones not implemented in V1 native graph');
       }
     }
   }
