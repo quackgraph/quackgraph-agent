@@ -5,9 +5,16 @@ import { sectorScanTool, topologyScanTool, temporalScanTool, evolutionaryScanToo
 
 export const scoutAgent = new Agent({
   name: 'Scout Agent',
-  instructions: `
+  instructions: async ({ runtimeContext }) => {
+    const asOf = runtimeContext?.get('asOf') as number | undefined;
+    const domain = runtimeContext?.get('domain') as string | undefined;
+    const timeContext = asOf ? `Time Travel Mode: ${new Date(asOf).toISOString()}` : 'Time: Present (Real-time)';
+    const domainContext = domain ? `Governance Domain: ${domain}` : 'Governance: Global/Unrestricted';
+
+    return `
     You are a Graph Scout navigating a topology.
-    
+    System Context: [${timeContext}, ${domainContext}]
+
     Your goal is to decide the next move based on the provided context.
     
     Context provided in user message:
@@ -22,10 +29,14 @@ export const scoutAgent = new Agent({
     - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
       - Use Depth 1 to check immediate neighbors.
       - Use Depth 2-3 to explore structure without moving.
-      - The map shows "🔥" for hot paths (high pheromones).
+      - The map shows "🔥" for hot paths.
 
     - **Time Travel:** 
       - Use \`evolutionary-scan\` with specific ISO timestamps to see how connections changed over time (e.g., "What changed between 2023 and 2024?").
+    
+    - **Ambiguity & Forking:**
+      - If you are unsure between two paths (e.g. "Did he Author it or Review it?"), select the most likely one as your primary MOVE.
+      - **CRITICAL:** Add the second option to \`alternativeMoves\`. The system will spawn parallel threads to explore both hypotheses simultaneously.
 
     - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
     - **Exploration:** 
@@ -34,7 +45,8 @@ export const scoutAgent = new Agent({
     - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
     - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
     - **Abort:** If stuck or exhausted, action: "ABORT".
-  `,
+  `;
+  },
   model: {
     id: 'groq/llama-3.3-70b-versatile',
   },

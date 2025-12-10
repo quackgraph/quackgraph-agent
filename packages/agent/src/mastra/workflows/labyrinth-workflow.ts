@@ -1,4 +1,5 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
+import { AISpanType } from '@mastra/core/ai-tracing';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
@@ -166,7 +167,7 @@ const speculativeTraversal = createStep({
     foundWinner: z.boolean()
   }),
   stateSchema: LabyrinthStateSchema,
-  execute: async ({ inputData, mastra, state, setState }) => {
+  execute: async ({ inputData, mastra, state, setState, tracingContext }) => {
     // Agents & Tools
     const scout = mastra?.getAgent('scoutAgent');
     const judge = mastra?.getAgent('judgeAgent');
@@ -199,35 +200,50 @@ const speculativeTraversal = createStep({
       // Parallel execution of all active cursors
       const promises = cursors.map(async (cursor) => {
         if (winner) return; // Short circuit
+
+        // Trace this specific thread's execution for this step
+        const threadSpan = tracingContext?.currentSpan?.createChildSpan({
+          type: AISpanType.GENERIC,
+          name: `thread-exec-${cursor.id}`,
+          metadata: {
+            thread_id: cursor.id,
+            step_count: cursor.stepCount,
+            current_node: cursor.currentNodeId
+          }
+        });
         
-        // 1. Max Hops Check
-        if (cursor.stepCount >= config.maxHops) {
-           deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
-           return;
-        }
-
-        // 2. Fetch Node Metadata (LOD 1)
-        const nodeMeta = await graph.match([]).where({ id: cursor.currentNodeId }).select();
-        if (!nodeMeta[0]) return;
-        const currentNode = nodeMeta[0];
-
-        // 3. Sector Scan (LOD 0) - "Satellite View"
-        const allowedEdges = registry.getValidEdges(domain);
-        const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
-        const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
-        
-        // 4. Scout Decision
-        const prompt = `
-          Goal: "${goal}"
-          Domain: "${domain}"
-          Node: "${cursor.currentNodeId}" (Labels: ${JSON.stringify(currentNode.labels)})
-          Path: ${JSON.stringify(cursor.path)}
-          Time: "${timeDesc}"
-          Moves:
-          ${summaryList}
-        `;
-
         try {
+          // 1. Max Hops Check
+          if (cursor.stepCount >= config.maxHops) {
+             deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
+             threadSpan?.end({ output: { result: 'max_hops' } });
+             return;
+          }
+
+          // 2. Fetch Node Metadata (LOD 1)
+          const nodeMeta = await graph.match([]).where({ id: cursor.currentNodeId }).select();
+          if (!nodeMeta[0]) {
+             threadSpan?.end({ output: { result: 'node_not_found' } });
+             return;
+          }
+          const currentNode = nodeMeta[0];
+
+          // 3. Sector Scan (LOD 0) - "Satellite View"
+          const allowedEdges = registry.getValidEdges(domain);
+          const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+          const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
+        
+          // 4. Scout Decision
+          const prompt = `
+            Goal: "${goal}"
+            Domain: "${domain}"
+            Node: "${cursor.currentNodeId}" (Labels: ${JSON.stringify(currentNode.labels)})
+            Path: ${JSON.stringify(cursor.path)}
+            Time: "${timeDesc}"
+            Moves:
+            ${summaryList}
+          `;
+
             // Note: We inject runtimeContext here to ensure tools called by Scout respect "Time" and "Domain"
             const res = await scout.generate(prompt, { 
                 structuredOutput: { schema: ScoutDecisionSchema },
@@ -244,7 +260,10 @@ const speculativeTraversal = createStep({
             if (res.usage) tokensUsed += (res.usage.promptTokens||0) + (res.usage.completionTokens||0);
             
             const decision = res.object;
-            if (!decision) return;
+            if (!decision) {
+              threadSpan?.end({ output: { error: 'no_decision' } });
+              return;
+            }
 
             // Log step
             cursor.stepHistory.push({
@@ -285,42 +304,76 @@ const speculativeTraversal = createStep({
                     };
                      if (winner.metadata) winner.metadata.execution = [{ thread_id: cursor.id, status: 'COMPLETED', steps: cursor.stepHistory }];
                 }
-            } else if (decision.action === 'MOVE' && (decision.edgeType || decision.path)) {
-                // Fork / Move Logic
-                if (decision.path) {
-                     // Multi-hop jump (from Navigational Map)
-                     const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
-                     if (target) {
-                        nextCursors.push({ 
+            } else if (decision.action === 'MOVE') {
+                // Collect all intended moves (Primary + Alternatives)
+                const moves = [];
+                
+                // 1. Primary Move
+                if (decision.edgeType || decision.path) {
+                    moves.push({ 
+                        edgeType: decision.edgeType, 
+                        path: decision.path, 
+                        confidence: decision.confidence, 
+                        reasoning: decision.reasoning 
+                    });
+                }
+
+                // 2. Alternative Moves (Semantic Forking)
+                if (decision.alternativeMoves) {
+                    for (const alt of decision.alternativeMoves) {
+                        moves.push({ 
+                            edgeType: alt.edgeType, 
+                            path: undefined, 
+                            confidence: alt.confidence, 
+                            reasoning: alt.reasoning 
+                        });
+                    }
+                }
+
+                // Process all moves
+                for (const move of moves) {
+                    if (move.path) {
+                        // Multi-hop jump (from Navigational Map)
+                        const target = move.path.length > 0 ? move.path[move.path.length-1] : undefined;
+                        if (target) {
+                           nextCursors.push({ 
                           ...cursor, 
                           id: randomUUID(), 
                           currentNodeId: target, 
-                          path: [...cursor.path, ...decision.path], 
-                          pathEdges: [...cursor.pathEdges, ...new Array(decision.path.length).fill(undefined)],
-                          stepCount: cursor.stepCount + decision.path.length, 
-                          confidence: cursor.confidence * decision.confidence 
+                          path: [...cursor.path, ...move.path], 
+                          pathEdges: [...cursor.pathEdges, ...new Array(move.path.length).fill(undefined)],
+                          stepCount: cursor.stepCount + move.path.length, 
+                          confidence: cursor.confidence * move.confidence 
                         });
-                     }
-                } else if (decision.edgeType) {
-                     // Single-hop move
-                     const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
-                     // Speculative Forking: Take top 2 paths if ambiguous
-                     for (const t of neighbors.slice(0, 2)) {
-                        nextCursors.push({ 
+                        }
+                    } else if (move.edgeType) {
+                        // Single-hop move
+                        const neighbors = await tools.topologyScan([cursor.currentNodeId], move.edgeType, asOfTs);
+                        
+                        // Speculative Forking: Take top 3 paths per semantic branch to handle topological ambiguity
+                        for (const t of neighbors.slice(0, 3)) {
+                           nextCursors.push({ 
                           ...cursor, 
                           id: randomUUID(), 
                           currentNodeId: t, 
                           path: [...cursor.path, t], 
-                          pathEdges: [...cursor.pathEdges, decision.edgeType],
+                          pathEdges: [...cursor.pathEdges, move.edgeType],
                           stepCount: cursor.stepCount+1, 
-                          confidence: cursor.confidence * decision.confidence 
+                          confidence: cursor.confidence * move.confidence 
                         });
-                     }
+                        }
+                    }
+                    
+                    threadSpan?.end({ output: { action: 'MOVE', branches: moves.length } });
                 }
+            } else {
+               threadSpan?.end({ output: { action: decision.action } });
             }
-        } catch(e) { 
+        } catch(e) {
            console.warn(`Thread ${cursor.id} failed:`, e);
            deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
+           // @ts-expect-error - span.error exists in runtime but typing might be strict
+           threadSpan?.error({ error: e });
         }
       });
 
@@ -387,7 +440,7 @@ const reinforcePath = createStep({
   inputSchema: z.object({}),
   stateSchema: LabyrinthStateSchema,
   outputSchema: z.object({ success: z.boolean() }),
-  execute: async ({ state }) => {
+  execute: async ({ state, tracingContext }) => {
     if (!state.winner || !state.winner.sources) return { success: false };
     
     // Find the cursor that produced the winner
@@ -395,7 +448,21 @@ const reinforcePath = createStep({
     if (winningCursor) {
         const graph = getGraphInstance();
         const tools = new GraphTools(graph);
-        await tools.reinforcePath(winningCursor.path, winningCursor.pathEdges, state.winner.confidence);
+        
+        const span = tracingContext?.currentSpan?.createChildSpan({
+            type: AISpanType.GENERIC,
+            name: 'apply-pheromones',
+            metadata: { path_length: winningCursor.path.length }
+        });
+
+        try {
+            await tools.reinforcePath(winningCursor.path, winningCursor.pathEdges, state.winner.confidence);
+            span?.end();
+        } catch(e) {
+            // @ts-expect-error - span.error usage
+            span?.error({ error: e });
+            throw e;
+        }
         return { success: true };
     }
 

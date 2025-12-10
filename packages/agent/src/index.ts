@@ -29,7 +29,14 @@ export function createAgent(graph: QuackGraph, config: AgentConfig) {
   const router = mastra.getAgent('routerAgent');
 
   if (!scout || !judge || !router) {
-    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
+    const missing = [];
+    if (!scout) missing.push('scoutAgent');
+    if (!judge) missing.push('judgeAgent');
+    if (!router) missing.push('routerAgent');
+    throw new Error(
+      `Failed to create QuackGraph Agent. Required Mastra agents are missing: ${missing.join(', ')}. ` +
+      `Ensure you have imported 'mastra' from this package and registered these agents.`
+    );
   }
 
   return new Labyrinth(

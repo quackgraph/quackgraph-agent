@@ -5,14 +5,19 @@ import { GraphTools } from '../../tools/graph-tools';
 import { getSchemaRegistry } from '../../governance/schema-registry';
 import { Chronos } from '../../agent/chronos';
 
-// We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
+// Helper to reliably extract context from Mastra's RuntimeContext
+// biome-ignore lint/suspicious/noExplicitAny: RuntimeContext access
+function extractContext(runtimeContext: any) {
+  const asOf = runtimeContext?.get?.('asOf') as number | undefined;
+  const domain = runtimeContext?.get?.('domain') as string | undefined;
+  return { asOf, domain };
+}
 
 export const sectorScanTool = createTool({
   id: 'sector-scan',
-  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
+  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Automatically filters by active governance domain.',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
-    asOf: z.number().optional(),
     allowedEdgeTypes: z.array(z.string()).optional(),
   }),
   outputSchema: z.object({
@@ -25,20 +30,23 @@ export const sectorScanTool = createTool({
   execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
-
-    // 1. Resolve Context
-    // @ts-expect-error - Runtime context typing overlap
-    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
-    // @ts-expect-error - Runtime context typing overlap
-    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
-    
-    // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
-    const asOf = context.asOf ?? ctxAsOf;
-
-    // 2. Resolve Governance
     const registry = getSchemaRegistry();
-    const domainEdges = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
-    const effectiveAllowed = context.allowedEdgeTypes ?? domainEdges;
+
+    // 1. Extract Environmental Context
+    const { asOf, domain } = extractContext(runtimeContext);
+
+    // 2. Apply Governance
+    const domainEdges = domain ? registry.getValidEdges(domain) : undefined;
+    
+    // Merge explicit allowed types (if provided by agent) with domain restrictions
+    let effectiveAllowed: string[] | undefined;
+    
+    if (context.allowedEdgeTypes && domainEdges) {
+      // Intersection
+      effectiveAllowed = context.allowedEdgeTypes.filter(e => domainEdges.includes(e));
+    } else {
+      effectiveAllowed = context.allowedEdgeTypes || domainEdges;
+    }
 
     const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
     return { summary };
@@ -47,13 +55,11 @@ export const sectorScanTool = createTool({
 
 export const topologyScanTool = createTool({
   id: 'topology-scan',
-  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
+  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1) or visualize structure (Ghost Map).',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
     edgeType: z.string().optional(),
-    asOf: z.number().optional(),
-    minValidFrom: z.number().optional(),
-    depth: z.number().min(1).max(4).optional(),
+    depth: z.number().min(1).max(3).optional(),
   }),
   outputSchema: z.object({
     neighborIds: z.array(z.string()).optional(),
@@ -63,54 +69,48 @@ export const topologyScanTool = createTool({
   execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
-    
-    // Resolve Context
-    // @ts-expect-error - Runtime context typing overlap
-    const ctxAsOf = (runtimeContext?.asOf || runtimeContext?.get?.('asOf')) as number | undefined;
-    // @ts-expect-error - Runtime context typing overlap
-    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
+    const registry = getSchemaRegistry();
+    const { asOf, domain } = extractContext(runtimeContext);
 
-    const asOf = context.asOf ?? ctxAsOf;
-    
-    // Enforce Domain Governance if implicit
-    if (ctxDomain && context.edgeType) {
-      const registry = getSchemaRegistry();
-      if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+    // 1. Governance Check
+    if (domain && context.edgeType) {
+      if (!registry.isEdgeAllowed(domain, context.edgeType)) {
         return { neighborIds: [] }; // Silently block restricted edges
       }
     }
 
+    // 2. Ghost Map Mode (LOD 1.5)
     if (context.depth && context.depth > 1) {
-      // Ghost Map Mode (LOD 1.5)
       const maps = [];
       let truncated = false;
       for (const id of context.nodeIds) {
-        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
-        const res = await tools.getNavigationalMap(id, context.depth, asOf);
+        // Note: NavigationalMap respects asOf
+        const res = await tools.getNavigationalMap(id, context.depth, { asOf });
         maps.push(res.map);
         if (res.truncated) truncated = true;
       }
       return { map: maps.join('\n\n'), truncated };
     }
 
-    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
+    // Implicit map mode if no edgeType is provided
     if (!context.edgeType) {
         const maps = [];
         for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1, asOf);
+            const res = await tools.getNavigationalMap(id, 1, { asOf });
             maps.push(res.map);
         }
         return { map: maps.join('\n\n') };
     }
 
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf, context.minValidFrom);
+    // 3. Standard Traversal
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, { asOf });
     return { neighborIds };
   },
 });
 
 export const temporalScanTool = createTool({
   id: 'temporal-scan',
-  description: 'Find neighbors connected via edges overlapping a specific time window',
+  description: 'Find neighbors connected via edges overlapping a specific time window.',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
     windowStart: z.string().describe('ISO Date String'),
@@ -124,14 +124,12 @@ export const temporalScanTool = createTool({
   execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
-    
-    // Enforce Governance
-    // @ts-expect-error - Runtime context typing overlap
-    const ctxDomain = (runtimeContext?.domain || runtimeContext?.get?.('domain')) as string | undefined;
+    const registry = getSchemaRegistry();
+    const { domain } = extractContext(runtimeContext);
 
-    if (ctxDomain && context.edgeType) {
-       const registry = getSchemaRegistry();
-       if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+    // Governance Check
+    if (domain && context.edgeType) {
+       if (!registry.isEdgeAllowed(domain, context.edgeType)) {
          return { neighborIds: [] };
        }
     }
@@ -145,7 +143,7 @@ export const temporalScanTool = createTool({
 
 export const contentRetrievalTool = createTool({
   id: 'content-retrieval',
-  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',
+  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2).',
   inputSchema: z.object({
     nodeIds: z.array(z.string()),
   }),
@@ -162,10 +160,10 @@ export const contentRetrievalTool = createTool({
 
 export const evolutionaryScanTool = createTool({
   id: 'evolutionary-scan',
-  description: 'Analyze how the topology around a node changed over specific timepoints (LOD 4 - Time). Useful for trend analysis.',
+  description: 'Analyze how the topology around a node changed over specific timepoints (LOD 4 - Time).',
   inputSchema: z.object({
     nodeId: z.string(),
-    timestamps: z.array(z.string()).describe('ISO Date Strings to compare (e.g. ["2020-01-01", "2021-01-01"])'),
+    timestamps: z.array(z.string()).describe('ISO Date Strings'),
   }),
   outputSchema: z.object({
     timeline: z.array(z.object({
@@ -185,7 +183,6 @@ export const evolutionaryScanTool = createTool({
     const dates = context.timestamps.map(t => new Date(t));
     const result = await chronos.evolutionaryDiff(context.nodeId, dates);
 
-    // Format for LLM consumption
     const timeline = result.timeline.map(t => ({
       timestamp: t.timestamp.toISOString(),
       added: t.addedEdges.map(e => `${e.edgeType} (${e.count})`),
