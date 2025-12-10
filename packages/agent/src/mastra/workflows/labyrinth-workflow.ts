@@ -1,7 +1,7 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace, LabyrinthContext } from '../../types';
+import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
 import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
@@ -49,7 +49,9 @@ const routeDomain = createStep({
   id: 'route-domain',
   inputSchema: WorkflowInputSchema,
   outputSchema: z.object({
-    selectedDomain: z.string()
+    selectedDomain: z.string(),
+    goal: z.string(),
+    start: z.union([z.string(), z.object({ query: z.string() })])
   }),
   stateSchema: LabyrinthStateSchema,
   execute: async ({ inputData, mastra, setState, state }) => {
@@ -100,7 +102,8 @@ const routeDomain = createStep({
       winner: undefined
     });
 
-    return { selectedDomain };
+    // Pass-through essential inputs for the next step in the chain
+    return { selectedDomain, goal: inputData.goal, start: inputData.start };
   }
 });
 
@@ -109,7 +112,12 @@ const routeDomain = createStep({
 const initializeCursors = createStep({
   id: 'initialize-cursors',
   inputSchema: z.object({
+    goal: z.string(),
     start: z.union([z.string(), z.object({ query: z.string() })]),
+  }),
+  outputSchema: z.object({
+    cursorCount: z.number(),
+    goal: z.string()
   }),
   stateSchema: LabyrinthStateSchema,
   execute: async ({ inputData, state, setState }) => {
@@ -143,7 +151,7 @@ const initializeCursors = createStep({
       cursors: initialCursors
     });
 
-    return { cursorCount: initialCursors.length };
+    return { cursorCount: initialCursors.length, goal: inputData.goal };
   }
 });
 
@@ -153,6 +161,9 @@ const speculativeTraversal = createStep({
   id: 'speculative-traversal',
   inputSchema: z.object({
     goal: z.string()
+  }),
+  outputSchema: z.object({
+    foundWinner: z.boolean()
   }),
   stateSchema: LabyrinthStateSchema,
   execute: async ({ inputData, mastra, state, setState }) => {

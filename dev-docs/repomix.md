@@ -161,326 +161,6 @@ export function getGraphInstance(): QuackGraph {
 }
 ````
 
-## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
-````typescript
-import { createStep, createWorkflow } from '@mastra/core/workflows';
-import { z } from 'zod';
-import { randomUUID } from 'node:crypto';
-import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
-import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
-import { getSchemaRegistry } from '../../governance/schema-registry';
-
-// Types
-const WorkflowInputSchema = z.object({
-  goal: z.string(),
-  start: z.union([z.string(), z.object({ query: z.string() })]),
-  domain: z.string().optional(),
-  maxHops: z.number().optional().default(10),
-  maxCursors: z.number().optional().default(3),
-  confidenceThreshold: z.number().optional().default(0.7),
-  timeContext: z.object({
-    asOf: z.number().optional(),
-    windowStart: z.string().optional(),
-    windowEnd: z.string().optional()
-  }).optional()
-});
-
-// Step 1: Route
-const routeDomain = createStep({
-  id: 'route-domain',
-  inputSchema: WorkflowInputSchema,
-  outputSchema: z.object({
-    domain: z.string(),
-    governance: z.any(),
-    // Pass-through
-    goal: z.string(),
-    start: z.union([z.string(), z.object({ query: z.string() })]),
-    config: z.any() 
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const registry = getSchemaRegistry();
-    const availableDomains = registry.getAllDomains();
-    
-    // Pass-through config
-    const config = {
-      maxHops: inputData.maxHops,
-      maxCursors: inputData.maxCursors,
-      confidenceThreshold: inputData.confidenceThreshold,
-      timeContext: inputData.timeContext
-    };
-
-    let selectedDomain = inputData.domain || 'global';
-    let reasoning = 'Default';
-    let rejected: string[] = [];
-
-    if (availableDomains.length > 1 && !inputData.domain) {
-      const router = mastra?.getAgent('routerAgent');
-      if (router) {
-        const descriptions = availableDomains.map(d => `- ${d.name}: ${d.description}`).join('\n');
-        const prompt = `Goal: "${inputData.goal}"\nAvailable Domains:\n${descriptions}`;
-        try {
-          const res = await router.generate(prompt, { structuredOutput: { schema: RouterDecisionSchema } });
-          const decision = res.object;
-          if (decision) {
-             const valid = availableDomains.find(d => d.name.toLowerCase() === decision.domain.toLowerCase());
-             if (valid) selectedDomain = decision.domain;
-             reasoning = decision.reasoning;
-             rejected = availableDomains.map(d => d.name).filter(n => n.toLowerCase() !== selectedDomain.toLowerCase());
-          }
-        } catch(e) { console.warn("Router failed", e); }
-      }
-    }
-
-    return {
-      domain: selectedDomain,
-      governance: { query: inputData.goal, selected_domain: selectedDomain, rejected_domains: rejected, reasoning },
-      goal: inputData.goal,
-      start: inputData.start,
-      config
-    };
-  }
-});
-
-// Step 2: Initialize
-const initializeCursors = createStep({
-  id: 'initialize-cursors',
-  inputSchema: z.object({
-    domain: z.string(),
-    governance: z.any(),
-    goal: z.string(),
-    start: z.union([z.string(), z.object({ query: z.string() })]),
-    config: z.any()
-  }),
-  outputSchema: z.object({
-    cursors: z.array(z.custom<LabyrinthCursor>()),
-    domain: z.string(),
-    governance: z.any(),
-    goal: z.string(),
-    config: z.any()
-  }),
-  execute: async ({ inputData }) => {
-    let startNodes: string[] = [];
-    if (typeof inputData.start === 'string') {
-      startNodes = [inputData.start];
-    } else {
-       // Vector search fallback logic would go here
-       console.warn("Vector search not implemented in this workflow step yet.");
-       startNodes = [];
-    }
-
-    const cursors: LabyrinthCursor[] = startNodes.map(nodeId => ({
-      id: randomUUID().slice(0, 8),
-      currentNodeId: nodeId,
-      path: [nodeId],
-      pathEdges: [undefined],
-      stepHistory: [{
-        step: 0,
-        node_id: nodeId,
-        action: 'START',
-        reasoning: 'Initialized',
-        ghost_view: 'N/A'
-      }],
-      stepCount: 0,
-      confidence: 1.0
-    }));
-
-    return {
-      cursors,
-      domain: inputData.domain,
-      governance: inputData.governance,
-      goal: inputData.goal,
-      config: inputData.config
-    };
-  }
-});
-
-// Step 3: Traverse
-const speculativeTraversal = createStep({
-  id: 'speculative-traversal',
-  inputSchema: z.object({
-    cursors: z.array(z.custom<LabyrinthCursor>()),
-    domain: z.string(),
-    governance: z.any(),
-    goal: z.string(),
-    config: z.any()
-  }),
-  outputSchema: z.object({
-    winner: z.custom<LabyrinthArtifact | null>(),
-    deadThreads: z.array(z.custom<ThreadTrace>()),
-    tokensUsed: z.number(),
-    governance: z.any()
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    const registry = getSchemaRegistry();
-    const scout = mastra?.getAgent('scoutAgent');
-    const judge = mastra?.getAgent('judgeAgent');
-    
-    if (!scout || !judge) throw new Error("Missing agents");
-
-    const { goal, domain, config } = inputData;
-    let cursors = inputData.cursors;
-    const deadThreads: ThreadTrace[] = [];
-    let winner: LabyrinthArtifact | null = null;
-    let tokensUsed = 0;
-    
-    const asOfTs = config.timeContext?.asOf;
-    const timeDesc = asOfTs ? `As of: ${new Date(asOfTs).toISOString()}` : '';
-
-    while (cursors.length > 0 && !winner) {
-      const nextCursors: LabyrinthCursor[] = [];
-      const promises = cursors.map(async (cursor) => {
-        if (winner) return;
-        if (cursor.stepCount >= config.maxHops) {
-           deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
-           return;
-        }
-
-        const nodeMeta = await graph.match([]).where({ id: cursor.currentNodeId }).select();
-        if (!nodeMeta[0]) return;
-        const currentNode = nodeMeta[0];
-
-        const allowedEdges = registry.getValidEdges(domain);
-        const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
-        const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
-        
-        const prompt = `
-          Goal: "${goal}"
-          Domain: "${domain}"
-          Node: "${cursor.currentNodeId}" (Labels: ${JSON.stringify(currentNode.labels)})
-          Path: ${JSON.stringify(cursor.path)}
-          Time: "${timeDesc}"
-          Moves:
-          ${summaryList}
-        `;
-
-        try {
-            const res = await scout.generate(prompt, { 
-                structuredOutput: { schema: ScoutDecisionSchema },
-                memory: {
-                    thread: cursor.id,
-                    resource: inputData.governance?.query || 'global-query'
-                },
-                // @ts-expect-error - Injecting runtime context for tools (Mastra experimental/custom support)
-                runtimeContext: { asOf: asOfTs, domain }
-            });
-            // @ts-expect-error usage
-            if (res.usage) tokensUsed += (res.usage.promptTokens||0) + (res.usage.completionTokens||0);
-            const decision = res.object;
-            if (!decision) return;
-
-            cursor.stepHistory.push({
-                step: cursor.stepCount + 1,
-                node_id: cursor.currentNodeId,
-                action: decision.action,
-                reasoning: decision.reasoning,
-                ghost_view: sectorSummary.slice(0,3).map(s=>s.edgeType).join(',')
-            });
-
-            if (decision.action === 'CHECK') {
-                const content = await tools.contentRetrieval([cursor.currentNodeId]);
-                const jRes = await judge.generate(`Goal: ${goal}\nData: ${JSON.stringify(content)}`, { 
-                    structuredOutput: { schema: JudgeDecisionSchema },
-                    memory: {
-                        thread: cursor.id,
-                        resource: inputData.governance?.query || 'global-query'
-                    }
-                });
-                 // @ts-expect-error usage
-                if (jRes.object && jRes.usage) tokensUsed += (jRes.usage.promptTokens||0) + (jRes.usage.completionTokens||0);
-                if (jRes.object?.isAnswer && jRes.object.confidence >= config.confidenceThreshold) {
-                    winner = {
-                        answer: jRes.object.answer,
-                        confidence: jRes.object.confidence,
-                        traceId: randomUUID(),
-                        sources: [cursor.currentNodeId],
-                        metadata: {
-                            duration_ms: 0,
-                            tokens_used: 0,
-                            governance: inputData.governance,
-                            execution: [],
-                            judgment: { verdict: jRes.object.answer, confidence: jRes.object.confidence }
-                        }
-                    };
-                     if (winner.metadata) winner.metadata.execution = [{ thread_id: cursor.id, status: 'COMPLETED', steps: cursor.stepHistory }];
-                }
-            } else if (decision.action === 'MOVE' && (decision.edgeType || decision.path)) {
-                // Simplified move logic
-                if (decision.path) {
-                     const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
-                     if (target) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
-                     }
-                } else if (decision.edgeType) {
-                     const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
-                     for (const t of neighbors.slice(0, 2)) {
-                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: t, path: [...cursor.path, t], stepCount: cursor.stepCount+1, confidence: cursor.confidence * decision.confidence });
-                     }
-                }
-            }
-        } catch(_e) { return; }
-      });
-
-      await Promise.all(promises);
-      if (winner) break;
-
-      nextCursors.sort((a,b) => b.confidence - a.confidence);
-      for(let i=config.maxCursors; i<nextCursors.length; i++) {
-        const c = nextCursors[i];
-        if (c) deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
-      }
-      cursors = nextCursors.slice(0, config.maxCursors);
-    }
-    
-    if(!winner) {
-        cursors.forEach(c => {
-            deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
-        });
-    }
-
-    return { winner, deadThreads, tokensUsed, governance: inputData.governance };
-  }
-});
-
-// Step 4: Finalize
-const finalizeArtifact = createStep({
-  id: 'finalize-artifact',
-  inputSchema: z.object({
-    winner: z.custom<LabyrinthArtifact | null>(),
-    deadThreads: z.array(z.custom<ThreadTrace>()),
-    tokensUsed: z.number(),
-    governance: z.any()
-  }),
-  outputSchema: z.object({
-    artifact: z.custom<LabyrinthArtifact | null>()
-  }),
-  execute: async ({ inputData }) => {
-    if (!inputData.winner || !inputData.winner.metadata) return { artifact: null };
-    const w = inputData.winner;
-    if (w.metadata) {
-        w.metadata.tokens_used = inputData.tokensUsed;
-        w.metadata.execution.push(...inputData.deadThreads.slice(-5));
-    }
-    return { artifact: w };
-  }
-});
-
-export const labyrinthWorkflow = createWorkflow({
-  id: 'labyrinth-workflow',
-  description: 'Agentic Labyrinth Traversal',
-  inputSchema: WorkflowInputSchema,
-  outputSchema: z.object({ artifact: z.custom<LabyrinthArtifact | null>() })
-})
-  .then(routeDomain)
-  .then(initializeCursors)
-  .then(speculativeTraversal)
-  .then(finalizeArtifact)
-  .commit();
-````
-
 ## File: packages/agent/tsconfig.json
 ````json
 {
@@ -867,6 +547,390 @@ export class Chronos {
     return { anchorNodeId, timeline };
   }
 }
+````
+
+## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
+````typescript
+import { createStep, createWorkflow } from '@mastra/core/workflows';
+import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
+import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
+import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
+import { getGraphInstance } from '../../lib/graph-instance';
+import { GraphTools } from '../../tools/graph-tools';
+import { getSchemaRegistry } from '../../governance/schema-registry';
+
+// --- State Schema ---
+// This tracks the "memory" of the entire traversal run
+const LabyrinthStateSchema = z.object({
+  // Traversal State
+  cursors: z.array(z.custom<LabyrinthCursor>()).default([]),
+  deadThreads: z.array(z.custom<ThreadTrace>()).default([]),
+  winner: z.custom<LabyrinthArtifact | null>().optional(),
+  tokensUsed: z.number().default(0),
+
+  // Governance & Config State (Persisted from init)
+  domain: z.string().default('global'),
+  governance: z.any().default({}),
+  config: z.object({
+    maxHops: z.number(),
+    maxCursors: z.number(),
+    confidenceThreshold: z.number(),
+    timeContext: z.any().optional()
+  }).optional()
+});
+
+// --- Input Schemas ---
+
+const WorkflowInputSchema = z.object({
+  goal: z.string(),
+  start: z.union([z.string(), z.object({ query: z.string() })]),
+  domain: z.string().optional(),
+  maxHops: z.number().optional().default(10),
+  maxCursors: z.number().optional().default(3),
+  confidenceThreshold: z.number().optional().default(0.7),
+  timeContext: z.object({
+    asOf: z.number().optional(),
+    windowStart: z.string().optional(),
+    windowEnd: z.string().optional()
+  }).optional()
+});
+
+// --- Step 1: Route Domain ---
+// Determines the "Ghost Earth" layer (Domain) and initializes state configuration
+const routeDomain = createStep({
+  id: 'route-domain',
+  inputSchema: WorkflowInputSchema,
+  outputSchema: z.object({
+    selectedDomain: z.string(),
+    goal: z.string(),
+    start: z.union([z.string(), z.object({ query: z.string() })])
+  }),
+  stateSchema: LabyrinthStateSchema,
+  execute: async ({ inputData, mastra, setState, state }) => {
+    const registry = getSchemaRegistry();
+    const availableDomains = registry.getAllDomains();
+
+    // 1. Setup Configuration in State
+    const config = {
+      maxHops: inputData.maxHops,
+      maxCursors: inputData.maxCursors,
+      confidenceThreshold: inputData.confidenceThreshold,
+      timeContext: inputData.timeContext
+    };
+
+    let selectedDomain = inputData.domain || 'global';
+    let reasoning = 'Default';
+    let rejected: string[] = [];
+
+    // 2. AI Routing (if multiple domains exist and none specified)
+    if (availableDomains.length > 1 && !inputData.domain) {
+      const router = mastra?.getAgent('routerAgent');
+      if (router) {
+        const descriptions = availableDomains.map(d => `- ${d.name}: ${d.description}`).join('\n');
+        const prompt = `Goal: "${inputData.goal}"\nAvailable Domains:\n${descriptions}`;
+        try {
+          const res = await router.generate(prompt, { structuredOutput: { schema: RouterDecisionSchema } });
+          const decision = res.object;
+          if (decision) {
+             const valid = availableDomains.find(d => d.name.toLowerCase() === decision.domain.toLowerCase());
+             if (valid) selectedDomain = decision.domain;
+             reasoning = decision.reasoning;
+             rejected = availableDomains.map(d => d.name).filter(n => n.toLowerCase() !== selectedDomain.toLowerCase());
+          }
+        } catch(e) { console.warn("Router failed", e); }
+      }
+    }
+
+    // 3. Update Global State
+    setState({
+      ...state,
+      domain: selectedDomain,
+      governance: { query: inputData.goal, selected_domain: selectedDomain, rejected_domains: rejected, reasoning },
+      config,
+      // Reset counters
+      tokensUsed: 0,
+      cursors: [],
+      deadThreads: [],
+      winner: undefined
+    });
+
+    // Pass-through essential inputs for the next step in the chain
+    return { selectedDomain, goal: inputData.goal, start: inputData.start };
+  }
+});
+
+// --- Step 2: Initialize Cursors ---
+// Bootstraps the search threads
+const initializeCursors = createStep({
+  id: 'initialize-cursors',
+  inputSchema: z.object({
+    goal: z.string(),
+    start: z.union([z.string(), z.object({ query: z.string() })]),
+  }),
+  outputSchema: z.object({
+    cursorCount: z.number(),
+    goal: z.string()
+  }),
+  stateSchema: LabyrinthStateSchema,
+  execute: async ({ inputData, state, setState }) => {
+    let startNodes: string[] = [];
+    if (typeof inputData.start === 'string') {
+      startNodes = [inputData.start];
+    } else {
+       // Future: Vector search fallback logic
+       console.warn("Vector search not implemented in this workflow step yet.");
+       startNodes = [];
+    }
+
+    const initialCursors: LabyrinthCursor[] = startNodes.map(nodeId => ({
+      id: randomUUID().slice(0, 8),
+      currentNodeId: nodeId,
+      path: [nodeId],
+      pathEdges: [undefined],
+      stepHistory: [{
+        step: 0,
+        node_id: nodeId,
+        action: 'START',
+        reasoning: 'Initialized',
+        ghost_view: 'N/A'
+      }],
+      stepCount: 0,
+      confidence: 1.0
+    }));
+
+    setState({
+      ...state,
+      cursors: initialCursors
+    });
+
+    return { cursorCount: initialCursors.length, goal: inputData.goal };
+  }
+});
+
+// --- Step 3: Speculative Traversal ---
+// The Core Loop: Runs agents, branches threads, and updates state until a winner is found or hops exhausted
+const speculativeTraversal = createStep({
+  id: 'speculative-traversal',
+  inputSchema: z.object({
+    goal: z.string()
+  }),
+  outputSchema: z.object({
+    foundWinner: z.boolean()
+  }),
+  stateSchema: LabyrinthStateSchema,
+  execute: async ({ inputData, mastra, state, setState }) => {
+    // Agents & Tools
+    const scout = mastra?.getAgent('scoutAgent');
+    const judge = mastra?.getAgent('judgeAgent');
+    if (!scout || !judge) throw new Error("Missing agents");
+
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const registry = getSchemaRegistry();
+
+    // Load from State
+    const { goal } = inputData;
+    const { domain, config } = state;
+    if (!config) throw new Error("Config missing in state");
+
+    // Local mutable copies for the loop (will sync back to state at end)
+    let cursors = [...state.cursors];
+    const deadThreads = [...state.deadThreads];
+    let winner: LabyrinthArtifact | null = state.winner || null;
+    let tokensUsed = state.tokensUsed;
+
+    const asOfTs = config.timeContext?.asOf;
+    const timeDesc = asOfTs ? `As of: ${new Date(asOfTs).toISOString()}` : '';
+
+    // --- The Loop ---
+    // Note: We loop inside the step because Mastra workflows are currently DAGs.
+    // Ideally, this would be a cyclic workflow, but loop-in-step is robust for now.
+    while (cursors.length > 0 && !winner) {
+      const nextCursors: LabyrinthCursor[] = [];
+
+      // Parallel execution of all active cursors
+      const promises = cursors.map(async (cursor) => {
+        if (winner) return; // Short circuit
+        
+        // 1. Max Hops Check
+        if (cursor.stepCount >= config.maxHops) {
+           deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
+           return;
+        }
+
+        // 2. Fetch Node Metadata (LOD 1)
+        const nodeMeta = await graph.match([]).where({ id: cursor.currentNodeId }).select();
+        if (!nodeMeta[0]) return;
+        const currentNode = nodeMeta[0];
+
+        // 3. Sector Scan (LOD 0) - "Satellite View"
+        const allowedEdges = registry.getValidEdges(domain);
+        const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+        const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
+        
+        // 4. Scout Decision
+        const prompt = `
+          Goal: "${goal}"
+          Domain: "${domain}"
+          Node: "${cursor.currentNodeId}" (Labels: ${JSON.stringify(currentNode.labels)})
+          Path: ${JSON.stringify(cursor.path)}
+          Time: "${timeDesc}"
+          Moves:
+          ${summaryList}
+        `;
+
+        try {
+            // Note: We inject runtimeContext here to ensure tools called by Scout respect "Time" and "Domain"
+            const res = await scout.generate(prompt, { 
+                structuredOutput: { schema: ScoutDecisionSchema },
+                memory: {
+                    thread: cursor.id,
+                    resource: state.governance?.query || 'global-query'
+                },
+                // Pass "Ghost Earth" context to the agent runtime
+                // @ts-expect-error - Mastra experimental context injection
+                runtimeContext: { asOf: asOfTs, domain: domain }
+            });
+
+            // @ts-expect-error usage tracking
+            if (res.usage) tokensUsed += (res.usage.promptTokens||0) + (res.usage.completionTokens||0);
+            
+            const decision = res.object;
+            if (!decision) return;
+
+            // Log step
+            cursor.stepHistory.push({
+                step: cursor.stepCount + 1,
+                node_id: cursor.currentNodeId,
+                action: decision.action,
+                reasoning: decision.reasoning,
+                ghost_view: sectorSummary.slice(0,3).map(s=>s.edgeType).join(',')
+            });
+
+            // 5. Handle Actions
+            if (decision.action === 'CHECK') {
+                // Judge Agent: "Street View" (LOD 2 - Full Content)
+                const content = await tools.contentRetrieval([cursor.currentNodeId]);
+                const jRes = await judge.generate(`Goal: ${goal}\nData: ${JSON.stringify(content)}`, { 
+                    structuredOutput: { schema: JudgeDecisionSchema },
+                    memory: {
+                        thread: cursor.id,
+                        resource: state.governance?.query || 'global-query'
+                    }
+                });
+                 // @ts-expect-error usage
+                if (jRes.object && jRes.usage) tokensUsed += (jRes.usage.promptTokens||0) + (jRes.usage.completionTokens||0);
+                
+                if (jRes.object?.isAnswer && jRes.object.confidence >= config.confidenceThreshold) {
+                    winner = {
+                        answer: jRes.object.answer,
+                        confidence: jRes.object.confidence,
+                        traceId: randomUUID(),
+                        sources: [cursor.currentNodeId],
+                        metadata: {
+                            duration_ms: 0,
+                            tokens_used: 0,
+                            governance: state.governance,
+                            execution: [],
+                            judgment: { verdict: jRes.object.answer, confidence: jRes.object.confidence }
+                        }
+                    };
+                     if (winner.metadata) winner.metadata.execution = [{ thread_id: cursor.id, status: 'COMPLETED', steps: cursor.stepHistory }];
+                }
+            } else if (decision.action === 'MOVE' && (decision.edgeType || decision.path)) {
+                // Fork / Move Logic
+                if (decision.path) {
+                     // Multi-hop jump (from Navigational Map)
+                     const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
+                     if (target) {
+                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
+                     }
+                } else if (decision.edgeType) {
+                     // Single-hop move
+                     const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
+                     // Speculative Forking: Take top 2 paths if ambiguous
+                     for (const t of neighbors.slice(0, 2)) {
+                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: t, path: [...cursor.path, t], stepCount: cursor.stepCount+1, confidence: cursor.confidence * decision.confidence });
+                     }
+                }
+            }
+        } catch(e) { 
+           console.warn(`Thread ${cursor.id} failed:`, e);
+           deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
+        }
+      });
+
+      await Promise.all(promises);
+      if (winner) break;
+
+      // 6. Pruning (Survival of the Fittest)
+      nextCursors.sort((a,b) => b.confidence - a.confidence);
+      // Kill excess threads
+      for(let i=config.maxCursors; i<nextCursors.length; i++) {
+        const c = nextCursors[i];
+        if (c) deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
+      }
+      cursors = nextCursors.slice(0, config.maxCursors);
+    }
+    
+    // Cleanup if no winner
+    if(!winner) {
+        cursors.forEach(c => {
+            deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
+        });
+        cursors = []; // Clear active
+    }
+
+    // 7. Update State
+    setState({
+        ...state,
+        cursors, // Should be empty if no winner, or active if paused? Logic here assumes run-to-completion.
+        deadThreads,
+        winner: winner || undefined,
+        tokensUsed
+    });
+
+    return { foundWinner: !!winner };
+  }
+});
+
+// --- Step 4: Finalize Artifact ---
+// Compiles the final report and metadata
+const finalizeArtifact = createStep({
+  id: 'finalize-artifact',
+  inputSchema: z.object({}),
+  stateSchema: LabyrinthStateSchema,
+  outputSchema: z.object({
+    artifact: z.custom<LabyrinthArtifact | null>()
+  }),
+  execute: async ({ state }) => {
+    if (!state.winner || !state.winner.metadata) return { artifact: null };
+    
+    const w = state.winner;
+    if (w.metadata) {
+        w.metadata.tokens_used = state.tokensUsed;
+        // Attach a few dead threads for debugging context
+        w.metadata.execution.push(...state.deadThreads.slice(-5));
+    }
+    return { artifact: w };
+  }
+});
+
+// --- Workflow Definition ---
+
+export const labyrinthWorkflow = createWorkflow({
+  id: 'labyrinth-workflow',
+  description: 'Agentic Labyrinth Traversal with Parallel Speculation',
+  inputSchema: WorkflowInputSchema,
+  outputSchema: z.object({ artifact: z.custom<LabyrinthArtifact | null>() }),
+  stateSchema: LabyrinthStateSchema,
+})
+  .then(routeDomain)
+  .then(initializeCursors)
+  .then(speculativeTraversal)
+  .then(finalizeArtifact)
+  .commit();
 ````
 
 ## File: packages/agent/src/agent-schemas.ts
@@ -1344,6 +1408,81 @@ graph LR
     5.  **Why it wins:** The LLM didn't have to look at 1,000 meal logs and calculate time deltas. Rust did the math; LLM did the storytelling.
 ````
 
+## File: packages/agent/src/governance/schema-registry.ts
+````typescript
+import type { DomainConfig } from '../types';
+
+export class SchemaRegistry {
+  private domains = new Map<string, DomainConfig>();
+
+  constructor() {
+    // Default 'Global' domain that sees everything (fallback)
+    this.register({
+      name: 'global',
+      description: 'Unrestricted access to the entire topology.',
+      allowedEdges: [], // Empty means ALL allowed
+      excludedEdges: []
+    });
+  }
+
+  register(config: DomainConfig) {
+    this.domains.set(config.name.toLowerCase(), config);
+  }
+
+  loadFromConfig(configs: DomainConfig[]) {
+    configs.forEach(c => { this.register(c); });
+  }
+
+  getDomain(name: string): DomainConfig | undefined {
+    return this.domains.get(name.toLowerCase());
+  }
+
+  getAllDomains(): DomainConfig[] {
+    return Array.from(this.domains.values());
+  }
+
+  /**
+   * Returns true if the edge type is allowed within the domain.
+   * If domain is 'global' or not found, it defaults to true (permissive) 
+   * unless strict mode is desired.
+   */
+  isEdgeAllowed(domainName: string, edgeType: string): boolean {
+    const domain = this.domains.get(domainName.toLowerCase());
+    if (!domain) return true;
+    
+    // 1. Check Exclusion (Blacklist)
+    if (domain.excludedEdges?.includes(edgeType)) return false;
+
+    // 2. Check Inclusion (Whitelist)
+    if (domain.allowedEdges.length > 0) {
+      return domain.allowedEdges.includes(edgeType);
+    }
+
+    // 3. Default Permissive
+    return true;
+  }
+
+  getValidEdges(domainName: string): string[] | undefined {
+    const domain = this.domains.get(domainName.toLowerCase());
+    if (!domain || (domain.allowedEdges.length === 0 && (!domain.excludedEdges || domain.excludedEdges.length === 0))) {
+      return undefined; // All allowed
+    }
+    return domain.allowedEdges;
+  }
+
+  /**
+   * Returns true if the domain requires causal (monotonic) time traversal.
+   */
+  isDomainCausal(domainName: string): boolean {
+    const domain = this.domains.get(domainName.toLowerCase());
+    return !!domain?.isCausal;
+  }
+}
+
+export const schemaRegistry = new SchemaRegistry();
+export const getSchemaRegistry = () => schemaRegistry;
+````
+
 ## File: packages/agent/src/mastra/agents/judge-agent.ts
 ````typescript
 import { Agent } from '@mastra/core/agent';
@@ -1408,7 +1547,6 @@ import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
 import { getSchemaRegistry } from '../../governance/schema-registry';
-import type { LabyrinthContext } from '../../types';
 
 // We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
 
@@ -1557,81 +1695,6 @@ export const contentRetrievalTool = createTool({
     return { content };
   },
 });
-````
-
-## File: packages/agent/src/governance/schema-registry.ts
-````typescript
-import type { DomainConfig } from '../types';
-
-export class SchemaRegistry {
-  private domains = new Map<string, DomainConfig>();
-
-  constructor() {
-    // Default 'Global' domain that sees everything (fallback)
-    this.register({
-      name: 'global',
-      description: 'Unrestricted access to the entire topology.',
-      allowedEdges: [], // Empty means ALL allowed
-      excludedEdges: []
-    });
-  }
-
-  register(config: DomainConfig) {
-    this.domains.set(config.name.toLowerCase(), config);
-  }
-
-  loadFromConfig(configs: DomainConfig[]) {
-    configs.forEach(c => { this.register(c); });
-  }
-
-  getDomain(name: string): DomainConfig | undefined {
-    return this.domains.get(name.toLowerCase());
-  }
-
-  getAllDomains(): DomainConfig[] {
-    return Array.from(this.domains.values());
-  }
-
-  /**
-   * Returns true if the edge type is allowed within the domain.
-   * If domain is 'global' or not found, it defaults to true (permissive) 
-   * unless strict mode is desired.
-   */
-  isEdgeAllowed(domainName: string, edgeType: string): boolean {
-    const domain = this.domains.get(domainName.toLowerCase());
-    if (!domain) return true;
-    
-    // 1. Check Exclusion (Blacklist)
-    if (domain.excludedEdges?.includes(edgeType)) return false;
-
-    // 2. Check Inclusion (Whitelist)
-    if (domain.allowedEdges.length > 0) {
-      return domain.allowedEdges.includes(edgeType);
-    }
-
-    // 3. Default Permissive
-    return true;
-  }
-
-  getValidEdges(domainName: string): string[] | undefined {
-    const domain = this.domains.get(domainName.toLowerCase());
-    if (!domain || (domain.allowedEdges.length === 0 && (!domain.excludedEdges || domain.excludedEdges.length === 0))) {
-      return undefined; // All allowed
-    }
-    return domain.allowedEdges;
-  }
-
-  /**
-   * Returns true if the domain requires causal (monotonic) time traversal.
-   */
-  isDomainCausal(domainName: string): boolean {
-    const domain = this.domains.get(domainName.toLowerCase());
-    return !!domain?.isCausal;
-  }
-}
-
-export const schemaRegistry = new SchemaRegistry();
-export const getSchemaRegistry = () => schemaRegistry;
 ````
 
 ## File: packages/agent/src/mastra/workflows/metabolism-workflow.ts
@@ -1820,54 +1883,6 @@ export const mastra = new Mastra({
 });
 ````
 
-## File: packages/agent/src/index.ts
-````typescript
-export * from './labyrinth';
-export * from './types';
-export * from './agent/chronos';
-export * from './governance/schema-registry';
-export * from './tools/graph-tools';
-// Expose Mastra definitions if needed, but facade prefers hiding them
-export { mastra } from './mastra';
-
-import type { QuackGraph } from '@quackgraph/graph';
-import { Labyrinth } from './labyrinth';
-import type { AgentConfig } from './types';
-import { mastra } from './mastra';
-
-/**
- * Factory to create a fully wired Labyrinth Agent.
- * Uses default Mastra agents (Scout, Judge, Router) unless overridden.
- */
-export function createAgent(graph: QuackGraph, config: AgentConfig) {
-  const scout = mastra.getAgent('scoutAgent');
-  const judge = mastra.getAgent('judgeAgent');
-  const router = mastra.getAgent('routerAgent');
-
-  if (!scout || !judge || !router) {
-    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
-  }
-
-  return new Labyrinth(
-    graph,
-    { scout, judge, router },
-    config
-  );
-}
-
-
-
-/**
- * Runs the Metabolism (Dreaming) cycle to prune and summarize old nodes.
- */
-export async function runMetabolism(targetLabel: string, minAgeDays: number = 30) {
-  const workflow = mastra.getWorkflow('metabolismWorkflow');
-  if (!workflow) throw new Error("Metabolism workflow not found.");
-  const run = await workflow.createRunAsync();
-  return run.start({ inputData: { targetLabel, minAgeDays } });
-}
-````
-
 ## File: package.json
 ````json
 {
@@ -1900,6 +1915,158 @@ export async function runMetabolism(targetLabel: string, minAgeDays: number = 30
     "@types/bun": "latest",
     "tsup": "^8.5.1",
     "typescript": "^5.0.0"
+  }
+}
+````
+
+## File: packages/agent/src/index.ts
+````typescript
+// Core Facade
+export { Labyrinth } from './labyrinth';
+
+// Types & Schemas
+export * from './types';
+export * from './agent-schemas';
+
+// Utilities
+export * from './agent/chronos';
+export * from './governance/schema-registry';
+export * from './tools/graph-tools';
+
+// Mastra Internals (Exposed for advanced configuration)
+export { mastra } from './mastra';
+export { labyrinthWorkflow } from './mastra/workflows/labyrinth-workflow';
+
+// Factory
+import type { QuackGraph } from '@quackgraph/graph';
+import { Labyrinth } from './labyrinth';
+import type { AgentConfig } from './types';
+import { mastra } from './mastra';
+
+/**
+ * Factory to create a fully wired Labyrinth Agent.
+ * Checks for required Mastra agents (Scout, Judge, Router) before instantiation.
+ */
+export function createAgent(graph: QuackGraph, config: AgentConfig) {
+  const scout = mastra.getAgent('scoutAgent');
+  const judge = mastra.getAgent('judgeAgent');
+  const router = mastra.getAgent('routerAgent');
+
+  if (!scout || !judge || !router) {
+    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
+  }
+
+  return new Labyrinth(
+    graph,
+    { scout, judge, router },
+    config
+  );
+}
+````
+
+## File: packages/agent/package.json
+````json
+{
+  "name": "@quackgraph/agent",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "check": "biome check .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/loggers": "^0.1.0",
+    "@mastra/memory": "^0.15.12",
+    "@mastra/libsql": "0.16.4",
+    "@opentelemetry/api": "^1.8.0",
+    "zod": "^3.23.0",
+    "@quackgraph/graph": "workspace:*",
+    "@quackgraph/native": "workspace:*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "typescript": "^5.0.0",
+    "tsup": "^8.0.0"
+  }
+}
+````
+
+## File: repomix.config.json
+````json
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "input": {
+    "maxFileSize": 52428800
+  },
+  "output": {
+    "filePath": "dev-docs/repomix.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": false,
+    "directoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": true,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false
+    }
+  },
+  "include": [
+//"README.md",
+//"test-docs/"
+//"test/",
+//"test-docs/unit.test-plan.
+
+],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+            "packages/quackgraph",
+      "dev-docs/flow.todo.md",
+      "packages/quackgraph/.git",
+      "packages/quackgraph/repomix.config.json",
+      "packages/quackgraph/relay.config.json",
+      "packages/quackgraph/.relay",
+      "packages/quackgraph/dev-docs",
+      "packages/quackgraph/LICENSE",
+      "packages/quackgraph/.gitignore",
+      "packages/quackgraph/tsconfig.tsbuildinfo",
+"packages/quackgraph/packages/quack-graph/dist",
+      "packages/quackgraph/test/",
+      "packages/quackgraph/test-docs/",
+      "packages/quackgraph/test/e2e/",
+      "packages/quackgraph/src",
+            "packages/quackgraph/RFC.README.md",
+            "packages/quackgraph/README.md"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
   }
 }
 ````
@@ -2004,7 +2171,7 @@ export class GraphTools {
     const maxDepth = Math.min(depth, 4);
     const treeLines: string[] = [`[ROOT] ${rootId}`];
     let isTruncated = false;
-    const asOf = this.resolveAsOf(contextOrAsOf);
+    const _asOf = this.resolveAsOf(contextOrAsOf);
 
     // Helper for recursion
     const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
@@ -2167,113 +2334,6 @@ export class GraphTools {
         console.warn('Pheromones not implemented in V1 native graph');
       }
     }
-  }
-}
-````
-
-## File: packages/agent/package.json
-````json
-{
-  "name": "@quackgraph/agent",
-  "version": "0.1.0",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
-  "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "clean": "rm -rf dist",
-    "format": "biome format --write .",
-    "lint": "biome lint .",
-    "check": "biome check .",
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@mastra/core": "^0.24.6",
-    "@mastra/loggers": "^0.1.0",
-    "@mastra/memory": "^0.15.12",
-    "@mastra/libsql": "0.16.4",
-    "@opentelemetry/api": "^1.8.0",
-    "zod": "^3.23.0",
-    "@quackgraph/graph": "workspace:*",
-    "@quackgraph/native": "workspace:*"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "typescript": "^5.0.0",
-    "tsup": "^8.0.0"
-  }
-}
-````
-
-## File: repomix.config.json
-````json
-{
-  "$schema": "https://repomix.com/schemas/latest/schema.json",
-  "input": {
-    "maxFileSize": 52428800
-  },
-  "output": {
-    "filePath": "dev-docs/repomix.md",
-    "style": "markdown",
-    "parsableStyle": true,
-    "fileSummary": false,
-    "directoryStructure": true,
-    "files": true,
-    "removeComments": false,
-    "removeEmptyLines": false,
-    "compress": false,
-    "topFilesLength": 5,
-    "showLineNumbers": false,
-    "copyToClipboard": true,
-    "git": {
-      "sortByChanges": true,
-      "sortByChangesMaxCommits": 100,
-      "includeDiffs": false
-    }
-  },
-  "include": [
-//"README.md",
-//"test-docs/"
-//"test/",
-//"test-docs/unit.test-plan.
-
-],
-  "ignore": {
-    "useGitignore": true,
-    "useDefaultPatterns": true,
-    "customPatterns": [
-            "packages/quackgraph",
-      "dev-docs/flow.todo.md",
-      "packages/quackgraph/.git",
-      "packages/quackgraph/repomix.config.json",
-      "packages/quackgraph/relay.config.json",
-      "packages/quackgraph/.relay",
-      "packages/quackgraph/dev-docs",
-      "packages/quackgraph/LICENSE",
-      "packages/quackgraph/.gitignore",
-      "packages/quackgraph/tsconfig.tsbuildinfo",
-"packages/quackgraph/packages/quack-graph/dist",
-      "packages/quackgraph/test/",
-      "packages/quackgraph/test-docs/",
-      "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src",
-            "packages/quackgraph/RFC.README.md",
-            "packages/quackgraph/README.md"
-    ]
-  },
-  "security": {
-    "enableSecurityCheck": true
-  },
-  "tokenCount": {
-    "encoding": "o200k_base"
   }
 }
 ````
@@ -2479,18 +2539,25 @@ import type {
 } from './types';
 import { trace, type Span } from '@opentelemetry/api';
 
+// Core Dependencies
 import { setGraphInstance } from './lib/graph-instance';
 import { mastra } from './mastra';
-
-// Tools / Helpers
 import { Chronos } from './agent/chronos';
 import { GraphTools } from './tools/graph-tools';
 import { SchemaRegistry } from './governance/schema-registry';
 
+/**
+ * The QuackGraph Agent Facade.
+ * 
+ * In the new "Native Mastra" architecture, this class acts as a thin client
+ * that orchestrates the `labyrinth-workflow` and injects the RuntimeContext
+ * (Time Travel & Governance) into the Mastra execution environment.
+ */
 export class Labyrinth {
   public chronos: Chronos;
   public tools: GraphTools;
   public registry: SchemaRegistry;
+  
   private logger = mastra.getLogger();
   private tracer = trace.getTracer('quackgraph-agent');
 
@@ -2503,33 +2570,45 @@ export class Labyrinth {
     },
     private config: AgentConfig
   ) {
+    // Initialize Singleton for legacy tools support
     setGraphInstance(graph);
+    
+    // Utilities
     this.tools = new GraphTools(graph);
     this.chronos = new Chronos(graph, this.tools);
     this.registry = new SchemaRegistry();
   }
 
+  /**
+   * Registers a semantic domain (LOD 0 governance).
+   */
   registerDomain(config: DomainConfig) {
     this.registry.register(config);
   }
 
+  /**
+   * Main Entry Point: Finds a path through the Labyrinth.
+   * 
+   * @param start - Starting Node ID or natural language query
+   * @param goal - The question to answer
+   * @param timeContext - "Time Travel" parameters (asOf, window)
+   */
   async findPath(
     start: string | { query: string },
     goal: string,
     timeContext?: TimeContext
   ): Promise<LabyrinthArtifact | null> {
-    return this.tracer.startActiveSpan('labyrinth.facade', async (span: Span) => {
+    return this.tracer.startActiveSpan('labyrinth.findPath', async (span: Span) => {
         try {
             const workflow = mastra.getWorkflow('labyrinthWorkflow');
-            if (!workflow) throw new Error("Labyrinth Workflow not registered");
+            if (!workflow) throw new Error("Labyrinth Workflow not registered in Mastra.");
 
-            const run = await workflow.createRunAsync();
-            
-            // Map input
+            // 1. Prepare Input Data
             const inputData = {
                 goal,
                 start,
-                domain: undefined, // Let workflow route it
+                // Domain is left undefined here; the 'route-domain' step will decide it
+                // unless we wanted to force it via config.
                 maxHops: this.config.maxHops,
                 maxCursors: this.config.maxCursors,
                 confidenceThreshold: this.config.confidenceThreshold,
@@ -2540,15 +2619,30 @@ export class Labyrinth {
                 } : undefined
             };
 
-            // Pass runtime context trigger data if needed, mostly handled via inputData for now
-            // but we ensure the run is started cleanly.
+            // 2. Execute Workflow
+            const run = await workflow.createRunAsync();
+            
+            // Note: We pass strict inputs. The workflow steps handle State initialization.
+            // RuntimeContext for 'asOf' is passed via the inputData.timeContext mostly,
+            // but we can also inject it if the run start supported context overrides directly.
+            // For now, the workflow steps extract timeContext from inputData and pass it 
+            // to agents via runtimeContext.
             const result = await run.start({ inputData });
             
+            // 3. Extract Result
             // @ts-expect-error - Result payload typing
-            return result.results?.artifact || null;
+            const artifact = result.results?.artifact as LabyrinthArtifact | null;
             
+            if (artifact) {
+              span.setAttribute('labyrinth.confidence', artifact.confidence);
+              span.setAttribute('labyrinth.traceId', artifact.traceId);
+            }
+
+            return artifact;
+
         } catch (e) {
-            this.logger.error("Labyrinth workflow failed", { error: e });
+            this.logger.error("Labyrinth traversal failed", { error: e });
+            span.recordException(e as Error);
             throw e;
         } finally {
             span.end();
@@ -2556,6 +2650,10 @@ export class Labyrinth {
     });
   }
 
+  /**
+   * Direct access to Chronos for temporal analytics.
+   * Useful for "Life Coach" dashboards that need raw stats without full agent traversal.
+   */
   async analyzeCorrelation(
     anchorNodeId: string,
     targetLabel: string,

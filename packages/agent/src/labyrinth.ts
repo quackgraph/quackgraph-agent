@@ -70,7 +70,7 @@ export class Labyrinth {
   ): Promise<LabyrinthArtifact | null> {
     return this.tracer.startActiveSpan('labyrinth.findPath', async (span: Span) => {
         try {
-            const workflow = mastra.getWorkflow('labyrinth-workflow');
+            const workflow = mastra.getWorkflow('labyrinthWorkflow');
             if (!workflow) throw new Error("Labyrinth Workflow not registered in Mastra.");
 
             // 1. Prepare Input Data

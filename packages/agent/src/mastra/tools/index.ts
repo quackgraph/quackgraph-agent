@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
 import { getSchemaRegistry } from '../../governance/schema-registry';
-import type { LabyrinthContext } from '../../types';
 
 // We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
 

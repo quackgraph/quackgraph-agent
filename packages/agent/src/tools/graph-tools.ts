@@ -44,7 +44,7 @@ export class GraphTools {
     const maxDepth = Math.min(depth, 4);
     const treeLines: string[] = [`[ROOT] ${rootId}`];
     let isTruncated = false;
-    const asOf = this.resolveAsOf(contextOrAsOf);
+    const _asOf = this.resolveAsOf(contextOrAsOf);
 
     // Helper for recursion
     const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {

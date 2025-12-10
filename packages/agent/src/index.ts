@@ -1,6 +1,5 @@
 // Core Facade
 export { Labyrinth } from './labyrinth';
-export { createAgent } from './index'; // Self-reference for factory below
 
 // Types & Schemas
 export * from './types';
