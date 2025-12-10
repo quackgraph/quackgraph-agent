@@ -46,12 +46,127 @@ tsconfig.json
 
 # Files
 
+## File: dev-docs/MONOREPO.md
+````markdown
+# Monorepo Structure - Federated Repositories
+
+This monorepo uses a **federated repository structure** where:
+
+- **`quackgraph-agent`** (this repo) owns the high-level Agent logic
+- **`packages/quackgraph`** is a nested Git repository containing the Core engine
+
+## Repository Structure
+
+```
+quackgraph-agent/               # GitHub: quackgraph/quackgraph-agent
+├── packages/
+│   ├── agent/                  # Agent logic (owned by parent repo)
+│   │   └── src/
+│   └── quackgraph/             # GitHub: quackgraph/quackgraph
+│       └── packages/
+│           ├── native/         # Rust N-API bindings
+│           └── quack-graph/    # Core graph TypeScript library
+├── scripts/
+│   └── git-sync.ts             # Federated push automation
+├── package.json                # Root workspace config
+└── tsconfig.json
+```
+
+## Workspace Configuration
+
+The root `package.json` defines a Bun workspace that spans both repos:
+
+```json
+{
+  "workspaces": [
+    "packages/agent",
+    "packages/quackgraph/packages/*"
+  ]
+}
+```
+
+This allows seamless dependency resolution:
+- `@quackgraph/agent` → `packages/agent`
+- `@quackgraph/graph` → `packages/quackgraph/packages/quack-graph`
+- `@quackgraph/native` → `packages/quackgraph/packages/native`
+
+## Git Workflow
+
+### Synchronized Push
+
+To push changes to both repositories atomically:
+
+```bash
+bun run push:all "your commit message"
+```
+
+This runs `scripts/git-sync.ts` which:
+1. Checks if `packages/quackgraph` has uncommitted changes
+2. Commits and pushes the inner repo first
+3. Commits and pushes the parent repo
+
+### Manual Push (Fine-Grained Control)
+
+```bash
+# Push inner repo only
+cd packages/quackgraph
+git add -A && git commit -m "message" && git push
+
+# Push outer repo only (after inner)
+cd ../..
+git add -A && git commit -m "message" && git push
+```
+
+## Development Commands
+
+| Command | Description |
+|---------|-------------|
+| `bun install` | Install all dependencies across workspaces |
+| `bun run build` | Build core + agent packages |
+| `bun run build:core` | Build only the quackgraph core |
+| `bun run build:agent` | Build only the agent package |
+| `bun run test` | Run tests |
+| `bun run push:all` | Synchronized git push to both repos |
+| `bun run clean` | Clean all build artifacts |
+
+## Dependency Flow
+
+```
+@quackgraph/agent
+    ├── depends on → @quackgraph/graph
+    └── depends on → @quackgraph/native
+
+@quackgraph/graph
+    └── depends on → @quackgraph/native
+```
+
+The Agent extends and orchestrates the Core, not the other way around.
+````
+
+## File: packages/agent/src/lib/graph-instance.ts
+````typescript
+import type { QuackGraph } from '@quackgraph/graph';
+
+let graphInstance: QuackGraph | null = null;
+
+export function setGraphInstance(graph: QuackGraph) {
+  graphInstance = graph;
+}
+
+export function getGraphInstance(): QuackGraph {
+  if (!graphInstance) {
+    throw new Error('Graph instance not initialized. Call setGraphInstance() first.');
+  }
+  return graphInstance;
+}
+````
+
 ## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
 ````typescript
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
-import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace, SectorSummary } from '../../types';
+import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
 import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
@@ -249,7 +364,7 @@ const speculativeTraversal = createStep({
                     thread: cursor.id,
                     resource: inputData.governance?.query || 'global-query'
                 },
-                // @ts-ignore - Injecting runtime context for tools (Mastra experimental/custom support)
+                // @ts-expect-error - Injecting runtime context for tools (Mastra experimental/custom support)
                 runtimeContext: { asOf: asOfTs, domain }
             });
             // @ts-expect-error usage
@@ -295,8 +410,10 @@ const speculativeTraversal = createStep({
             } else if (decision.action === 'MOVE' && (decision.edgeType || decision.path)) {
                 // Simplified move logic
                 if (decision.path) {
-                     const target = decision.path[decision.path.length-1];
-                     nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
+                     const target = decision.path.length > 0 ? decision.path[decision.path.length-1] : undefined;
+                     if (target) {
+                        nextCursors.push({ ...cursor, id: randomUUID(), currentNodeId: target, path: [...cursor.path, ...decision.path], stepCount: cursor.stepCount + decision.path.length, confidence: cursor.confidence * decision.confidence });
+                     }
                 } else if (decision.edgeType) {
                      const neighbors = await tools.topologyScan([cursor.currentNodeId], decision.edgeType, asOfTs);
                      for (const t of neighbors.slice(0, 2)) {
@@ -304,19 +421,24 @@ const speculativeTraversal = createStep({
                      }
                 }
             }
-        } catch(e) { return; }
+        } catch(_e) { return; }
       });
 
       await Promise.all(promises);
       if (winner) break;
 
       nextCursors.sort((a,b) => b.confidence - a.confidence);
-      for(let i=config.maxCursors; i<nextCursors.length; i++) deadThreads.push({ thread_id: nextCursors[i]!.id, status: 'KILLED', steps: nextCursors[i]!.stepHistory });
+      for(let i=config.maxCursors; i<nextCursors.length; i++) {
+        const c = nextCursors[i];
+        if (c) deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
+      }
       cursors = nextCursors.slice(0, config.maxCursors);
     }
     
     if(!winner) {
-        cursors.forEach(c => deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory }));
+        cursors.forEach(c => {
+            deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
+        });
     }
 
     return { winner, deadThreads, tokensUsed, governance: inputData.governance };
@@ -338,8 +460,10 @@ const finalizeArtifact = createStep({
   execute: async ({ inputData }) => {
     if (!inputData.winner || !inputData.winner.metadata) return { artifact: null };
     const w = inputData.winner;
-    w.metadata!.tokens_used = inputData.tokensUsed;
-    w.metadata!.execution.push(...inputData.deadThreads.slice(-5));
+    if (w.metadata) {
+        w.metadata.tokens_used = inputData.tokensUsed;
+        w.metadata.execution.push(...inputData.deadThreads.slice(-5));
+    }
     return { artifact: w };
   }
 });
@@ -355,121 +479,6 @@ export const labyrinthWorkflow = createWorkflow({
   .then(speculativeTraversal)
   .then(finalizeArtifact)
   .commit();
-````
-
-## File: dev-docs/MONOREPO.md
-````markdown
-# Monorepo Structure - Federated Repositories
-
-This monorepo uses a **federated repository structure** where:
-
-- **`quackgraph-agent`** (this repo) owns the high-level Agent logic
-- **`packages/quackgraph`** is a nested Git repository containing the Core engine
-
-## Repository Structure
-
-```
-quackgraph-agent/               # GitHub: quackgraph/quackgraph-agent
-├── packages/
-│   ├── agent/                  # Agent logic (owned by parent repo)
-│   │   └── src/
-│   └── quackgraph/             # GitHub: quackgraph/quackgraph
-│       └── packages/
-│           ├── native/         # Rust N-API bindings
-│           └── quack-graph/    # Core graph TypeScript library
-├── scripts/
-│   └── git-sync.ts             # Federated push automation
-├── package.json                # Root workspace config
-└── tsconfig.json
-```
-
-## Workspace Configuration
-
-The root `package.json` defines a Bun workspace that spans both repos:
-
-```json
-{
-  "workspaces": [
-    "packages/agent",
-    "packages/quackgraph/packages/*"
-  ]
-}
-```
-
-This allows seamless dependency resolution:
-- `@quackgraph/agent` → `packages/agent`
-- `@quackgraph/graph` → `packages/quackgraph/packages/quack-graph`
-- `@quackgraph/native` → `packages/quackgraph/packages/native`
-
-## Git Workflow
-
-### Synchronized Push
-
-To push changes to both repositories atomically:
-
-```bash
-bun run push:all "your commit message"
-```
-
-This runs `scripts/git-sync.ts` which:
-1. Checks if `packages/quackgraph` has uncommitted changes
-2. Commits and pushes the inner repo first
-3. Commits and pushes the parent repo
-
-### Manual Push (Fine-Grained Control)
-
-```bash
-# Push inner repo only
-cd packages/quackgraph
-git add -A && git commit -m "message" && git push
-
-# Push outer repo only (after inner)
-cd ../..
-git add -A && git commit -m "message" && git push
-```
-
-## Development Commands
-
-| Command | Description |
-|---------|-------------|
-| `bun install` | Install all dependencies across workspaces |
-| `bun run build` | Build core + agent packages |
-| `bun run build:core` | Build only the quackgraph core |
-| `bun run build:agent` | Build only the agent package |
-| `bun run test` | Run tests |
-| `bun run push:all` | Synchronized git push to both repos |
-| `bun run clean` | Clean all build artifacts |
-
-## Dependency Flow
-
-```
-@quackgraph/agent
-    ├── depends on → @quackgraph/graph
-    └── depends on → @quackgraph/native
-
-@quackgraph/graph
-    └── depends on → @quackgraph/native
-```
-
-The Agent extends and orchestrates the Core, not the other way around.
-````
-
-## File: packages/agent/src/lib/graph-instance.ts
-````typescript
-import type { QuackGraph } from '@quackgraph/graph';
-
-let graphInstance: QuackGraph | null = null;
-
-export function setGraphInstance(graph: QuackGraph) {
-  graphInstance = graph;
-}
-
-export function getGraphInstance(): QuackGraph {
-  if (!graphInstance) {
-    throw new Error('Graph instance not initialized. Call setGraphInstance() first.');
-  }
-  return graphInstance;
-}
 ````
 
 ## File: packages/agent/tsconfig.json
@@ -1074,189 +1083,6 @@ Thumbs.db
 npm-debug.log*
 ````
 
-## File: packages/agent/src/mastra/agents/judge-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-
-export const judgeAgent = new Agent({
-  name: 'Judge Agent',
-  instructions: `
-    You are a Judge evaluating data from a Knowledge Graph.
-    
-    Input provided:
-    - Goal: The user's question.
-    - Data: Content of the nodes found.
-    - Time Context: Relevant timeframe.
-    
-    Task: Determine if the data answers the goal.
-  `,
-  model: {
-    id: 'groq/llama-3.3-70b-versatile',
-  },
-  memory: new Memory(),
-});
-````
-
-## File: packages/agent/src/mastra/agents/router-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-
-export const routerAgent = new Agent({
-  name: 'Router Agent',
-  instructions: `
-    You are a Semantic Router for a Knowledge Graph.
-    
-    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
-    
-    Input provided:
-    - Goal: User query.
-    - Available Domains: List of domains and descriptions.
-  `,
-  model: {
-    id: 'groq/llama-3.3-70b-versatile',
-  },
-  memory: new Memory(),
-});
-````
-
-## File: packages/agent/src/mastra/tools/index.ts
-````typescript
-import { createTool } from '@mastra/core/tools';
-import { z } from 'zod';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
-import { getSchemaRegistry } from '../../governance/schema-registry';
-
-// We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
-
-export const sectorScanTool = createTool({
-  id: 'sector-scan',
-  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    asOf: z.number().optional(),
-    allowedEdgeTypes: z.array(z.string()).optional(),
-  }),
-  outputSchema: z.object({
-    summary: z.array(z.object({
-      edgeType: z.string(),
-      count: z.number(),
-      avgHeat: z.number().optional(),
-    })),
-  }),
-  execute: async ({ context, runtimeContext }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-
-    // 1. Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
-    const effectiveAsOf = context.asOf ?? ctxAsOf;
-
-    // 2. Resolve Governance
-    const registry = getSchemaRegistry();
-    const allowedFromDomain = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
-    const effectiveAllowed = context.allowedEdgeTypes ?? allowedFromDomain;
-
-    const summary = await tools.getSectorSummary(context.nodeIds, effectiveAsOf, effectiveAllowed);
-    return { summary };
-  },
-});
-
-export const topologyScanTool = createTool({
-  id: 'topology-scan',
-  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    edgeType: z.string().optional(),
-    asOf: z.number().optional(),
-    minValidFrom: z.number().optional(),
-    depth: z.number().min(1).max(4).optional(),
-  }),
-  outputSchema: z.object({
-    neighborIds: z.array(z.string()).optional(),
-    map: z.string().optional(),
-    truncated: z.boolean().optional(),
-  }),
-  execute: async ({ context, runtimeContext }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    
-    // Resolve Context
-    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const effectiveAsOf = context.asOf ?? ctxAsOf;
-
-    if (context.depth && context.depth > 1) {
-      // Ghost Map Mode (LOD 1.5)
-      const maps = [];
-      let truncated = false;
-      for (const id of context.nodeIds) {
-        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
-        const res = await tools.getNavigationalMap(id, context.depth, effectiveAsOf);
-        maps.push(res.map);
-        if (res.truncated) truncated = true;
-      }
-      return { map: maps.join('\n\n'), truncated };
-    }
-
-    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
-    if (!context.edgeType) {
-        const maps = [];
-        for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1, effectiveAsOf);
-            maps.push(res.map);
-        }
-        return { map: maps.join('\n\n') };
-    }
-
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, effectiveAsOf, context.minValidFrom);
-    return { neighborIds };
-  },
-});
-
-export const temporalScanTool = createTool({
-  id: 'temporal-scan',
-  description: 'Find neighbors connected via edges overlapping a specific time window',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-    windowStart: z.string().describe('ISO Date String'),
-    windowEnd: z.string().describe('ISO Date String'),
-    edgeType: z.string().optional(),
-    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
-  }),
-  outputSchema: z.object({
-    neighborIds: z.array(z.string()),
-  }),
-  execute: async ({ context }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    const s = new Date(context.windowStart).getTime();
-    const e = new Date(context.windowEnd).getTime();
-    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
-    return { neighborIds };
-  },
-});
-
-export const contentRetrievalTool = createTool({
-  id: 'content-retrieval',
-  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',
-  inputSchema: z.object({
-    nodeIds: z.array(z.string()),
-  }),
-  outputSchema: z.object({
-    content: z.array(z.record(z.any())),
-  }),
-  execute: async ({ context }) => {
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    const content = await tools.contentRetrieval(context.nodeIds);
-    return { content };
-  },
-});
-````
-
 ## File: README.md
 ````markdown
 # QuackGraph-Agent Labyrinth Report
@@ -1518,6 +1344,221 @@ graph LR
     5.  **Why it wins:** The LLM didn't have to look at 1,000 meal logs and calculate time deltas. Rust did the math; LLM did the storytelling.
 ````
 
+## File: packages/agent/src/mastra/agents/judge-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+
+export const judgeAgent = new Agent({
+  name: 'Judge Agent',
+  instructions: `
+    You are a Judge evaluating data from a Knowledge Graph.
+    
+    Input provided:
+    - Goal: The user's question.
+    - Data: Content of the nodes found.
+    - Time Context: Relevant timeframe.
+    
+    Task: Determine if the data answers the goal.
+  `,
+  model: {
+    id: 'groq/llama-3.3-70b-versatile',
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+});
+````
+
+## File: packages/agent/src/mastra/agents/router-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+
+export const routerAgent = new Agent({
+  name: 'Router Agent',
+  instructions: `
+    You are a Semantic Router for a Knowledge Graph.
+    
+    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
+    
+    Input provided:
+    - Goal: User query.
+    - Available Domains: List of domains and descriptions.
+  `,
+  model: {
+    id: 'groq/llama-3.3-70b-versatile',
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+});
+````
+
+## File: packages/agent/src/mastra/tools/index.ts
+````typescript
+import { createTool } from '@mastra/core/tools';
+import { z } from 'zod';
+import { getGraphInstance } from '../../lib/graph-instance';
+import { GraphTools } from '../../tools/graph-tools';
+import { getSchemaRegistry } from '../../governance/schema-registry';
+import type { LabyrinthContext } from '../../types';
+
+// We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
+
+export const sectorScanTool = createTool({
+  id: 'sector-scan',
+  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Context aware: filters by active domain.',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    asOf: z.number().optional(),
+    allowedEdgeTypes: z.array(z.string()).optional(),
+  }),
+  outputSchema: z.object({
+    summary: z.array(z.object({
+      edgeType: z.string(),
+      count: z.number(),
+      avgHeat: z.number().optional(),
+    })),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+
+    // 1. Resolve Context
+    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    
+    // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
+    const asOf = context.asOf ?? ctxAsOf;
+
+    // 2. Resolve Governance
+    const registry = getSchemaRegistry();
+    const domainEdges = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
+    const effectiveAllowed = context.allowedEdgeTypes ?? domainEdges;
+
+    const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
+    return { summary };
+  },
+});
+
+export const topologyScanTool = createTool({
+  id: 'topology-scan',
+  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1)',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    edgeType: z.string().optional(),
+    asOf: z.number().optional(),
+    minValidFrom: z.number().optional(),
+    depth: z.number().min(1).max(4).optional(),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()).optional(),
+    map: z.string().optional(),
+    truncated: z.boolean().optional(),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    
+    // Resolve Context
+    const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    const asOf = context.asOf ?? ctxAsOf;
+    
+    // Enforce Domain Governance if implicit
+    if (ctxDomain && context.edgeType) {
+      const registry = getSchemaRegistry();
+      if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+        return { neighborIds: [] }; // Silently block restricted edges
+      }
+    }
+
+    if (context.depth && context.depth > 1) {
+      // Ghost Map Mode (LOD 1.5)
+      const maps = [];
+      let truncated = false;
+      for (const id of context.nodeIds) {
+        // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
+        const res = await tools.getNavigationalMap(id, context.depth, asOf);
+        maps.push(res.map);
+        if (res.truncated) truncated = true;
+      }
+      return { map: maps.join('\n\n'), truncated };
+    }
+
+    // Implicit map mode if no edgeType is provided, defaulting to depth 1 map
+    if (!context.edgeType) {
+        const maps = [];
+        for (const id of context.nodeIds) {
+            const res = await tools.getNavigationalMap(id, 1, asOf);
+            maps.push(res.map);
+        }
+        return { map: maps.join('\n\n') };
+    }
+
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf, context.minValidFrom);
+    return { neighborIds };
+  },
+});
+
+export const temporalScanTool = createTool({
+  id: 'temporal-scan',
+  description: 'Find neighbors connected via edges overlapping a specific time window',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    windowStart: z.string().describe('ISO Date String'),
+    windowEnd: z.string().describe('ISO Date String'),
+    edgeType: z.string().optional(),
+    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    
+    // Enforce Governance
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    if (ctxDomain && context.edgeType) {
+       const registry = getSchemaRegistry();
+       if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+         return { neighborIds: [] };
+       }
+    }
+    
+    const s = new Date(context.windowStart).getTime();
+    const e = new Date(context.windowEnd).getTime();
+    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
+    return { neighborIds };
+  },
+});
+
+export const contentRetrievalTool = createTool({
+  id: 'content-retrieval',
+  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2)',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+  }),
+  outputSchema: z.object({
+    content: z.array(z.record(z.any())),
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const content = await tools.contentRetrieval(context.nodeIds);
+    return { content };
+  },
+});
+````
+
 ## File: packages/agent/src/governance/schema-registry.ts
 ````typescript
 import type { DomainConfig } from '../types';
@@ -1591,80 +1632,6 @@ export class SchemaRegistry {
 
 export const schemaRegistry = new SchemaRegistry();
 export const getSchemaRegistry = () => schemaRegistry;
-````
-
-## File: packages/agent/src/mastra/index.ts
-````typescript
-import { Mastra } from '@mastra/core/mastra';
-import { LibSQLStore } from '@mastra/libsql';
-// import { PinoLogger } from '@mastra/loggers';
-import { scoutAgent } from './agents/scout-agent';
-import { judgeAgent } from './agents/judge-agent';
-import { routerAgent } from './agents/router-agent';
-import { metabolismWorkflow } from './workflows/metabolism-workflow';
-import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
-
-export const mastra = new Mastra({
-  agents: { scoutAgent, judgeAgent, routerAgent },
-  workflows: { metabolismWorkflow, labyrinthWorkflow },
-  storage: new LibSQLStore({
-    url: ':memory:',
-  }),
-  observability: {
-    default: {
-      enabled: true,
-
-      // exporters: [new DefaultExporter()],
-    },
-  },
-});
-````
-
-## File: packages/agent/src/mastra/agents/scout-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
-
-export const scoutAgent = new Agent({
-  name: 'Scout Agent',
-  instructions: `
-    You are a Graph Scout navigating a topology.
-    
-    Your goal is to decide the next move based on the provided context.
-    
-    Context provided in user message:
-    - Goal: The user's query.
-    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
-    - Current Node: ID and Labels.
-    - Path History: Nodes visited so far.
-    - Satellite View: A summary of outgoing edges (LOD 0).
-    - Time Context: Relevant timestamps.
-
-    Decide your next move:
-    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
-      - Use Depth 1 to check immediate neighbors.
-      - Use Depth 2-3 to explore structure without moving.
-      - The map shows "🔥" for hot paths (high pheromones).
-
-    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
-    - **Exploration:** 
-      - Single Hop: Action "MOVE" with \`edgeType\`.
-      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with \`path: [id1, id2]\`.
-    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
-    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
-    - **Abort:** If stuck or exhausted, action: "ABORT".
-  `,
-  model: {
-    id: 'groq/llama-3.3-70b-versatile',
-  },
-  memory: new Memory(),
-  tools: {
-    sectorScanTool,
-    topologyScanTool,
-    temporalScanTool
-  }
-});
 ````
 
 ## File: packages/agent/src/mastra/workflows/metabolism-workflow.ts
@@ -1826,21 +1793,192 @@ workflow.commit();
 export { workflow as metabolismWorkflow };
 ````
 
+## File: packages/agent/src/mastra/index.ts
+````typescript
+import { Mastra } from '@mastra/core/mastra';
+import { LibSQLStore } from '@mastra/libsql';
+// import { PinoLogger } from '@mastra/loggers';
+import { scoutAgent } from './agents/scout-agent';
+import { judgeAgent } from './agents/judge-agent';
+import { routerAgent } from './agents/router-agent';
+import { metabolismWorkflow } from './workflows/metabolism-workflow';
+import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
+
+export const mastra = new Mastra({
+  agents: { scoutAgent, judgeAgent, routerAgent },
+  workflows: { metabolismWorkflow, labyrinthWorkflow },
+  storage: new LibSQLStore({
+    url: ':memory:',
+  }),
+  observability: {
+    default: {
+      enabled: true,
+
+      // exporters: [new DefaultExporter()],
+    },
+  },
+});
+````
+
+## File: packages/agent/src/index.ts
+````typescript
+export * from './labyrinth';
+export * from './types';
+export * from './agent/chronos';
+export * from './governance/schema-registry';
+export * from './tools/graph-tools';
+// Expose Mastra definitions if needed, but facade prefers hiding them
+export { mastra } from './mastra';
+
+import type { QuackGraph } from '@quackgraph/graph';
+import { Labyrinth } from './labyrinth';
+import type { AgentConfig } from './types';
+import { mastra } from './mastra';
+
+/**
+ * Factory to create a fully wired Labyrinth Agent.
+ * Uses default Mastra agents (Scout, Judge, Router) unless overridden.
+ */
+export function createAgent(graph: QuackGraph, config: AgentConfig) {
+  const scout = mastra.getAgent('scoutAgent');
+  const judge = mastra.getAgent('judgeAgent');
+  const router = mastra.getAgent('routerAgent');
+
+  if (!scout || !judge || !router) {
+    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
+  }
+
+  return new Labyrinth(
+    graph,
+    { scout, judge, router },
+    config
+  );
+}
+
+
+
+/**
+ * Runs the Metabolism (Dreaming) cycle to prune and summarize old nodes.
+ */
+export async function runMetabolism(targetLabel: string, minAgeDays: number = 30) {
+  const workflow = mastra.getWorkflow('metabolismWorkflow');
+  if (!workflow) throw new Error("Metabolism workflow not found.");
+  const run = await workflow.createRunAsync();
+  return run.start({ inputData: { targetLabel, minAgeDays } });
+}
+````
+
+## File: package.json
+````json
+{
+  "name": "quackgraph-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/agent",
+    "packages/quackgraph/packages/*"
+  ],
+  "scripts": {
+    "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
+    "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
+    "postinstall": "bun run build",
+    "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
+    "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
+    "check": "bun run typecheck && bun run lint",
+    "dev": "bun test --watch",
+    "test": "bun run build && bun test",
+    "build": "bun run build:core && bun run build:agent",
+    "build:core": "bun run --cwd packages/quackgraph build",
+    "build:agent": "bun run --cwd packages/agent build",
+    "build:watch": "bun run --cwd packages/agent build --watch",
+    "push:all": "bun run scripts/git-sync.ts",
+    "pull:all": "bun run scripts/git-pull.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
+  }
+}
+````
+
+## File: packages/agent/src/mastra/agents/scout-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { sectorScanTool, topologyScanTool, temporalScanTool } from '../tools';
+
+export const scoutAgent = new Agent({
+  name: 'Scout Agent',
+  instructions: `
+    You are a Graph Scout navigating a topology.
+    
+    Your goal is to decide the next move based on the provided context.
+    
+    Context provided in user message:
+    - Goal: The user's query.
+    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
+    - Current Node: ID and Labels.
+    - Path History: Nodes visited so far.
+    - Satellite View: A summary of outgoing edges (LOD 0).
+    - Time Context: Relevant timestamps.
+
+    Decide your next move:
+    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
+      - Use Depth 1 to check immediate neighbors.
+      - Use Depth 2-3 to explore structure without moving.
+      - The map shows "🔥" for hot paths (high pheromones).
+
+    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
+    - **Exploration:** 
+      - Single Hop: Action "MOVE" with \`edgeType\`.
+      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with \`path: [id1, id2]\`.
+    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
+    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
+    - **Abort:** If stuck or exhausted, action: "ABORT".
+  `,
+  model: {
+    id: 'groq/llama-3.3-70b-versatile',
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+  tools: {
+    sectorScanTool,
+    topologyScanTool,
+    temporalScanTool
+  }
+});
+````
+
 ## File: packages/agent/src/tools/graph-tools.ts
 ````typescript
 import type { QuackGraph } from '@quackgraph/graph';
-import type { SectorSummary } from '../types';
+import type { SectorSummary, LabyrinthContext } from '../types';
 import type { JsPatternEdge } from '@quackgraph/native';
 
 export class GraphTools {
   constructor(private graph: QuackGraph) { }
 
+  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
+    if (typeof contextOrAsOf === 'number') return contextOrAsOf;
+    if (!contextOrAsOf?.asOf) return undefined;
+    return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
+  }
+
   /**
    * LOD 0: Sector Scan / Satellite View
    * Returns a summary of available moves from the current nodes.
    */
-  async getSectorSummary(currentNodes: string[], asOf?: number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
     if (currentNodes.length === 0) return [];
+
+    const asOf = this.resolveAsOf(contextOrAsOf);
 
     // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
     const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
@@ -1862,10 +2000,11 @@ export class GraphTools {
    * Generates an ASCII tree of the topology up to a certain depth.
    * Uses geometric pruning to keep the map readable.
    */
-  async getNavigationalMap(rootId: string, depth: number = 1, asOf?: number): Promise<{ map: string, truncated: boolean }> {
+  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
     const maxDepth = Math.min(depth, 4);
     const treeLines: string[] = [`[ROOT] ${rootId}`];
     let isTruncated = false;
+    const asOf = this.resolveAsOf(contextOrAsOf);
 
     // Helper for recursion
     const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
@@ -1876,7 +2015,7 @@ export class GraphTools {
       let branchesCount = 0;
 
       // 1. Get stats to find "hot" edges
-      const stats = await this.getSectorSummary([currentId], asOf);
+      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
       
       for (const stat of stats) {
         if (branchesCount >= branchLimit) {
@@ -1888,7 +2027,7 @@ export class GraphTools {
         const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
         
         // 2. Traverse to get samples (fetch just enough to display)
-        const neighbors = await this.topologyScan([currentId], edgeType, asOf);
+        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
         const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
         const displayNeighbors = neighbors.slice(0, neighborLimit);
         
@@ -1919,9 +2058,10 @@ export class GraphTools {
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType?: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
     // Native traverse does not support minValidFrom yet
+    const asOf = this.resolveAsOf(contextOrAsOf);
     return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
   }
 
@@ -1946,7 +2086,7 @@ export class GraphTools {
    * LOD 1.5: Pattern Matching (Structural Inference)
    * Finds subgraphs matching a specific shape.
    */
-  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], asOf?: number): Promise<string[][]> {
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
     if (startNodes.length === 0) return [];
     const nativePattern = pattern.map(p => ({
       srcVar: p.srcVar || 0,
@@ -1954,6 +2094,7 @@ export class GraphTools {
       edgeType: p.edgeType || '',
       direction: p.direction || 'out'
     }));
+    const asOf = this.resolveAsOf(contextOrAsOf);
     return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
   }
 
@@ -2030,54 +2171,6 @@ export class GraphTools {
 }
 ````
 
-## File: packages/agent/src/index.ts
-````typescript
-export * from './labyrinth';
-export * from './types';
-export * from './agent/chronos';
-export * from './governance/schema-registry';
-export * from './tools/graph-tools';
-// Expose Mastra definitions if needed, but facade prefers hiding them
-export { mastra } from './mastra';
-
-import type { QuackGraph } from '@quackgraph/graph';
-import { Labyrinth } from './labyrinth';
-import type { AgentConfig } from './types';
-import { mastra } from './mastra';
-
-/**
- * Factory to create a fully wired Labyrinth Agent.
- * Uses default Mastra agents (Scout, Judge, Router) unless overridden.
- */
-export function createAgent(graph: QuackGraph, config: AgentConfig) {
-  const scout = mastra.getAgent('scoutAgent');
-  const judge = mastra.getAgent('judgeAgent');
-  const router = mastra.getAgent('routerAgent');
-
-  if (!scout || !judge || !router) {
-    throw new Error('Required Mastra agents not found. Ensure scoutAgent, judgeAgent, and routerAgent are registered.');
-  }
-
-  return new Labyrinth(
-    graph,
-    { scout, judge, router },
-    config
-  );
-}
-
-
-
-/**
- * Runs the Metabolism (Dreaming) cycle to prune and summarize old nodes.
- */
-export async function runMetabolism(targetLabel: string, minAgeDays: number = 30) {
-  const workflow = mastra.getWorkflow('metabolismWorkflow');
-  if (!workflow) throw new Error("Metabolism workflow not found.");
-  const run = await workflow.createRunAsync();
-  return run.start({ inputData: { targetLabel, minAgeDays } });
-}
-````
-
 ## File: packages/agent/package.json
 ````json
 {
@@ -2116,42 +2209,6 @@ export async function runMetabolism(targetLabel: string, minAgeDays: number = 30
     "@biomejs/biome": "latest",
     "typescript": "^5.0.0",
     "tsup": "^8.0.0"
-  }
-}
-````
-
-## File: package.json
-````json
-{
-  "name": "quackgraph-agent",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "workspaces": [
-    "packages/agent",
-    "packages/quackgraph/packages/*"
-  ],
-  "scripts": {
-    "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
-    "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
-    "postinstall": "bun run build",
-    "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
-    "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
-    "check": "bun run typecheck && bun run lint",
-    "dev": "bun test --watch",
-    "test": "bun run build && bun test",
-    "build": "bun run build:core && bun run build:agent",
-    "build:core": "bun run --cwd packages/quackgraph build",
-    "build:agent": "bun run --cwd packages/agent build",
-    "build:watch": "bun run --cwd packages/agent build --watch",
-    "push:all": "bun run scripts/git-sync.ts",
-    "pull:all": "bun run scripts/git-pull.ts"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "@types/bun": "latest",
-    "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
   }
 }
 ````
@@ -2438,8 +2495,8 @@ export class Labyrinth {
   private tracer = trace.getTracer('quackgraph-agent');
 
   constructor(
-    private graph: QuackGraph,
-    private agents: {
+    graph: QuackGraph,
+    _agents: {
       scout: MastraAgent;
       judge: MastraAgent;
       router: MastraAgent;

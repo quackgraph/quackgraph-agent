@@ -1,11 +1,21 @@
-export * from './labyrinth';
+// Core Facade
+export { Labyrinth } from './labyrinth';
+export { createAgent } from './index'; // Self-reference for factory below
+
+// Types & Schemas
 export * from './types';
+export * from './agent-schemas';
+
+// Utilities
 export * from './agent/chronos';
 export * from './governance/schema-registry';
 export * from './tools/graph-tools';
-// Expose Mastra definitions if needed, but facade prefers hiding them
-export { mastra } from './mastra';
 
+// Mastra Internals (Exposed for advanced configuration)
+export { mastra } from './mastra';
+export { labyrinthWorkflow } from './mastra/workflows/labyrinth-workflow';
+
+// Factory
 import type { QuackGraph } from '@quackgraph/graph';
 import { Labyrinth } from './labyrinth';
 import type { AgentConfig } from './types';
@@ -13,7 +23,7 @@ import { mastra } from './mastra';
 
 /**
  * Factory to create a fully wired Labyrinth Agent.
- * Uses default Mastra agents (Scout, Judge, Router) unless overridden.
+ * Checks for required Mastra agents (Scout, Judge, Router) before instantiation.
  */
 export function createAgent(graph: QuackGraph, config: AgentConfig) {
   const scout = mastra.getAgent('scoutAgent');
@@ -29,16 +39,4 @@ export function createAgent(graph: QuackGraph, config: AgentConfig) {
     { scout, judge, router },
     config
   );
-}
-
-
-
-/**
- * Runs the Metabolism (Dreaming) cycle to prune and summarize old nodes.
- */
-export async function runMetabolism(targetLabel: string, minAgeDays: number = 30) {
-  const workflow = mastra.getWorkflow('metabolismWorkflow');
-  if (!workflow) throw new Error("Metabolism workflow not found.");
-  const run = await workflow.createRunAsync();
-  return run.start({ inputData: { targetLabel, minAgeDays } });
 }

@@ -1,16 +1,24 @@
 import type { QuackGraph } from '@quackgraph/graph';
-import type { SectorSummary } from '../types';
+import type { SectorSummary, LabyrinthContext } from '../types';
 import type { JsPatternEdge } from '@quackgraph/native';
 
 export class GraphTools {
   constructor(private graph: QuackGraph) { }
 
+  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
+    if (typeof contextOrAsOf === 'number') return contextOrAsOf;
+    if (!contextOrAsOf?.asOf) return undefined;
+    return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : contextOrAsOf.asOf;
+  }
+
   /**
    * LOD 0: Sector Scan / Satellite View
    * Returns a summary of available moves from the current nodes.
    */
-  async getSectorSummary(currentNodes: string[], asOf?: number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
     if (currentNodes.length === 0) return [];
+
+    const asOf = this.resolveAsOf(contextOrAsOf);
 
     // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
     const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
@@ -32,10 +40,11 @@ export class GraphTools {
    * Generates an ASCII tree of the topology up to a certain depth.
    * Uses geometric pruning to keep the map readable.
    */
-  async getNavigationalMap(rootId: string, depth: number = 1, asOf?: number): Promise<{ map: string, truncated: boolean }> {
+  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
     const maxDepth = Math.min(depth, 4);
     const treeLines: string[] = [`[ROOT] ${rootId}`];
     let isTruncated = false;
+    const asOf = this.resolveAsOf(contextOrAsOf);
 
     // Helper for recursion
     const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
@@ -46,7 +55,7 @@ export class GraphTools {
       let branchesCount = 0;
 
       // 1. Get stats to find "hot" edges
-      const stats = await this.getSectorSummary([currentId], asOf);
+      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
       
       for (const stat of stats) {
         if (branchesCount >= branchLimit) {
@@ -58,7 +67,7 @@ export class GraphTools {
         const heatMarker = (stat.avgHeat || 0) > 50 ? ' 🔥' : '';
         
         // 2. Traverse to get samples (fetch just enough to display)
-        const neighbors = await this.topologyScan([currentId], edgeType, asOf);
+        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
         const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
         const displayNeighbors = neighbors.slice(0, neighborLimit);
         
@@ -89,9 +98,10 @@ export class GraphTools {
    * LOD 1: Topology Scan
    * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async topologyScan(currentNodes: string[], edgeType?: string, asOf?: number, _minValidFrom?: number): Promise<string[]> {
+  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
     if (currentNodes.length === 0) return [];
     // Native traverse does not support minValidFrom yet
+    const asOf = this.resolveAsOf(contextOrAsOf);
     return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
   }
 
@@ -116,7 +126,7 @@ export class GraphTools {
    * LOD 1.5: Pattern Matching (Structural Inference)
    * Finds subgraphs matching a specific shape.
    */
-  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], asOf?: number): Promise<string[][]> {
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
     if (startNodes.length === 0) return [];
     const nativePattern = pattern.map(p => ({
       srcVar: p.srcVar || 0,
@@ -124,6 +134,7 @@ export class GraphTools {
       edgeType: p.edgeType || '',
       direction: p.direction || 'out'
     }));
+    const asOf = this.resolveAsOf(contextOrAsOf);
     return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
   }
 

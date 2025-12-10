@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
 import { GraphTools } from '../../tools/graph-tools';
 import { getSchemaRegistry } from '../../governance/schema-registry';
+import type { LabyrinthContext } from '../../types';
 
 // We wrap the existing GraphTools logic to make it available to Mastra agents/workflows
 
@@ -28,14 +29,16 @@ export const sectorScanTool = createTool({
     // 1. Resolve Context
     const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
     const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
-    const effectiveAsOf = context.asOf ?? ctxAsOf;
+    
+    // Prioritize tool input (if agent explicitly sets it), fallback to runtime context
+    const asOf = context.asOf ?? ctxAsOf;
 
     // 2. Resolve Governance
     const registry = getSchemaRegistry();
-    const allowedFromDomain = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
-    const effectiveAllowed = context.allowedEdgeTypes ?? allowedFromDomain;
+    const domainEdges = ctxDomain ? registry.getValidEdges(ctxDomain) : undefined;
+    const effectiveAllowed = context.allowedEdgeTypes ?? domainEdges;
 
-    const summary = await tools.getSectorSummary(context.nodeIds, effectiveAsOf, effectiveAllowed);
+    const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
     return { summary };
   },
 });
@@ -61,7 +64,16 @@ export const topologyScanTool = createTool({
     
     // Resolve Context
     const ctxAsOf = runtimeContext?.get?.('asOf') as number | undefined;
-    const effectiveAsOf = context.asOf ?? ctxAsOf;
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    const asOf = context.asOf ?? ctxAsOf;
+    
+    // Enforce Domain Governance if implicit
+    if (ctxDomain && context.edgeType) {
+      const registry = getSchemaRegistry();
+      if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+        return { neighborIds: [] }; // Silently block restricted edges
+      }
+    }
 
     if (context.depth && context.depth > 1) {
       // Ghost Map Mode (LOD 1.5)
@@ -69,7 +81,7 @@ export const topologyScanTool = createTool({
       let truncated = false;
       for (const id of context.nodeIds) {
         // Note: NavigationalMap internal logic might need asOf update in future, currently uses standard scan
-        const res = await tools.getNavigationalMap(id, context.depth, effectiveAsOf);
+        const res = await tools.getNavigationalMap(id, context.depth, asOf);
         maps.push(res.map);
         if (res.truncated) truncated = true;
       }
@@ -80,13 +92,13 @@ export const topologyScanTool = createTool({
     if (!context.edgeType) {
         const maps = [];
         for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1, effectiveAsOf);
+            const res = await tools.getNavigationalMap(id, 1, asOf);
             maps.push(res.map);
         }
         return { map: maps.join('\n\n') };
     }
 
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, effectiveAsOf, context.minValidFrom);
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf, context.minValidFrom);
     return { neighborIds };
   },
 });
@@ -104,9 +116,19 @@ export const temporalScanTool = createTool({
   outputSchema: z.object({
     neighborIds: z.array(z.string()),
   }),
-  execute: async ({ context }) => {
+  execute: async ({ context, runtimeContext }) => {
     const graph = getGraphInstance();
     const tools = new GraphTools(graph);
+    
+    // Enforce Governance
+    const ctxDomain = runtimeContext?.get?.('domain') as string | undefined;
+    if (ctxDomain && context.edgeType) {
+       const registry = getSchemaRegistry();
+       if (!registry.isEdgeAllowed(ctxDomain, context.edgeType)) {
+         return { neighborIds: [] };
+       }
+    }
+    
     const s = new Date(context.windowStart).getTime();
     const e = new Date(context.windowEnd).getTime();
     const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
