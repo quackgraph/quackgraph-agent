@@ -33,7 +33,7 @@
     "useGitignore": true,
     "useDefaultPatterns": true,
     "customPatterns": [
-            "packages/quackgraph",
+//            "packages/quackgraph",
       "dev-docs/flow.todo.md",
       "packages/quackgraph/.git",
       "packages/quackgraph/repomix.config.json",
@@ -48,8 +48,8 @@
       "packages/quackgraph/test-docs/",
       "packages/quackgraph/test/e2e/",
       "packages/quackgraph/src",
-            "packages/quackgraph/RFC.README.md",
-            "packages/quackgraph/README.md"
+//            "packages/quackgraph/RFC.README.md",
+//            "packages/quackgraph/README.md"
     ]
   },
   "security": {
