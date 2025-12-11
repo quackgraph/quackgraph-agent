@@ -274,6 +274,13 @@ const speculativeTraversal = createStep({
             return;
           }
 
+          console.log('[DEBUG Scout]', {
+            node: cursor.currentNodeId,
+            action: decision.action,
+            edgeType: decision.edgeType,
+            reasoning: decision.reasoning?.slice(0, 50)
+          });
+
           // Log step
           cursor.stepHistory.push({
             step: cursor.stepCount + 1,
@@ -296,6 +303,14 @@ const speculativeTraversal = createStep({
             });
             // @ts-expect-error usage
             if (jRes.object && jRes.usage) tokensUsed += (jRes.usage.promptTokens || 0) + (jRes.usage.completionTokens || 0);
+
+            console.log('[DEBUG Judge]', {
+              isAnswer: jRes.object?.isAnswer,
+              answer: jRes.object?.answer,
+              confidence: jRes.object?.confidence,
+              threshold: config.confidenceThreshold,
+              passesThreshold: jRes.object?.confidence >= config.confidenceThreshold
+            });
 
             if (jRes.object?.isAnswer && jRes.object.confidence >= config.confidenceThreshold) {
               winner = {
@@ -452,9 +467,12 @@ const reinforcePath = createStep({
     artifact: z.custom<LabyrinthArtifact | null>()
   }),
   stateSchema: LabyrinthStateSchema,
-  outputSchema: z.object({ success: z.boolean() }),
-  execute: async ({ state, tracingContext }) => {
-    if (!state.winner || !state.winner.sources) return { success: false };
+  outputSchema: z.object({ 
+    artifact: z.custom<LabyrinthArtifact | null>(),
+    success: z.boolean() 
+  }),
+  execute: async ({ inputData, state, tracingContext }) => {
+    if (!state.winner || !state.winner.sources) return { artifact: inputData.artifact, success: false };
 
     // Find the cursor that produced the winner
     const winningCursor = state.cursors.find(c => state.winner?.sources.includes(c.currentNodeId));
@@ -476,10 +494,10 @@ const reinforcePath = createStep({
         span?.error({ error: e });
         throw e;
       }
-      return { success: true };
+      return { artifact: inputData.artifact, success: true };
     }
 
-    return { success: false };
+    return { artifact: inputData.artifact, success: false };
   }
 });
 

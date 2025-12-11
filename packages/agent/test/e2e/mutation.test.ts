@@ -75,7 +75,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     // @ts-expect-error
     const storedNode = await graph.match([]).where({ labels: ["User"], id: "bob_1" }).select();
     expect(storedNode.length).toBe(1);
-    expect(storedNode[0].properties.name).toBe("Bob");
+    expect(storedNode[0].name).toBe("Bob");
   });
 
   it("Scenario: Temporal Close ('Bob left the company yesterday')", async () => {

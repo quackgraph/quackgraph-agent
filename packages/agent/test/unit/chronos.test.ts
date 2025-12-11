@@ -23,14 +23,8 @@ describe("Unit: Chronos (Temporal Physics)", () => {
       await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t1 });
 
       // T2: Edge removed (closed)
-      // Simulating "CLOSE_EDGE" by setting valid_to manually in DB or via edge update
-      // For this test, let's assume validFrom/validTo logic in getSectorSummary filters it out.
-      // We'll simulate it by updating the edge valid_to to be before T2.
-      // @ts-expect-error
-      await graph.db.execute(
-        "UPDATE edges SET valid_to = ? WHERE type = 'CONN'", 
-        [new Date(t1.getTime() + 1000).toISOString()] // Closed shortly after T1
-      );
+      // Use the proper deleteEdge API to ensure both DB and Rust index are updated
+      await graph.deleteEdge("anchor", "target", "CONN");
 
       // T3: Edge re-created (new instance)
       await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t3 });
