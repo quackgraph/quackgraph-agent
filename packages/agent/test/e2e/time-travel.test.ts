@@ -100,7 +100,8 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       if (res2023.status === "failed") throw new Error(`Workflow failed: ${res2023.error?.message}`);
 
       // @ts-expect-error
-      const art2023 = (res2023.results as LabyrinthResult)?.artifact;
+      const payload2023 = res2023.results || res2023;
+      const art2023 = (payload2023 as LabyrinthResult)?.artifact;
       expect(art2023).toBeDefined();
       expect(art2023?.answer).toContain("Alice");
       expect(art2023?.sources).toContain("alice");
@@ -120,7 +121,8 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       if (res2024.status === "failed") throw new Error(`Workflow failed: ${res2024.error?.message}`);
 
       // @ts-expect-error
-      const art2024 = (res2024.results as LabyrinthResult)?.artifact;
+      const payload2024 = res2024.results || res2024;
+      const art2024 = (payload2024 as LabyrinthResult)?.artifact;
       expect(art2024).toBeDefined();
       expect(art2024?.answer).toContain("Bob");
       expect(art2024?.sources).toContain("bob");

@@ -46,7 +46,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
 
       // 4. Verify Success
       // @ts-expect-error
-      const results = res.results as MetabolismResult;
+      const results = (res.results || res) as MetabolismResult;
       expect(results?.success).toBe(true);
 
       // 5. Verify Physics (Graph State)

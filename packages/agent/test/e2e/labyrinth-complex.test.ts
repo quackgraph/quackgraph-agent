@@ -101,7 +101,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // @ts-expect-error
-      const results = res.results as WorkflowResult;
+      const results = (res.results || res) as WorkflowResult;
       const artifact = results?.artifact;
       
       expect(artifact).toBeDefined();

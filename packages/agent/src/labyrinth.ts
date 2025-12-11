@@ -102,7 +102,8 @@ export class Labyrinth {
             
             // 3. Extract Result
             // @ts-expect-error - Result payload typing
-            const artifact = result.results?.artifact as LabyrinthArtifact | null;
+            const payload = result.results || result;
+            const artifact = payload?.artifact as LabyrinthArtifact | null;
             if (!artifact && result.status === 'failed') {
                  throw new Error(`Workflow failed: ${result.error?.message || 'Unknown error'}`);
             }
@@ -187,10 +188,13 @@ export class Labyrinth {
         if (result.status === 'failed') {
           throw new Error(`Mutation failed: ${result.error.message}`);
         }
-        if (result.status !== 'success') {
-          throw new Error(`Mutation failed with status: ${result.status}`);
+        // Some runtimes return 'completed' or 'success'
+        if (result.status !== 'success' && result.status !== 'completed') {
+          throw new Error(`Mutation possibly failed with status: ${result.status}`);
         }
-        return result.result as { success: boolean; summary: string };
+        // @ts-expect-error - Result payload typing
+        const payload = result.results || result;
+        return payload as { success: boolean; summary: string };
           } catch (e) {
             this.logger.error("Mutation failed", { error: e });
             span.recordException(e as Error);

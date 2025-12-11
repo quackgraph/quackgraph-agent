@@ -51,7 +51,8 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
 
         // The workflow should complete, but find nothing because the thread was killed
         // @ts-expect-error
-        const artifact = res.results?.artifact;
+        const payload = res.results || res;
+        const artifact = payload?.artifact;
         expect(artifact).toBeNull(); // No winner found
 
       } finally {
@@ -97,7 +98,8 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
       });
 
       // @ts-expect-error
-      const artifact = res.results?.artifact;
+      const payload = res.results || res;
+      const artifact = payload?.artifact;
       
       // Should result in null (failure to find) rather than hanging
       expect(artifact).toBeNull();

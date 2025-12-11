@@ -36,9 +36,12 @@ describe("E2E: Scribe (Complex Mutations)", () => {
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // @ts-expect-error
-      expect(res.results?.success).toBe(false);
+      const payload = res.results || res;
+      
       // @ts-expect-error
-      expect(res.results?.summary).toContain("Did you mean the Ford or the Chevy?");
+      expect(payload?.success).toBe(false);
+      // @ts-expect-error
+      expect(payload?.summary).toContain("Did you mean the Ford or the Chevy?");
 
       // Verify no deletion happened
       const cars = await graph.match([]).where({ labels: ["Car"] }).select();

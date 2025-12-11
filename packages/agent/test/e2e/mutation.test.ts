@@ -61,7 +61,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify Result
     // @ts-expect-error - Mastra generic return type
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
@@ -115,7 +115,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
       throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
@@ -164,7 +164,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) throw new Error("Invalid Result");
 

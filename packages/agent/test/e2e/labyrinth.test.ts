@@ -7,6 +7,13 @@ import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { Labyrinth } from "../../src/labyrinth";
 import type { QuackGraph } from "@quackgraph/graph";
 
+// Helper to extract results safely across Mastra versions/mocks
+// biome-ignore lint/suspicious/noExplicitAny: generic
+function getArtifact(res: any) {
+    const payload = res.results || res;
+    return payload?.artifact;
+}
+
 describe("E2E: Labyrinth (Traversal Workflow)", () => {
   let graph: QuackGraph;
   let llm: SyntheticLLM;
