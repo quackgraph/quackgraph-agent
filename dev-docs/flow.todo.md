@@ -1,4 +1,6 @@
 
+should be now raw duckdb query in quackgraph-agent , should only in quackgraph core
+
 ===
 
 agent should be able to freely perform complex querying and aggregation and custom duckdb operations
