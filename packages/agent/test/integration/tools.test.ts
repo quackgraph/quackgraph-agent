@@ -13,24 +13,24 @@ describe("Integration: Graph Tools (Physics Layer)", () => {
     
     // Seed Data
     // Root Node
-    // @ts-ignore - Dynamic graph method
+    // @ts-expect-error - Dynamic graph method
     await graph.addNode("root", ["Entity"], { name: "Root" });
     
     // Branch A (Hot)
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("a1", ["Entity"], { name: "A1" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("root", "a1", "LINK", { weight: 1 });
     
     // Branch B (Cold)
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("b1", ["Entity"], { name: "B1" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("root", "b1", "LINK", { weight: 1 });
     
     // Temporal Node (Future)
     // using addNodes to ensure validFrom property support if addNode signature varies
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{
       id: "future",
       labels: ["Entity"],
@@ -38,7 +38,7 @@ describe("Integration: Graph Tools (Physics Layer)", () => {
       validFrom: new Date("2030-01-01")
     }]);
     
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdges([{
       source: "root",
       target: "future",
@@ -50,20 +50,20 @@ describe("Integration: Graph Tools (Physics Layer)", () => {
 
   afterEach(async () => {
     // Teardown if supported by graph instance
-    // @ts-ignore
+    // @ts-expect-error
     if (typeof graph.close === 'function') await graph.close();
   });
 
   it("LOD 0: getSectorSummary aggregates edge types", async () => {
     // Add more edges to test aggregation
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("a2", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("root", "a2", "LINK", {});
     
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("c1", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("root", "c1", "OTHER", {});
 
     const summary = await tools.getSectorSummary(["root"]);

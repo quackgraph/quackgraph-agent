@@ -6,7 +6,6 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { Labyrinth } from "../../src/labyrinth";
 import type { QuackGraph } from "@quackgraph/graph";
-import { config } from "../../src/lib/config";
 
 describe("E2E: Labyrinth (Traversal Workflow)", () => {
   let graph: QuackGraph;
@@ -32,17 +31,17 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
   });
 
   afterEach(async () => {
-    // @ts-ignore
+    // @ts-expect-error
     if (typeof graph.close === 'function') await graph.close();
   });
 
   it("Scenario: Single Hop Success", async () => {
     // Topology: Start -> Middle -> Goal
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("start", ["Entity"], { name: "Start" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("goal_node", ["Entity"], { name: "The Answer" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("start", "goal_node", "LINKS_TO", {});
 
     // 1. Train Router
@@ -88,20 +87,20 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
     // Topology: 
     // start -> path_A -> dead_end
     // start -> path_B -> success
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("start", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("path_A", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("path_B", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("success", ["Entity"], { content: "Victory" });
 
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("start", "path_A", "OPTION_A", {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("start", "path_B", "OPTION_B", {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("path_B", "success", "WIN", {});
 
     // 1. Scout at Start: Unsure, forks!
@@ -154,7 +153,7 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
     expect(artifact?.sources).toContain("success");
     
     // Use getTrace to verify forking happened
-    const trace = await labyrinth.getTrace(artifact?.traceId || "");
+    const _trace = await labyrinth.getTrace(artifact?.traceId || "");
     // In our implementation, execution trace is in metadata
     // We expect at least 2 threads to have existed
     // The winner thread + dead thread(s)
@@ -167,13 +166,13 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
 
   it("Scenario: Max Hops Exhaustion", async () => {
     // Loop: A <-> B
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("A", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("B", ["Entity"], {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("A", "B", "LOOP", {});
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("B", "A", "LOOP", {});
 
     // Scout just bounces

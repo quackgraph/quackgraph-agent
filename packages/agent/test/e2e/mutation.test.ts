@@ -4,7 +4,6 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
 import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
 import type { QuackGraph } from "@quackgraph/graph";
-import { getGraphInstance } from "../../src/lib/graph-instance";
 
 describe("E2E: Mutation Workflow (The Scribe)", () => {
   let graph: QuackGraph;
@@ -21,7 +20,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
   });
 
   afterEach(async () => {
-    // @ts-ignore
+    // @ts-expect-error
     if (typeof graph.close === 'function') await graph.close();
   });
 
@@ -51,9 +50,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 3. Verify Result
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.success).toBe(true);
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.summary).toContain("Created Node bob_1");
 
     // 4. Verify Side Effects (Graph Physics)
@@ -64,11 +63,11 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
   it("Scenario: Temporal Close ('Bob left the company yesterday')", async () => {
     // Setup: Bob exists and works at Acme
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("bob_1", ["User"], { name: "Bob" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("acme", ["Company"], { name: "Acme Inc" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdge("bob_1", "acme", "WORKS_AT", { role: "Engineer" });
 
     // 1. Train Brain
@@ -96,7 +95,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 3. Verify
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.success).toBe(true);
 
     // 4. Verify Side Effects (Time Travel)
@@ -114,9 +113,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
   it("Scenario: Ambiguity ('Delete the car')", async () => {
     // Setup: Two cars
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("car_1", ["Car"], { color: "Blue", model: "Ford" });
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNode("car_2", ["Car"], { color: "Blue", model: "Chevy" });
 
     // 1. Train Brain to be confused
@@ -136,11 +135,11 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 3. Verify
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.success).toBe(false);
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.summary).toContain("Clarification needed");
-    // @ts-ignore
+    // @ts-expect-error
     expect(result.results.summary).toContain("The Ford or the Chevy");
 
     // 4. Verify Safety (No deletes happened)

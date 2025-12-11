@@ -15,9 +15,9 @@ export async function createTestGraph(): Promise<QuackGraph> {
   });
 
   // If there's an async init method, call it
-  // @ts-ignore - Checking for potential init method
+  // @ts-expect-error - Checking for potential init method
   if (typeof graph.initialize === 'function') {
-    // @ts-ignore
+    // @ts-expect-error
     await graph.initialize();
   }
 

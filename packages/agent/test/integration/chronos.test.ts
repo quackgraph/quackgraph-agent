@@ -16,7 +16,7 @@ describe("Integration: Chronos (Temporal Physics)", () => {
   });
 
   afterEach(async () => {
-    // @ts-ignore
+    // @ts-expect-error
     if (typeof graph.close === 'function') await graph.close();
   });
 
@@ -25,17 +25,17 @@ describe("Integration: Chronos (Temporal Physics)", () => {
     const ONE_HOUR = 60 * 60 * 1000;
 
     // 1. Anchor Node (e.g., "Migraine") at T=0
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "migraine_1", labels: ["Symptom"], properties: {}, validFrom: NOW }]);
 
     // 2. Target Node (e.g., "Coffee") at T=-30min (Inside window)
     const tInside = new Date(NOW.getTime() - (30 * 60 * 1000));
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "coffee_1", labels: ["Food"], properties: { name: "Espresso" }, validFrom: tInside }]);
 
     // 3. Target Node (e.g., "Coffee") at T=-2hours (Outside window)
     const tOutside = new Date(NOW.getTime() - (2 * ONE_HOUR));
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "coffee_2", labels: ["Food"], properties: { name: "Latte" }, validFrom: tOutside }]);
 
     // Analyze 60 minute window
@@ -52,22 +52,22 @@ describe("Integration: Chronos (Temporal Physics)", () => {
     const t3 = new Date("2024-03-01");
 
     // T1: Anchor exists, connected to A
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "anchor", labels: ["Entity"], properties: {}, validFrom: t1 }]);
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "A", labels: ["Child"], properties: {}, validFrom: t1 }]);
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdges([{ source: "anchor", target: "A", type: "KNOWS", properties: {}, validFrom: t1 }]);
 
     // T2: Add B
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addNodes([{ id: "B", labels: ["Child"], properties: {}, validFrom: t2 }]);
-    // @ts-ignore
+    // @ts-expect-error
     await graph.addEdges([{ source: "anchor", target: "B", type: "KNOWS", properties: {}, validFrom: t2 }]);
 
     // T3: Remove A (Close edge)
     // Direct DB manipulation to simulate edge closing if API is limited
-    // @ts-ignore
+    // @ts-expect-error
     await graph.db.execute(
         `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ?`, 
         [t3.toISOString(), "anchor", "A"]

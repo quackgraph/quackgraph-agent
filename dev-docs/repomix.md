@@ -67,829 +67,6 @@ tsconfig.json
 
 # Files
 
-## File: packages/agent/test/e2e/labyrinth.test.ts
-````typescript
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
-import { createTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scoutAgent } from "../../src/mastra/agents/scout-agent";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { Labyrinth } from "../../src/labyrinth";
-import type { QuackGraph } from "@quackgraph/graph";
-import { config } from "../../src/lib/config";
-
-describe("E2E: Labyrinth (Traversal Workflow)", () => {
-  let graph: QuackGraph;
-  let llm: SyntheticLLM;
-  let labyrinth: Labyrinth;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    llm.mockAgent(scoutAgent);
-    llm.mockAgent(judgeAgent);
-    llm.mockAgent(routerAgent);
-  });
-
-  beforeEach(async () => {
-    graph = await createTestGraph();
-    // Re-instantiate Labyrinth per test to ensure clean state config
-    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
-        llmProvider: { generate: async () => "" }, // Dummy, unused due to mock
-        maxHops: 5,
-        maxCursors: 3,
-        confidenceThreshold: 0.8
-    });
-  });
-
-  afterEach(async () => {
-    // @ts-ignore
-    if (typeof graph.close === 'function') await graph.close();
-  });
-
-  it("Scenario: Single Hop Success", async () => {
-    // Topology: Start -> Middle -> Goal
-    // @ts-ignore
-    await graph.addNode("start", ["Entity"], { name: "Start" });
-    // @ts-ignore
-    await graph.addNode("goal_node", ["Entity"], { name: "The Answer" });
-    // @ts-ignore
-    await graph.addEdge("start", "goal_node", "LINKS_TO", {});
-
-    // 1. Train Router
-    llm.addResponse("Find the answer", {
-        domain: "global",
-        confidence: 1.0,
-        reasoning: "General query"
-    });
-
-    // 2. Train Scout
-    // Step 1: At 'start', sees 'goal_node' via 'LINKS_TO'
-    llm.addResponse(`Node: "start"`, {
-        action: "MOVE",
-        edgeType: "LINKS_TO",
-        confidence: 1.0,
-        reasoning: "Moving to linked node"
-    });
-    
-    // Step 2: At 'goal_node', checks for answer
-    llm.addResponse(`Node: "goal_node"`, {
-        action: "CHECK",
-        confidence: 1.0,
-        reasoning: "This looks like the answer"
-    });
-
-    // 3. Train Judge
-    llm.addResponse(`Goal: Find the answer`, {
-        isAnswer: true,
-        answer: "Found the answer at goal_node",
-        confidence: 0.95
-    });
-
-    // 4. Run Labyrinth
-    const artifact = await labyrinth.findPath("start", "Find the answer");
-
-    expect(artifact).toBeDefined();
-    expect(artifact?.answer).toBe("Found the answer at goal_node");
-    expect(artifact?.sources).toContain("goal_node");
-    expect(artifact?.confidence).toBe(0.95);
-  });
-
-  it("Scenario: Speculative Forking (The Race)", async () => {
-    // Topology: 
-    // start -> path_A -> dead_end
-    // start -> path_B -> success
-    // @ts-ignore
-    await graph.addNode("start", ["Entity"], {});
-    // @ts-ignore
-    await graph.addNode("path_A", ["Entity"], {});
-    // @ts-ignore
-    await graph.addNode("path_B", ["Entity"], {});
-    // @ts-ignore
-    await graph.addNode("success", ["Entity"], { content: "Victory" });
-
-    // @ts-ignore
-    await graph.addEdge("start", "path_A", "OPTION_A", {});
-    // @ts-ignore
-    await graph.addEdge("start", "path_B", "OPTION_B", {});
-    // @ts-ignore
-    await graph.addEdge("path_B", "success", "WIN", {});
-
-    // 1. Scout at Start: Unsure, forks!
-    // Keyword match on the Node ID provided in prompt
-    llm.addResponse(`Node: "start"`, {
-        action: "MOVE",
-        confidence: 0.5,
-        reasoning: "Unsure which path is better",
-        alternativeMoves: [
-            { edgeType: "OPTION_A", confidence: 0.5, reasoning: "Try A" },
-            { edgeType: "OPTION_B", confidence: 0.5, reasoning: "Try B" }
-        ]
-    });
-
-    // 2. Scout at Path A (Dead End)
-    llm.addResponse(`Node: "path_A"`, {
-        action: "ABORT", // Or exhaustive search that yields nothing
-        confidence: 0.0,
-        reasoning: "Dead end"
-    });
-
-    // 3. Scout at Path B (Good Path)
-    llm.addResponse(`Node: "path_B"`, {
-        action: "MOVE",
-        edgeType: "WIN",
-        confidence: 0.9,
-        reasoning: "Found winning path"
-    });
-
-    // 4. Scout at Success
-    llm.addResponse(`Node: "success"`, {
-        action: "CHECK",
-        confidence: 1.0,
-        reasoning: "Check this"
-    });
-
-    // 5. Judge
-    llm.addResponse(`Goal: Race`, {
-        isAnswer: true,
-        answer: "Victory found",
-        confidence: 1.0
-    });
-
-    // Router default
-    llm.setDefault({ domain: "global", confidence: 1.0, reasoning: "default" });
-
-    const artifact = await labyrinth.findPath("start", "Race");
-
-    expect(artifact).toBeDefined();
-    expect(artifact?.sources).toContain("success");
-    
-    // Use getTrace to verify forking happened
-    const trace = await labyrinth.getTrace(artifact?.traceId || "");
-    // In our implementation, execution trace is in metadata
-    // We expect at least 2 threads to have existed
-    // The winner thread + dead thread(s)
-    
-    // Note: In the mock implementation `labyrinth.ts`, we copy metadata to traceCache. 
-    // The test might access `artifact.metadata.execution` directly if Labyrinth returns it (it strips it for the public return, but keeps in cache).
-    
-    // For this test, verifying we found the answer via path_B is sufficient proof the B-thread survived.
-  });
-
-  it("Scenario: Max Hops Exhaustion", async () => {
-    // Loop: A <-> B
-    // @ts-ignore
-    await graph.addNode("A", ["Entity"], {});
-    // @ts-ignore
-    await graph.addNode("B", ["Entity"], {});
-    // @ts-ignore
-    await graph.addEdge("A", "B", "LOOP", {});
-    // @ts-ignore
-    await graph.addEdge("B", "A", "LOOP", {});
-
-    // Scout just bounces
-    llm.addResponse("LOOP", {
-        action: "MOVE",
-        edgeType: "LOOP",
-        confidence: 0.5,
-        reasoning: "Looping"
-    });
-
-    // Limit hops
-    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
-        llmProvider: { generate: async () => "" },
-        maxHops: 3, // Very short leash
-        maxCursors: 1
-    });
-
-    const artifact = await labyrinth.findPath("A", "Infinite Loop");
-
-    // Should fail gracefully
-    expect(artifact).toBeNull();
-  });
-});
-````
-
-## File: packages/agent/test/e2e/mutation.test.ts
-````typescript
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
-import { createTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
-import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
-import type { QuackGraph } from "@quackgraph/graph";
-import { getGraphInstance } from "../../src/lib/graph-instance";
-
-describe("E2E: Mutation Workflow (The Scribe)", () => {
-  let graph: QuackGraph;
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    // Hijack the singleton scribe agent
-    llm.mockAgent(scribeAgent);
-  });
-
-  beforeEach(async () => {
-    graph = await createTestGraph();
-  });
-
-  afterEach(async () => {
-    // @ts-ignore
-    if (typeof graph.close === 'function') await graph.close();
-  });
-
-  it("Scenario: Create Node ('Create a user named Bob')", async () => {
-    // 1. Train the Synthetic Brain
-    llm.addResponse("Create a user named Bob", {
-      reasoning: "User explicitly requested creation of a new Entity.",
-      operations: [
-        {
-          op: "CREATE_NODE",
-          id: "bob_1",
-          labels: ["User"],
-          properties: { name: "Bob" },
-          validFrom: "2024-01-01T00:00:00.000Z"
-        }
-      ]
-    });
-
-    // 2. Execute Workflow
-    const run = await mutationWorkflow.createRunAsync();
-    const result = await run.start({
-      inputData: {
-        query: "Create a user named Bob",
-        userId: "admin",
-        asOf: new Date("2024-01-01").getTime()
-      }
-    });
-
-    // 3. Verify Result
-    // @ts-ignore
-    expect(result.results.success).toBe(true);
-    // @ts-ignore
-    expect(result.results.summary).toContain("Created Node bob_1");
-
-    // 4. Verify Side Effects (Graph Physics)
-    const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
-    expect(storedNode.length).toBe(1);
-    expect(storedNode[0].properties.name).toBe("Bob");
-  });
-
-  it("Scenario: Temporal Close ('Bob left the company yesterday')", async () => {
-    // Setup: Bob exists and works at Acme
-    // @ts-ignore
-    await graph.addNode("bob_1", ["User"], { name: "Bob" });
-    // @ts-ignore
-    await graph.addNode("acme", ["Company"], { name: "Acme Inc" });
-    // @ts-ignore
-    await graph.addEdge("bob_1", "acme", "WORKS_AT", { role: "Engineer" });
-
-    // 1. Train Brain
-    const validTo = "2024-01-02T12:00:00.000Z";
-    llm.addResponse("Bob left the company", {
-      reasoning: "User indicated employment ended. Closing edge.",
-      operations: [
-        {
-          op: "CLOSE_EDGE",
-          source: "bob_1",
-          target: "acme",
-          type: "WORKS_AT",
-          validTo: validTo
-        }
-      ]
-    });
-
-    // 2. Execute
-    const run = await mutationWorkflow.createRunAsync();
-    const result = await run.start({
-      inputData: {
-        query: "Bob left the company",
-        userId: "admin"
-      }
-    });
-
-    // 3. Verify
-    // @ts-ignore
-    expect(result.results.success).toBe(true);
-
-    // 4. Verify Side Effects (Time Travel)
-    // The edge should still exist physically but have a valid_to set
-    // Note: QuackGraph native.removeEdge might delete it from RAM index, 
-    // but DB should retain it if we checked DB directly.
-    // For this test, we verify the Workflow reported success and assumed DB update logic held.
-    
-    // In memory graph implementation might delete it immediately on 'removeEdge' 
-    // depending on how QuackGraph core handles soft deletes in memory.
-    // Let's verify it's gone from the "Present" view.
-    const neighbors = await graph.native.traverse(["bob_1"], "WORKS_AT", "out");
-    expect(neighbors).not.toContain("acme");
-  });
-
-  it("Scenario: Ambiguity ('Delete the car')", async () => {
-    // Setup: Two cars
-    // @ts-ignore
-    await graph.addNode("car_1", ["Car"], { color: "Blue", model: "Ford" });
-    // @ts-ignore
-    await graph.addNode("car_2", ["Car"], { color: "Blue", model: "Chevy" });
-
-    // 1. Train Brain to be confused
-    llm.addResponse("Delete the car", {
-      reasoning: "Ambiguous reference. Found multiple cars.",
-      operations: [],
-      requiresClarification: "Which car? The Ford or the Chevy?"
-    });
-
-    // 2. Execute
-    const run = await mutationWorkflow.createRunAsync();
-    const result = await run.start({
-      inputData: {
-        query: "Delete the car",
-        userId: "admin"
-      }
-    });
-
-    // 3. Verify
-    // @ts-ignore
-    expect(result.results.success).toBe(false);
-    // @ts-ignore
-    expect(result.results.summary).toContain("Clarification needed");
-    // @ts-ignore
-    expect(result.results.summary).toContain("The Ford or the Chevy");
-
-    // 4. Verify Safety (No deletes happened)
-    const cars = await graph.match([]).where({ labels: ["Car"] }).select();
-    expect(cars.length).toBe(2);
-  });
-});
-````
-
-## File: packages/agent/test/integration/chronos.test.ts
-````typescript
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { Chronos } from "../../src/agent/chronos";
-import { GraphTools } from "../../src/tools/graph-tools";
-import { createTestGraph } from "../utils/test-graph";
-import type { QuackGraph } from "@quackgraph/graph";
-
-describe("Integration: Chronos (Temporal Physics)", () => {
-  let graph: QuackGraph;
-  let tools: GraphTools;
-  let chronos: Chronos;
-
-  beforeEach(async () => {
-    graph = await createTestGraph();
-    tools = new GraphTools(graph);
-    chronos = new Chronos(graph, tools);
-  });
-
-  afterEach(async () => {
-    // @ts-ignore
-    if (typeof graph.close === 'function') await graph.close();
-  });
-
-  it("analyzeCorrelation: detects causal overlap", async () => {
-    const NOW = new Date("2025-01-01T12:00:00Z");
-    const ONE_HOUR = 60 * 60 * 1000;
-
-    // 1. Anchor Node (e.g., "Migraine") at T=0
-    // @ts-ignore
-    await graph.addNodes([{ id: "migraine_1", labels: ["Symptom"], properties: {}, validFrom: NOW }]);
-
-    // 2. Target Node (e.g., "Coffee") at T=-30min (Inside window)
-    const tInside = new Date(NOW.getTime() - (30 * 60 * 1000));
-    // @ts-ignore
-    await graph.addNodes([{ id: "coffee_1", labels: ["Food"], properties: { name: "Espresso" }, validFrom: tInside }]);
-
-    // 3. Target Node (e.g., "Coffee") at T=-2hours (Outside window)
-    const tOutside = new Date(NOW.getTime() - (2 * ONE_HOUR));
-    // @ts-ignore
-    await graph.addNodes([{ id: "coffee_2", labels: ["Food"], properties: { name: "Latte" }, validFrom: tOutside }]);
-
-    // Analyze 60 minute window
-    const result = await chronos.analyzeCorrelation("migraine_1", "Food", 60);
-
-    expect(result.targetLabel).toBe("Food");
-    expect(result.sampleSize).toBe(1); // Only coffee_1
-    expect(result.correlationScore).toBe(1.0); // Simple boolean presence
-  });
-
-  it("evolutionaryDiff: tracks topology changes", async () => {
-    const t1 = new Date("2024-01-01");
-    const t2 = new Date("2024-02-01");
-    const t3 = new Date("2024-03-01");
-
-    // T1: Anchor exists, connected to A
-    // @ts-ignore
-    await graph.addNodes([{ id: "anchor", labels: ["Entity"], properties: {}, validFrom: t1 }]);
-    // @ts-ignore
-    await graph.addNodes([{ id: "A", labels: ["Child"], properties: {}, validFrom: t1 }]);
-    // @ts-ignore
-    await graph.addEdges([{ source: "anchor", target: "A", type: "KNOWS", properties: {}, validFrom: t1 }]);
-
-    // T2: Add B
-    // @ts-ignore
-    await graph.addNodes([{ id: "B", labels: ["Child"], properties: {}, validFrom: t2 }]);
-    // @ts-ignore
-    await graph.addEdges([{ source: "anchor", target: "B", type: "KNOWS", properties: {}, validFrom: t2 }]);
-
-    // T3: Remove A (Close edge)
-    // Direct DB manipulation to simulate edge closing if API is limited
-    // @ts-ignore
-    await graph.db.execute(
-        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ?`, 
-        [t3.toISOString(), "anchor", "A"]
-    );
-
-    const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
-
-    expect(result.timeline.length).toBe(3);
-
-    // Snapshot T1: KNOWS (1)
-    // Initial state diff vs empty
-    const t1Added = result.timeline[0].addedEdges.find(e => e.edgeType === "KNOWS");
-    expect(t1Added?.count).toBe(1);
-
-    // Snapshot T2: KNOWS (2) -> A + B
-    // Diff vs T1: KNOWS Persisted (count 2)
-    // Note: Because edgeType is the same, Chronos groups them. 
-    // It sees KNOWS in T1 (count 1) and KNOWS in T2 (count 2).
-    // It classifies this as "Persisted" because the type exists in both.
-    const t2Step = result.timeline[1];
-    const knowsPersistedT2 = t2Step.persistedEdges.find(e => e.edgeType === "KNOWS");
-    expect(knowsPersistedT2?.count).toBe(2); 
-
-    // Snapshot T3: KNOWS (1) -> B only
-    // Diff vs T2: KNOWS Persisted (count 1)
-    const t3Step = result.timeline[2];
-    const knowsPersistedT3 = t3Step.persistedEdges.find(e => e.edgeType === "KNOWS");
-    expect(knowsPersistedT3?.count).toBe(1);
-    
-    // Density Calculation check
-    // T2 (2) -> T3 (1). Change = (1 - 2) / 2 = -0.5 (-50%)
-    expect(t3Step.densityChange).toBe(-50);
-  });
-});
-````
-
-## File: packages/agent/test/integration/tools.test.ts
-````typescript
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { GraphTools } from "../../src/tools/graph-tools";
-import { createTestGraph } from "../utils/test-graph";
-import type { QuackGraph } from "@quackgraph/graph";
-
-describe("Integration: Graph Tools (Physics Layer)", () => {
-  let graph: QuackGraph;
-  let tools: GraphTools;
-
-  beforeEach(async () => {
-    graph = await createTestGraph();
-    tools = new GraphTools(graph);
-    
-    // Seed Data
-    // Root Node
-    // @ts-ignore - Dynamic graph method
-    await graph.addNode("root", ["Entity"], { name: "Root" });
-    
-    // Branch A (Hot)
-    // @ts-ignore
-    await graph.addNode("a1", ["Entity"], { name: "A1" });
-    // @ts-ignore
-    await graph.addEdge("root", "a1", "LINK", { weight: 1 });
-    
-    // Branch B (Cold)
-    // @ts-ignore
-    await graph.addNode("b1", ["Entity"], { name: "B1" });
-    // @ts-ignore
-    await graph.addEdge("root", "b1", "LINK", { weight: 1 });
-    
-    // Temporal Node (Future)
-    // using addNodes to ensure validFrom property support if addNode signature varies
-    // @ts-ignore
-    await graph.addNodes([{
-      id: "future",
-      labels: ["Entity"],
-      properties: { name: "Future" },
-      validFrom: new Date("2030-01-01")
-    }]);
-    
-    // @ts-ignore
-    await graph.addEdges([{
-      source: "root",
-      target: "future",
-      type: "FUTURE_LINK",
-      properties: {},
-      validFrom: new Date("2030-01-01")
-    }]);
-  });
-
-  afterEach(async () => {
-    // Teardown if supported by graph instance
-    // @ts-ignore
-    if (typeof graph.close === 'function') await graph.close();
-  });
-
-  it("LOD 0: getSectorSummary aggregates edge types", async () => {
-    // Add more edges to test aggregation
-    // @ts-ignore
-    await graph.addNode("a2", ["Entity"], {});
-    // @ts-ignore
-    await graph.addEdge("root", "a2", "LINK", {});
-    
-    // @ts-ignore
-    await graph.addNode("c1", ["Entity"], {});
-    // @ts-ignore
-    await graph.addEdge("root", "c1", "OTHER", {});
-
-    const summary = await tools.getSectorSummary(["root"]);
-    
-    const linkStats = summary.find(s => s.edgeType === "LINK");
-    const otherStats = summary.find(s => s.edgeType === "OTHER");
-    
-    expect(linkStats).toBeDefined();
-    // 2 initial LINKs (a1, b1) + 1 new (a2) = 3
-    expect(linkStats?.count).toBeGreaterThanOrEqual(3);
-    expect(otherStats?.count).toBe(1);
-  });
-
-  it("LOD 0: getSectorSummary respects time travel (asOf)", async () => {
-    const past = new Date("2020-01-01").getTime();
-    const summary = await tools.getSectorSummary(["root"], past);
-    
-    // The "future" edge shouldn't exist in 2020
-    const futureStats = summary.find(s => s.edgeType === "FUTURE_LINK");
-    expect(futureStats).toBeUndefined();
-  });
-
-  it("LOD 1: topologyScan traverses edges", async () => {
-    const neighbors = await tools.topologyScan(["root"], "LINK");
-    expect(neighbors).toContain("a1");
-    expect(neighbors).toContain("b1");
-    expect(neighbors).not.toContain("future"); // Wrong type
-  });
-
-  it("LOD 1.5: getNavigationalMap generates ASCII tree", async () => {
-    const { map, truncated } = await tools.getNavigationalMap("root", 2);
-    
-    // console.log("Debug Map Output:\n", map);
-    
-    expect(map).toContain("[ROOT] root");
-    expect(map).toContain("├── [LINK]──> (a1)"); // Order depends on heat/count
-    expect(map).not.toContain("future"); // Should be hidden by default "now"
-    
-    expect(truncated).toBe(false);
-  });
-
-  it("LOD 1.5: getNavigationalMap respects asOf", async () => {
-    const futureTime = new Date("2035-01-01").getTime();
-    const { map } = await tools.getNavigationalMap("root", 1, futureTime);
-    
-    expect(map).toContain("future");
-    expect(map).toContain("[FUTURE_LINK]");
-  });
-});
-````
-
-## File: packages/agent/test/unit/governance.test.ts
-````typescript
-import { describe, it, expect, beforeEach } from "bun:test";
-import { SchemaRegistry } from "../../src/governance/schema-registry";
-
-describe("Governance (SchemaRegistry)", () => {
-  let registry: SchemaRegistry;
-
-  beforeEach(() => {
-    registry = new SchemaRegistry();
-  });
-
-  it("registers and retrieves domains", () => {
-    registry.register({
-      name: "Medical",
-      description: "Health data",
-      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
-    });
-
-    const domain = registry.getDomain("Medical");
-    expect(domain).toBeDefined();
-    expect(domain?.allowedEdges).toContain("TREATED_WITH");
-  });
-
-  it("handles case-insensitive domain names", () => {
-    registry.register({
-      name: "Finance",
-      description: "Money",
-      allowedEdges: []
-    });
-    expect(registry.getDomain("finance")).toBeDefined();
-    expect(registry.getDomain("FINANCE")).toBeDefined();
-  });
-
-  it("enforces whitelists (allowedEdges)", () => {
-    registry.register({
-      name: "Strict",
-      description: "Only A and B",
-      allowedEdges: ["A", "B"]
-    });
-
-    expect(registry.isEdgeAllowed("Strict", "A")).toBe(true);
-    expect(registry.isEdgeAllowed("Strict", "B")).toBe(true);
-    expect(registry.isEdgeAllowed("Strict", "C")).toBe(false); // blocked
-  });
-
-  it("enforces blacklists (excludedEdges)", () => {
-    registry.register({
-      name: "OpenButSafe",
-      description: "Everything except DANGER",
-      allowedEdges: [], // All allowed by default
-      excludedEdges: ["DANGER"]
-    });
-
-    expect(registry.isEdgeAllowed("OpenButSafe", "SAFE")).toBe(true);
-    expect(registry.isEdgeAllowed("OpenButSafe", "DANGER")).toBe(false); // blocked
-  });
-
-  it("defaults to permissive if domain not found", () => {
-    // If a domain doesn't exist, we usually default to global/permissive 
-    // or the registry returns true as per implementation
-    expect(registry.isEdgeAllowed("UnknownDomain", "ANYTHING")).toBe(true);
-  });
-
-  it("getValidEdges returns undefined for unrestricted domains", () => {
-    registry.register({
-      name: "Global",
-      description: "All access",
-      allowedEdges: []
-    });
-    // Implementation details: empty allowedEdges usually means 'undefined' (all) in return 
-    // or empty array depending on implementation. 
-    // Checking src: `if (domain.allowedEdges.length === 0 ...) return undefined;`
-    expect(registry.getValidEdges("Global")).toBeUndefined();
-  });
-
-  it("getValidEdges returns specific list for restricted domains", () => {
-    registry.register({
-      name: "Restricted",
-      description: "Restricted",
-      allowedEdges: ["A"]
-    });
-    expect(registry.getValidEdges("Restricted")).toEqual(["A"]);
-  });
-});
-````
-
-## File: packages/agent/test/unit/temporal.test.ts
-````typescript
-import { describe, it, expect } from "bun:test";
-import { resolveRelativeTime } from "../../src/utils/temporal";
-
-describe("Temporal Logic (resolveRelativeTime)", () => {
-  // Fixed reference time: 2025-01-01T12:00:00Z
-  // Timestamp: 1735732800000
-  const refDate = new Date("2025-01-01T12:00:00Z");
-  const ONE_DAY = 24 * 60 * 60 * 1000;
-  const ONE_HOUR = 60 * 60 * 1000;
-
-  it("resolves exact keywords", () => {
-    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
-    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
-    
-    const yesterday = resolveRelativeTime("yesterday", refDate);
-    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
-
-    const tomorrow = resolveRelativeTime("tomorrow", refDate);
-    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
-  });
-
-  it("resolves 'X time ago' patterns", () => {
-    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
-    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
-
-    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
-    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
-  });
-
-  it("resolves 'in X time' patterns", () => {
-    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
-    // 3 weeks = 21 days
-    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
-  });
-
-  it("resolves absolute dates", () => {
-    const iso = "2023-10-05T00:00:00.000Z";
-    const result = resolveRelativeTime(iso, refDate);
-    expect(result?.toISOString()).toBe(iso);
-  });
-
-  it("returns null for garbage input", () => {
-    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
-  });
-});
-````
-
-## File: packages/agent/test/utils/synthetic-llm.ts
-````typescript
-import { type Mock, mock } from "bun:test";
-import type { Agent } from "@mastra/core/agent";
-
-/**
- * A deterministic LLM simulator for testing Mastra Agents.
- * Allows mapping prompt keywords to specific JSON responses.
- */
-export class SyntheticLLM {
-  private responses: Map<string, object> = new Map();
-  private defaultResponse: object = { error: "No matching synthetic response configured" };
-
-  /**
-   * Register a response trigger.
-   * @param keyword If the prompt contains this string, the response will be returned.
-   * @param response The JSON object to return.
-   */
-  addResponse(keyword: string, response: object) {
-    this.responses.set(keyword, response);
-  }
-
-  setDefault(response: object) {
-    this.defaultResponse = response;
-  }
-
-  /**
-   * Hijacks the `generate` method of a Mastra agent to return synthetic data.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
-  mockAgent(agent: Agent<any, any, any>) {
-    // @ts-ignore - Overwriting the generate method for testing
-    agent.generate = mock(async (prompt: string, _options?: any) => {
-      // 1. Check for keyword matches
-      for (const [key, val] of this.responses) {
-        if (prompt.includes(key)) {
-          return {
-            text: JSON.stringify(val),
-            object: val,
-            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
-          };
-        }
-      }
-
-      // 2. Fallback
-      return {
-        text: JSON.stringify(this.defaultResponse),
-        object: this.defaultResponse,
-        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-      };
-    });
-
-    return agent;
-  }
-}
-````
-
-## File: packages/agent/test/utils/test-graph.ts
-````typescript
-import { QuackGraph } from '@quackgraph/graph';
-import { setGraphInstance } from '../../src/lib/graph-instance';
-
-/**
- * Factory for creating ephemeral, in-memory graph instances.
- * Ensures tests are isolated and idempotent.
- */
-export async function createTestGraph(): Promise<QuackGraph> {
-  // Initialize QuackGraph in-memory
-  // Note: We assume the QuackGraph constructor supports a config object for storage.
-  // If the core package implementation differs, this needs adjustment.
-  const graph = new QuackGraph({
-    storage: ':memory:',
-    dbUrl: ':memory:', // Dual support depending on core version
-  });
-
-  // If there's an async init method, call it
-  // @ts-ignore - Checking for potential init method
-  if (typeof graph.initialize === 'function') {
-    // @ts-ignore
-    await graph.initialize();
-  }
-
-  // Set as global instance for the test context (so tools can pick it up)
-  setGraphInstance(graph);
-
-  return graph;
-}
-````
-
-## File: packages/agent/test/setup.ts
-````typescript
-import { beforeAll, afterAll } from "bun:test";
-
-beforeAll(() => {
-  // specific global setup if needed
-  // console.log("🔒 Starting Zero-Trust Verification Suite");
-});
-
-afterAll(() => {
-  // specific global teardown if needed
-});
-````
-
 ## File: dev-docs/MONOREPO.md
 ````markdown
 # Monorepo Structure - Federated Repositories
@@ -1103,6 +280,828 @@ export function resolveRelativeTime(input: string, referenceDate: Date = new Dat
 
   return null;
 }
+````
+
+## File: packages/agent/test/e2e/labyrinth.test.ts
+````typescript
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
+import { createTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scoutAgent } from "../../src/mastra/agents/scout-agent";
+import { judgeAgent } from "../../src/mastra/agents/judge-agent";
+import { routerAgent } from "../../src/mastra/agents/router-agent";
+import { Labyrinth } from "../../src/labyrinth";
+import type { QuackGraph } from "@quackgraph/graph";
+import { config } from "../../src/lib/config";
+
+describe("E2E: Labyrinth (Traversal Workflow)", () => {
+  let graph: QuackGraph;
+  let llm: SyntheticLLM;
+  let labyrinth: Labyrinth;
+
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    llm.mockAgent(scoutAgent);
+    llm.mockAgent(judgeAgent);
+    llm.mockAgent(routerAgent);
+  });
+
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    // Re-instantiate Labyrinth per test to ensure clean state config
+    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
+        llmProvider: { generate: async () => "" }, // Dummy, unused due to mock
+        maxHops: 5,
+        maxCursors: 3,
+        confidenceThreshold: 0.8
+    });
+  });
+
+  afterEach(async () => {
+    // @ts-expect-error
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("Scenario: Single Hop Success", async () => {
+    // Topology: Start -> Middle -> Goal
+    // @ts-expect-error
+    await graph.addNode("start", ["Entity"], { name: "Start" });
+    // @ts-expect-error
+    await graph.addNode("goal_node", ["Entity"], { name: "The Answer" });
+    // @ts-expect-error
+    await graph.addEdge("start", "goal_node", "LINKS_TO", {});
+
+    // 1. Train Router
+    llm.addResponse("Find the answer", {
+        domain: "global",
+        confidence: 1.0,
+        reasoning: "General query"
+    });
+
+    // 2. Train Scout
+    // Step 1: At 'start', sees 'goal_node' via 'LINKS_TO'
+    llm.addResponse(`Node: "start"`, {
+        action: "MOVE",
+        edgeType: "LINKS_TO",
+        confidence: 1.0,
+        reasoning: "Moving to linked node"
+    });
+    
+    // Step 2: At 'goal_node', checks for answer
+    llm.addResponse(`Node: "goal_node"`, {
+        action: "CHECK",
+        confidence: 1.0,
+        reasoning: "This looks like the answer"
+    });
+
+    // 3. Train Judge
+    llm.addResponse(`Goal: Find the answer`, {
+        isAnswer: true,
+        answer: "Found the answer at goal_node",
+        confidence: 0.95
+    });
+
+    // 4. Run Labyrinth
+    const artifact = await labyrinth.findPath("start", "Find the answer");
+
+    expect(artifact).toBeDefined();
+    expect(artifact?.answer).toBe("Found the answer at goal_node");
+    expect(artifact?.sources).toContain("goal_node");
+    expect(artifact?.confidence).toBe(0.95);
+  });
+
+  it("Scenario: Speculative Forking (The Race)", async () => {
+    // Topology: 
+    // start -> path_A -> dead_end
+    // start -> path_B -> success
+    // @ts-expect-error
+    await graph.addNode("start", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addNode("path_A", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addNode("path_B", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addNode("success", ["Entity"], { content: "Victory" });
+
+    // @ts-expect-error
+    await graph.addEdge("start", "path_A", "OPTION_A", {});
+    // @ts-expect-error
+    await graph.addEdge("start", "path_B", "OPTION_B", {});
+    // @ts-expect-error
+    await graph.addEdge("path_B", "success", "WIN", {});
+
+    // 1. Scout at Start: Unsure, forks!
+    // Keyword match on the Node ID provided in prompt
+    llm.addResponse(`Node: "start"`, {
+        action: "MOVE",
+        confidence: 0.5,
+        reasoning: "Unsure which path is better",
+        alternativeMoves: [
+            { edgeType: "OPTION_A", confidence: 0.5, reasoning: "Try A" },
+            { edgeType: "OPTION_B", confidence: 0.5, reasoning: "Try B" }
+        ]
+    });
+
+    // 2. Scout at Path A (Dead End)
+    llm.addResponse(`Node: "path_A"`, {
+        action: "ABORT", // Or exhaustive search that yields nothing
+        confidence: 0.0,
+        reasoning: "Dead end"
+    });
+
+    // 3. Scout at Path B (Good Path)
+    llm.addResponse(`Node: "path_B"`, {
+        action: "MOVE",
+        edgeType: "WIN",
+        confidence: 0.9,
+        reasoning: "Found winning path"
+    });
+
+    // 4. Scout at Success
+    llm.addResponse(`Node: "success"`, {
+        action: "CHECK",
+        confidence: 1.0,
+        reasoning: "Check this"
+    });
+
+    // 5. Judge
+    llm.addResponse(`Goal: Race`, {
+        isAnswer: true,
+        answer: "Victory found",
+        confidence: 1.0
+    });
+
+    // Router default
+    llm.setDefault({ domain: "global", confidence: 1.0, reasoning: "default" });
+
+    const artifact = await labyrinth.findPath("start", "Race");
+
+    expect(artifact).toBeDefined();
+    expect(artifact?.sources).toContain("success");
+    
+    // Use getTrace to verify forking happened
+    const trace = await labyrinth.getTrace(artifact?.traceId || "");
+    // In our implementation, execution trace is in metadata
+    // We expect at least 2 threads to have existed
+    // The winner thread + dead thread(s)
+    
+    // Note: In the mock implementation `labyrinth.ts`, we copy metadata to traceCache. 
+    // The test might access `artifact.metadata.execution` directly if Labyrinth returns it (it strips it for the public return, but keeps in cache).
+    
+    // For this test, verifying we found the answer via path_B is sufficient proof the B-thread survived.
+  });
+
+  it("Scenario: Max Hops Exhaustion", async () => {
+    // Loop: A <-> B
+    // @ts-expect-error
+    await graph.addNode("A", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addNode("B", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addEdge("A", "B", "LOOP", {});
+    // @ts-expect-error
+    await graph.addEdge("B", "A", "LOOP", {});
+
+    // Scout just bounces
+    llm.addResponse("LOOP", {
+        action: "MOVE",
+        edgeType: "LOOP",
+        confidence: 0.5,
+        reasoning: "Looping"
+    });
+
+    // Limit hops
+    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
+        llmProvider: { generate: async () => "" },
+        maxHops: 3, // Very short leash
+        maxCursors: 1
+    });
+
+    const artifact = await labyrinth.findPath("A", "Infinite Loop");
+
+    // Should fail gracefully
+    expect(artifact).toBeNull();
+  });
+});
+````
+
+## File: packages/agent/test/e2e/mutation.test.ts
+````typescript
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
+import { createTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
+import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
+import type { QuackGraph } from "@quackgraph/graph";
+
+describe("E2E: Mutation Workflow (The Scribe)", () => {
+  let graph: QuackGraph;
+  let llm: SyntheticLLM;
+
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    // Hijack the singleton scribe agent
+    llm.mockAgent(scribeAgent);
+  });
+
+  beforeEach(async () => {
+    graph = await createTestGraph();
+  });
+
+  afterEach(async () => {
+    // @ts-expect-error
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("Scenario: Create Node ('Create a user named Bob')", async () => {
+    // 1. Train the Synthetic Brain
+    llm.addResponse("Create a user named Bob", {
+      reasoning: "User explicitly requested creation of a new Entity.",
+      operations: [
+        {
+          op: "CREATE_NODE",
+          id: "bob_1",
+          labels: ["User"],
+          properties: { name: "Bob" },
+          validFrom: "2024-01-01T00:00:00.000Z"
+        }
+      ]
+    });
+
+    // 2. Execute Workflow
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Create a user named Bob",
+        userId: "admin",
+        asOf: new Date("2024-01-01").getTime()
+      }
+    });
+
+    // 3. Verify Result
+    // @ts-expect-error
+    expect(result.results.success).toBe(true);
+    // @ts-expect-error
+    expect(result.results.summary).toContain("Created Node bob_1");
+
+    // 4. Verify Side Effects (Graph Physics)
+    const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
+    expect(storedNode.length).toBe(1);
+    expect(storedNode[0].properties.name).toBe("Bob");
+  });
+
+  it("Scenario: Temporal Close ('Bob left the company yesterday')", async () => {
+    // Setup: Bob exists and works at Acme
+    // @ts-expect-error
+    await graph.addNode("bob_1", ["User"], { name: "Bob" });
+    // @ts-expect-error
+    await graph.addNode("acme", ["Company"], { name: "Acme Inc" });
+    // @ts-expect-error
+    await graph.addEdge("bob_1", "acme", "WORKS_AT", { role: "Engineer" });
+
+    // 1. Train Brain
+    const validTo = "2024-01-02T12:00:00.000Z";
+    llm.addResponse("Bob left the company", {
+      reasoning: "User indicated employment ended. Closing edge.",
+      operations: [
+        {
+          op: "CLOSE_EDGE",
+          source: "bob_1",
+          target: "acme",
+          type: "WORKS_AT",
+          validTo: validTo
+        }
+      ]
+    });
+
+    // 2. Execute
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Bob left the company",
+        userId: "admin"
+      }
+    });
+
+    // 3. Verify
+    // @ts-expect-error
+    expect(result.results.success).toBe(true);
+
+    // 4. Verify Side Effects (Time Travel)
+    // The edge should still exist physically but have a valid_to set
+    // Note: QuackGraph native.removeEdge might delete it from RAM index, 
+    // but DB should retain it if we checked DB directly.
+    // For this test, we verify the Workflow reported success and assumed DB update logic held.
+    
+    // In memory graph implementation might delete it immediately on 'removeEdge' 
+    // depending on how QuackGraph core handles soft deletes in memory.
+    // Let's verify it's gone from the "Present" view.
+    const neighbors = await graph.native.traverse(["bob_1"], "WORKS_AT", "out");
+    expect(neighbors).not.toContain("acme");
+  });
+
+  it("Scenario: Ambiguity ('Delete the car')", async () => {
+    // Setup: Two cars
+    // @ts-expect-error
+    await graph.addNode("car_1", ["Car"], { color: "Blue", model: "Ford" });
+    // @ts-expect-error
+    await graph.addNode("car_2", ["Car"], { color: "Blue", model: "Chevy" });
+
+    // 1. Train Brain to be confused
+    llm.addResponse("Delete the car", {
+      reasoning: "Ambiguous reference. Found multiple cars.",
+      operations: [],
+      requiresClarification: "Which car? The Ford or the Chevy?"
+    });
+
+    // 2. Execute
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Delete the car",
+        userId: "admin"
+      }
+    });
+
+    // 3. Verify
+    // @ts-expect-error
+    expect(result.results.success).toBe(false);
+    // @ts-expect-error
+    expect(result.results.summary).toContain("Clarification needed");
+    // @ts-expect-error
+    expect(result.results.summary).toContain("The Ford or the Chevy");
+
+    // 4. Verify Safety (No deletes happened)
+    const cars = await graph.match([]).where({ labels: ["Car"] }).select();
+    expect(cars.length).toBe(2);
+  });
+});
+````
+
+## File: packages/agent/test/integration/chronos.test.ts
+````typescript
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Chronos } from "../../src/agent/chronos";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { createTestGraph } from "../utils/test-graph";
+import type { QuackGraph } from "@quackgraph/graph";
+
+describe("Integration: Chronos (Temporal Physics)", () => {
+  let graph: QuackGraph;
+  let tools: GraphTools;
+  let chronos: Chronos;
+
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    tools = new GraphTools(graph);
+    chronos = new Chronos(graph, tools);
+  });
+
+  afterEach(async () => {
+    // @ts-expect-error
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("analyzeCorrelation: detects causal overlap", async () => {
+    const NOW = new Date("2025-01-01T12:00:00Z");
+    const ONE_HOUR = 60 * 60 * 1000;
+
+    // 1. Anchor Node (e.g., "Migraine") at T=0
+    // @ts-expect-error
+    await graph.addNodes([{ id: "migraine_1", labels: ["Symptom"], properties: {}, validFrom: NOW }]);
+
+    // 2. Target Node (e.g., "Coffee") at T=-30min (Inside window)
+    const tInside = new Date(NOW.getTime() - (30 * 60 * 1000));
+    // @ts-expect-error
+    await graph.addNodes([{ id: "coffee_1", labels: ["Food"], properties: { name: "Espresso" }, validFrom: tInside }]);
+
+    // 3. Target Node (e.g., "Coffee") at T=-2hours (Outside window)
+    const tOutside = new Date(NOW.getTime() - (2 * ONE_HOUR));
+    // @ts-expect-error
+    await graph.addNodes([{ id: "coffee_2", labels: ["Food"], properties: { name: "Latte" }, validFrom: tOutside }]);
+
+    // Analyze 60 minute window
+    const result = await chronos.analyzeCorrelation("migraine_1", "Food", 60);
+
+    expect(result.targetLabel).toBe("Food");
+    expect(result.sampleSize).toBe(1); // Only coffee_1
+    expect(result.correlationScore).toBe(1.0); // Simple boolean presence
+  });
+
+  it("evolutionaryDiff: tracks topology changes", async () => {
+    const t1 = new Date("2024-01-01");
+    const t2 = new Date("2024-02-01");
+    const t3 = new Date("2024-03-01");
+
+    // T1: Anchor exists, connected to A
+    // @ts-expect-error
+    await graph.addNodes([{ id: "anchor", labels: ["Entity"], properties: {}, validFrom: t1 }]);
+    // @ts-expect-error
+    await graph.addNodes([{ id: "A", labels: ["Child"], properties: {}, validFrom: t1 }]);
+    // @ts-expect-error
+    await graph.addEdges([{ source: "anchor", target: "A", type: "KNOWS", properties: {}, validFrom: t1 }]);
+
+    // T2: Add B
+    // @ts-expect-error
+    await graph.addNodes([{ id: "B", labels: ["Child"], properties: {}, validFrom: t2 }]);
+    // @ts-expect-error
+    await graph.addEdges([{ source: "anchor", target: "B", type: "KNOWS", properties: {}, validFrom: t2 }]);
+
+    // T3: Remove A (Close edge)
+    // Direct DB manipulation to simulate edge closing if API is limited
+    // @ts-expect-error
+    await graph.db.execute(
+        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ?`, 
+        [t3.toISOString(), "anchor", "A"]
+    );
+
+    const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
+
+    expect(result.timeline.length).toBe(3);
+
+    // Snapshot T1: KNOWS (1)
+    // Initial state diff vs empty
+    const t1Added = result.timeline[0].addedEdges.find(e => e.edgeType === "KNOWS");
+    expect(t1Added?.count).toBe(1);
+
+    // Snapshot T2: KNOWS (2) -> A + B
+    // Diff vs T1: KNOWS Persisted (count 2)
+    // Note: Because edgeType is the same, Chronos groups them. 
+    // It sees KNOWS in T1 (count 1) and KNOWS in T2 (count 2).
+    // It classifies this as "Persisted" because the type exists in both.
+    const t2Step = result.timeline[1];
+    const knowsPersistedT2 = t2Step.persistedEdges.find(e => e.edgeType === "KNOWS");
+    expect(knowsPersistedT2?.count).toBe(2); 
+
+    // Snapshot T3: KNOWS (1) -> B only
+    // Diff vs T2: KNOWS Persisted (count 1)
+    const t3Step = result.timeline[2];
+    const knowsPersistedT3 = t3Step.persistedEdges.find(e => e.edgeType === "KNOWS");
+    expect(knowsPersistedT3?.count).toBe(1);
+    
+    // Density Calculation check
+    // T2 (2) -> T3 (1). Change = (1 - 2) / 2 = -0.5 (-50%)
+    expect(t3Step.densityChange).toBe(-50);
+  });
+});
+````
+
+## File: packages/agent/test/integration/tools.test.ts
+````typescript
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { createTestGraph } from "../utils/test-graph";
+import type { QuackGraph } from "@quackgraph/graph";
+
+describe("Integration: Graph Tools (Physics Layer)", () => {
+  let graph: QuackGraph;
+  let tools: GraphTools;
+
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    tools = new GraphTools(graph);
+    
+    // Seed Data
+    // Root Node
+    // @ts-expect-error - Dynamic graph method
+    await graph.addNode("root", ["Entity"], { name: "Root" });
+    
+    // Branch A (Hot)
+    // @ts-expect-error
+    await graph.addNode("a1", ["Entity"], { name: "A1" });
+    // @ts-expect-error
+    await graph.addEdge("root", "a1", "LINK", { weight: 1 });
+    
+    // Branch B (Cold)
+    // @ts-expect-error
+    await graph.addNode("b1", ["Entity"], { name: "B1" });
+    // @ts-expect-error
+    await graph.addEdge("root", "b1", "LINK", { weight: 1 });
+    
+    // Temporal Node (Future)
+    // using addNodes to ensure validFrom property support if addNode signature varies
+    // @ts-expect-error
+    await graph.addNodes([{
+      id: "future",
+      labels: ["Entity"],
+      properties: { name: "Future" },
+      validFrom: new Date("2030-01-01")
+    }]);
+    
+    // @ts-expect-error
+    await graph.addEdges([{
+      source: "root",
+      target: "future",
+      type: "FUTURE_LINK",
+      properties: {},
+      validFrom: new Date("2030-01-01")
+    }]);
+  });
+
+  afterEach(async () => {
+    // Teardown if supported by graph instance
+    // @ts-expect-error
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("LOD 0: getSectorSummary aggregates edge types", async () => {
+    // Add more edges to test aggregation
+    // @ts-expect-error
+    await graph.addNode("a2", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addEdge("root", "a2", "LINK", {});
+    
+    // @ts-expect-error
+    await graph.addNode("c1", ["Entity"], {});
+    // @ts-expect-error
+    await graph.addEdge("root", "c1", "OTHER", {});
+
+    const summary = await tools.getSectorSummary(["root"]);
+    
+    const linkStats = summary.find(s => s.edgeType === "LINK");
+    const otherStats = summary.find(s => s.edgeType === "OTHER");
+    
+    expect(linkStats).toBeDefined();
+    // 2 initial LINKs (a1, b1) + 1 new (a2) = 3
+    expect(linkStats?.count).toBeGreaterThanOrEqual(3);
+    expect(otherStats?.count).toBe(1);
+  });
+
+  it("LOD 0: getSectorSummary respects time travel (asOf)", async () => {
+    const past = new Date("2020-01-01").getTime();
+    const summary = await tools.getSectorSummary(["root"], past);
+    
+    // The "future" edge shouldn't exist in 2020
+    const futureStats = summary.find(s => s.edgeType === "FUTURE_LINK");
+    expect(futureStats).toBeUndefined();
+  });
+
+  it("LOD 1: topologyScan traverses edges", async () => {
+    const neighbors = await tools.topologyScan(["root"], "LINK");
+    expect(neighbors).toContain("a1");
+    expect(neighbors).toContain("b1");
+    expect(neighbors).not.toContain("future"); // Wrong type
+  });
+
+  it("LOD 1.5: getNavigationalMap generates ASCII tree", async () => {
+    const { map, truncated } = await tools.getNavigationalMap("root", 2);
+    
+    // console.log("Debug Map Output:\n", map);
+    
+    expect(map).toContain("[ROOT] root");
+    expect(map).toContain("├── [LINK]──> (a1)"); // Order depends on heat/count
+    expect(map).not.toContain("future"); // Should be hidden by default "now"
+    
+    expect(truncated).toBe(false);
+  });
+
+  it("LOD 1.5: getNavigationalMap respects asOf", async () => {
+    const futureTime = new Date("2035-01-01").getTime();
+    const { map } = await tools.getNavigationalMap("root", 1, futureTime);
+    
+    expect(map).toContain("future");
+    expect(map).toContain("[FUTURE_LINK]");
+  });
+});
+````
+
+## File: packages/agent/test/unit/governance.test.ts
+````typescript
+import { describe, it, expect, beforeEach } from "bun:test";
+import { SchemaRegistry } from "../../src/governance/schema-registry";
+
+describe("Governance (SchemaRegistry)", () => {
+  let registry: SchemaRegistry;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+  });
+
+  it("registers and retrieves domains", () => {
+    registry.register({
+      name: "Medical",
+      description: "Health data",
+      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
+    });
+
+    const domain = registry.getDomain("Medical");
+    expect(domain).toBeDefined();
+    expect(domain?.allowedEdges).toContain("TREATED_WITH");
+  });
+
+  it("handles case-insensitive domain names", () => {
+    registry.register({
+      name: "Finance",
+      description: "Money",
+      allowedEdges: []
+    });
+    expect(registry.getDomain("finance")).toBeDefined();
+    expect(registry.getDomain("FINANCE")).toBeDefined();
+  });
+
+  it("enforces whitelists (allowedEdges)", () => {
+    registry.register({
+      name: "Strict",
+      description: "Only A and B",
+      allowedEdges: ["A", "B"]
+    });
+
+    expect(registry.isEdgeAllowed("Strict", "A")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "B")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "C")).toBe(false); // blocked
+  });
+
+  it("enforces blacklists (excludedEdges)", () => {
+    registry.register({
+      name: "OpenButSafe",
+      description: "Everything except DANGER",
+      allowedEdges: [], // All allowed by default
+      excludedEdges: ["DANGER"]
+    });
+
+    expect(registry.isEdgeAllowed("OpenButSafe", "SAFE")).toBe(true);
+    expect(registry.isEdgeAllowed("OpenButSafe", "DANGER")).toBe(false); // blocked
+  });
+
+  it("defaults to permissive if domain not found", () => {
+    // If a domain doesn't exist, we usually default to global/permissive 
+    // or the registry returns true as per implementation
+    expect(registry.isEdgeAllowed("UnknownDomain", "ANYTHING")).toBe(true);
+  });
+
+  it("getValidEdges returns undefined for unrestricted domains", () => {
+    registry.register({
+      name: "Global",
+      description: "All access",
+      allowedEdges: []
+    });
+    // Implementation details: empty allowedEdges usually means 'undefined' (all) in return 
+    // or empty array depending on implementation. 
+    // Checking src: `if (domain.allowedEdges.length === 0 ...) return undefined;`
+    expect(registry.getValidEdges("Global")).toBeUndefined();
+  });
+
+  it("getValidEdges returns specific list for restricted domains", () => {
+    registry.register({
+      name: "Restricted",
+      description: "Restricted",
+      allowedEdges: ["A"]
+    });
+    expect(registry.getValidEdges("Restricted")).toEqual(["A"]);
+  });
+});
+````
+
+## File: packages/agent/test/unit/temporal.test.ts
+````typescript
+import { describe, it, expect } from "bun:test";
+import { resolveRelativeTime } from "../../src/utils/temporal";
+
+describe("Temporal Logic (resolveRelativeTime)", () => {
+  // Fixed reference time: 2025-01-01T12:00:00Z
+  // Timestamp: 1735732800000
+  const refDate = new Date("2025-01-01T12:00:00Z");
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_HOUR = 60 * 60 * 1000;
+
+  it("resolves exact keywords", () => {
+    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
+    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
+    
+    const yesterday = resolveRelativeTime("yesterday", refDate);
+    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
+
+    const tomorrow = resolveRelativeTime("tomorrow", refDate);
+    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
+  });
+
+  it("resolves 'X time ago' patterns", () => {
+    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
+    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
+
+    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
+    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
+  });
+
+  it("resolves 'in X time' patterns", () => {
+    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
+    // 3 weeks = 21 days
+    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
+  });
+
+  it("resolves absolute dates", () => {
+    const iso = "2023-10-05T00:00:00.000Z";
+    const result = resolveRelativeTime(iso, refDate);
+    expect(result?.toISOString()).toBe(iso);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
+  });
+});
+````
+
+## File: packages/agent/test/utils/synthetic-llm.ts
+````typescript
+import { mock } from "bun:test";
+import type { Agent } from "@mastra/core/agent";
+
+/**
+ * A deterministic LLM simulator for testing Mastra Agents.
+ * Allows mapping prompt keywords to specific JSON responses.
+ */
+export class SyntheticLLM {
+  private responses: Map<string, object> = new Map();
+  private defaultResponse: object = { error: "No matching synthetic response configured" };
+
+  /**
+   * Register a response trigger.
+   * @param keyword If the prompt contains this string, the response will be returned.
+   * @param response The JSON object to return.
+   */
+  addResponse(keyword: string, response: object) {
+    this.responses.set(keyword, response);
+  }
+
+  setDefault(response: object) {
+    this.defaultResponse = response;
+  }
+
+  /**
+   * Hijacks the `generate` method of a Mastra agent to return synthetic data.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
+  mockAgent(agent: Agent<any, any, any>) {
+    // @ts-expect-error - Overwriting the generate method for testing
+    agent.generate = mock(async (prompt: string, _options?: any) => {
+      // 1. Check for keyword matches
+      for (const [key, val] of this.responses) {
+        if (prompt.includes(key)) {
+          return {
+            text: JSON.stringify(val),
+            object: val,
+            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+          };
+        }
+      }
+
+      // 2. Fallback
+      return {
+        text: JSON.stringify(this.defaultResponse),
+        object: this.defaultResponse,
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+      };
+    });
+
+    return agent;
+  }
+}
+````
+
+## File: packages/agent/test/utils/test-graph.ts
+````typescript
+import { QuackGraph } from '@quackgraph/graph';
+import { setGraphInstance } from '../../src/lib/graph-instance';
+
+/**
+ * Factory for creating ephemeral, in-memory graph instances.
+ * Ensures tests are isolated and idempotent.
+ */
+export async function createTestGraph(): Promise<QuackGraph> {
+  // Initialize QuackGraph in-memory
+  // Note: We assume the QuackGraph constructor supports a config object for storage.
+  // If the core package implementation differs, this needs adjustment.
+  const graph = new QuackGraph({
+    storage: ':memory:',
+    dbUrl: ':memory:', // Dual support depending on core version
+  });
+
+  // If there's an async init method, call it
+  // @ts-expect-error - Checking for potential init method
+  if (typeof graph.initialize === 'function') {
+    // @ts-expect-error
+    await graph.initialize();
+  }
+
+  // Set as global instance for the test context (so tools can pick it up)
+  setGraphInstance(graph);
+
+  return graph;
+}
+````
+
+## File: packages/agent/test/setup.ts
+````typescript
+import { beforeAll, afterAll } from "bun:test";
+
+beforeAll(() => {
+  // specific global setup if needed
+  // console.log("🔒 Starting Zero-Trust Verification Suite");
+});
+
+afterAll(() => {
+  // specific global teardown if needed
+});
 ````
 
 ## File: packages/agent/.env.example
@@ -1381,6 +1380,214 @@ SOFTWARE.
 }
 ````
 
+## File: packages/agent/src/mastra/agents/scribe-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
+import { config } from '../../lib/config';
+
+export const scribeAgent = new Agent({
+  name: 'Scribe Agent',
+  instructions: async ({ runtimeContext }) => {
+    const asOf = runtimeContext?.get('asOf') as number | undefined;
+    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
+
+    return `
+    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
+    Current System Time: ${timeStr}
+
+    Your Goal:
+    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
+
+    Rules:
+    1. **Entity Resolution First**: Never guess Node IDs. 
+       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
+       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
+    
+    2. **Temporal Grounding**:
+       - The graph requires ISO 8601 timestamps.
+       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
+       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
+
+    3. **Atomic Operations**:
+       - Output a list of operations that represent the full state change.
+       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
+
+    4. **Ambiguity**:
+       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
+  `;
+  },
+  model: {
+    id: config.agents.scribe.model.id,
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+  tools: {
+    // Scribe needs to see before it writes
+    topologyScanTool,
+    contentRetrievalTool,
+    sectorScanTool
+  }
+});
+````
+
+## File: packages/agent/biome.json
+````json
+{
+  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": false
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/node_modules"
+    ]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "trailingCommas": "es5"
+    }
+  }
+}
+````
+
+## File: scripts/git-pull.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * Git Pull Script - Federated Pull for Nested Repositories
+ * 
+ * Usage:
+ *   bun run scripts/git-pull.ts
+ *   bun run pull:all
+ */
+
+import { $ } from "bun";
+
+const INNER_REPO_PATH = "packages/quackgraph";
+const ROOT_DIR = import.meta.dir.replace("/scripts", "");
+
+async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
+    console.log(`\n⬇️ [${repoName}] Processing...`);
+
+    // Check if directory exists and has .git
+    const fs = await import("node:fs/promises");
+    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
+
+    if (!hasGit && repoUrl) {
+        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
+        try {
+            // Ensure parent dir exists
+            await $`mkdir -p ${cwd}`;
+            // Remove the empty dir if it exists so clone works (or clone into it if empty)
+            // Safest is to remove checking uniqueness or just run git clone
+            // If cwd exists but is empty, git clone <url> <dir> works.
+
+            await $`git clone ${repoUrl} ${cwd}`;
+            console.log(`   ✅ Successfully cloned ${repoName}`);
+            return;
+        } catch (error) {
+            console.error(`   ❌ Failed to clone ${repoName}:`, error);
+            throw error;
+        }
+    }
+
+    console.log(`   ⬇️ Pulling changes...`);
+    try {
+        await $`git -C ${cwd} pull`.quiet();
+        console.log(`   ✅ Successfully pulled ${repoName}`);
+    } catch (error) {
+        console.error(`   ❌ Failed to pull ${repoName}:`, error);
+        throw error;
+    }
+}
+
+async function pullAll(): Promise<void> {
+    console.log("🔄 Git Pull - Federated Repository Update");
+    console.log("=========================================");
+
+    // Pull parent first
+    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
+    await pullRepo(ROOT_DIR, "quackgraph-agent");
+
+    // Pull inner repo
+    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
+    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
+    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
+
+    // Custom logic to ensure 'agent' branch
+    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
+    // Force checkout agent branch if not already
+    try {
+        await $`git -C ${innerRepoPath} checkout agent`.quiet();
+        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
+    } catch (e) {
+        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
+    }
+
+    console.log("\n\n=========================================");
+    console.log("✅ Git pull completed successfully!");
+    console.log("=========================================\n");
+}
+
+pullAll().catch((error) => {
+    console.error("\n❌ Pull failed:", error);
+    process.exit(1);
+});
+````
+
+## File: .gitignore
+````
+# Dependencies
+node_modules/
+bun.lock
+
+# Build outputs
+dist/
+*.node
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Relay state
+/.relay/
+
+# Logs
+*.log
+npm-debug.log*
+````
+
 ## File: packages/agent/src/agent/chronos.ts
 ````typescript
 import type { QuackGraph } from '@quackgraph/graph';
@@ -1517,62 +1724,6 @@ export class Chronos {
     return { anchorNodeId, timeline };
   }
 }
-````
-
-## File: packages/agent/src/mastra/agents/scribe-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-import { LibSQLStore } from '@mastra/libsql';
-import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
-import { config } from '../../lib/config';
-
-export const scribeAgent = new Agent({
-  name: 'Scribe Agent',
-  instructions: async ({ runtimeContext }) => {
-    const asOf = runtimeContext?.get('asOf') as number | undefined;
-    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
-
-    return `
-    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
-    Current System Time: ${timeStr}
-
-    Your Goal:
-    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
-
-    Rules:
-    1. **Entity Resolution First**: Never guess Node IDs. 
-       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
-       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
-    
-    2. **Temporal Grounding**:
-       - The graph requires ISO 8601 timestamps.
-       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
-       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
-
-    3. **Atomic Operations**:
-       - Output a list of operations that represent the full state change.
-       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
-
-    4. **Ambiguity**:
-       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
-  `;
-  },
-  model: {
-    id: config.agents.scribe.model.id,
-  },
-  memory: new Memory({
-    storage: new LibSQLStore({
-      url: ':memory:'
-    })
-  }),
-  tools: {
-    // Scribe needs to see before it writes
-    topologyScanTool,
-    contentRetrievalTool,
-    sectorScanTool
-  }
-});
 ````
 
 ## File: packages/agent/src/mastra/workflows/mutation-workflow.ts
@@ -1765,158 +1916,6 @@ export const mutationWorkflow = createWorkflow({
 .then(analyzeIntent)
 .then(applyMutations)
 .commit();
-````
-
-## File: packages/agent/biome.json
-````json
-{
-  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
-  "vcs": {
-    "enabled": true,
-    "clientKind": "git",
-    "useIgnoreFile": false
-  },
-  "files": {
-    "ignoreUnknown": true,
-    "includes": [
-      "**",
-      "!**/dist",
-      "!**/node_modules"
-    ]
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
-  },
-  "linter": {
-    "enabled": true,
-    "rules": {
-      "recommended": true
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "single",
-      "trailingCommas": "es5"
-    }
-  }
-}
-````
-
-## File: scripts/git-pull.ts
-````typescript
-#!/usr/bin/env bun
-/**
- * Git Pull Script - Federated Pull for Nested Repositories
- * 
- * Usage:
- *   bun run scripts/git-pull.ts
- *   bun run pull:all
- */
-
-import { $ } from "bun";
-
-const INNER_REPO_PATH = "packages/quackgraph";
-const ROOT_DIR = import.meta.dir.replace("/scripts", "");
-
-async function pullRepo(cwd: string, repoName: string, repoUrl?: string): Promise<void> {
-    console.log(`\n⬇️ [${repoName}] Processing...`);
-
-    // Check if directory exists and has .git
-    const fs = await import("node:fs/promises");
-    const hasGit = await fs.exists(`${cwd}/.git`).catch(() => false);
-
-    if (!hasGit && repoUrl) {
-        console.log(`   ✨ Repository not found. Cloning from ${repoUrl}...`);
-        try {
-            // Ensure parent dir exists
-            await $`mkdir -p ${cwd}`;
-            // Remove the empty dir if it exists so clone works (or clone into it if empty)
-            // Safest is to remove checking uniqueness or just run git clone
-            // If cwd exists but is empty, git clone <url> <dir> works.
-
-            await $`git clone ${repoUrl} ${cwd}`;
-            console.log(`   ✅ Successfully cloned ${repoName}`);
-            return;
-        } catch (error) {
-            console.error(`   ❌ Failed to clone ${repoName}:`, error);
-            throw error;
-        }
-    }
-
-    console.log(`   ⬇️ Pulling changes...`);
-    try {
-        await $`git -C ${cwd} pull`.quiet();
-        console.log(`   ✅ Successfully pulled ${repoName}`);
-    } catch (error) {
-        console.error(`   ❌ Failed to pull ${repoName}:`, error);
-        throw error;
-    }
-}
-
-async function pullAll(): Promise<void> {
-    console.log("🔄 Git Pull - Federated Repository Update");
-    console.log("=========================================");
-
-    // Pull parent first
-    console.log("\n\n🔷 Step 1: Processing parent repository (quackgraph-agent)...");
-    await pullRepo(ROOT_DIR, "quackgraph-agent");
-
-    // Pull inner repo
-    console.log("\n\n🔷 Step 2: Processing inner repository (quackgraph core)...");
-    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
-    const innerRepoUrl = "https://github.com/quackgraph/quackgraph.git";
-
-    // Custom logic to ensure 'agent' branch
-    await pullRepo(innerRepoPath, "quackgraph", innerRepoUrl);
-    // Force checkout agent branch if not already
-    try {
-        await $`git -C ${innerRepoPath} checkout agent`.quiet();
-        await $`git -C ${innerRepoPath} pull origin agent`.quiet();
-    } catch (e) {
-        console.warn("   ⚠️ Could not checkout/pull agent branch explicitly:", e);
-    }
-
-    console.log("\n\n=========================================");
-    console.log("✅ Git pull completed successfully!");
-    console.log("=========================================\n");
-}
-
-pullAll().catch((error) => {
-    console.error("\n❌ Pull failed:", error);
-    process.exit(1);
-});
-````
-
-## File: .gitignore
-````
-# Dependencies
-node_modules/
-bun.lock
-
-# Build outputs
-dist/
-*.node
-target/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Relay state
-/.relay/
-
-# Logs
-*.log
-npm-debug.log*
 ````
 
 ## File: packages/agent/src/agent-schemas.ts
@@ -3725,71 +3724,6 @@ export function createAgent(graph: QuackGraph, config: AgentConfig) {
 }
 ````
 
-## File: repomix.config.json
-````json
-{
-  "$schema": "https://repomix.com/schemas/latest/schema.json",
-  "input": {
-    "maxFileSize": 52428800
-  },
-  "output": {
-    "filePath": "dev-docs/repomix.md",
-    "style": "markdown",
-    "parsableStyle": true,
-    "fileSummary": false,
-    "directoryStructure": true,
-    "files": true,
-    "removeComments": false,
-    "removeEmptyLines": false,
-    "compress": false,
-    "topFilesLength": 5,
-    "showLineNumbers": false,
-    "copyToClipboard": true,
-    "git": {
-      "sortByChanges": true,
-      "sortByChangesMaxCommits": 100,
-      "includeDiffs": false
-    }
-  },
-  "include": [
-//"README.md",
-//"test-docs/"
-//"test/",
-//"test-docs/unit.test-plan.
-
-],
-  "ignore": {
-    "useGitignore": true,
-    "useDefaultPatterns": true,
-    "customPatterns": [        
-      "packages/quackgraph",
-      "dev-docs/flow.todo.md",
-      "packages/quackgraph/.git",
-      "packages/quackgraph/repomix.config.json",
-      "packages/quackgraph/relay.config.json",
-      "packages/quackgraph/.relay",
-      "packages/quackgraph/dev-docs",
-      "packages/quackgraph/LICENSE",
-      "packages/quackgraph/.gitignore",
-      "packages/quackgraph/tsconfig.tsbuildinfo",
-"packages/quackgraph/packages/quack-graph/dist",
-      "packages/quackgraph/test/",
-      "packages/quackgraph/test-docs/",
-      "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src",
-            "packages/quackgraph/RFC.README.md",
-            "packages/quackgraph/README.md"
-    ]
-  },
-  "security": {
-    "enableSecurityCheck": true
-  },
-  "tokenCount": {
-    "encoding": "o200k_base"
-  }
-}
-````
-
 ## File: packages/agent/src/mastra/agents/scout-agent.ts
 ````typescript
 import { Agent } from '@mastra/core/agent';
@@ -3857,6 +3791,71 @@ export const scoutAgent = new Agent({
     evolutionaryScanTool
   }
 });
+````
+
+## File: repomix.config.json
+````json
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "input": {
+    "maxFileSize": 52428800
+  },
+  "output": {
+    "filePath": "dev-docs/repomix.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": false,
+    "directoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": true,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false
+    }
+  },
+  "include": [
+//"README.md",
+//"test-docs/"
+//"test/",
+//"test-docs/unit.test-plan.
+
+],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [        
+      "packages/quackgraph",
+      "dev-docs/flow.todo.md",
+      "packages/quackgraph/.git",
+      "packages/quackgraph/repomix.config.json",
+      "packages/quackgraph/relay.config.json",
+      "packages/quackgraph/.relay",
+      "packages/quackgraph/dev-docs",
+      "packages/quackgraph/LICENSE",
+      "packages/quackgraph/.gitignore",
+      "packages/quackgraph/tsconfig.tsbuildinfo",
+"packages/quackgraph/packages/quack-graph/dist",
+      "packages/quackgraph/test/",
+      "packages/quackgraph/test-docs/",
+      "packages/quackgraph/test/e2e/",
+      "packages/quackgraph/src",
+            "packages/quackgraph/RFC.README.md",
+            "packages/quackgraph/README.md"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
 ````
 
 ## File: packages/agent/src/tools/graph-tools.ts

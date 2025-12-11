@@ -1,4 +1,4 @@
-import { type Mock, mock } from "bun:test";
+import { mock } from "bun:test";
 import type { Agent } from "@mastra/core/agent";
 
 /**
@@ -27,7 +27,8 @@ export class SyntheticLLM {
    */
   // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
   mockAgent(agent: Agent<any, any, any>) {
-    // @ts-ignore - Overwriting the generate method for testing
+    // @ts-expect-error - Overwriting the generate method for testing
+    // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
     agent.generate = mock(async (prompt: string, _options?: any) => {
       // 1. Check for keyword matches
       for (const [key, val] of this.responses) {
