@@ -46,7 +46,7 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
     await graph.addEdge("start", "goal_node", "LINKS_TO", {});
 
     // 1. Train Router
-    llm.addResponse("Find the answer", {
+    llm.addResponse("Available Domains:", {
         domain: "global",
         confidence: 1.0,
         reasoning: "General query"
@@ -54,7 +54,8 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
 
     // 2. Train Scout
     // Step 1: At 'start', sees 'goal_node' via 'LINKS_TO'
-    llm.addResponse(`Node: "start"`, {
+    // Use a more specific keyword that won't conflict with other prompts
+    llm.addResponse('Node: "start" (Labels:', {
         action: "MOVE",
         edgeType: "LINKS_TO",
         confidence: 1.0,
@@ -62,14 +63,14 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
     });
     
     // Step 2: At 'goal_node', checks for answer
-    llm.addResponse(`Node: "goal_node"`, {
+    llm.addResponse('Node: "goal_node" (Labels:', {
         action: "CHECK",
         confidence: 1.0,
         reasoning: "This looks like the answer"
     });
 
     // 3. Train Judge
-    llm.addResponse(`Goal: Find the answer`, {
+    llm.addResponse(`Data:`, {
         isAnswer: true,
         answer: "Found the answer at goal_node",
         confidence: 0.95

@@ -274,13 +274,6 @@ const speculativeTraversal = createStep({
             return;
           }
 
-          console.log('[DEBUG Scout]', {
-            node: cursor.currentNodeId,
-            action: decision.action,
-            edgeType: decision.edgeType,
-            reasoning: decision.reasoning?.slice(0, 50)
-          });
-
           // Log step
           cursor.stepHistory.push({
             step: cursor.stepCount + 1,
@@ -303,14 +296,6 @@ const speculativeTraversal = createStep({
             });
             // @ts-expect-error usage
             if (jRes.object && jRes.usage) tokensUsed += (jRes.usage.promptTokens || 0) + (jRes.usage.completionTokens || 0);
-
-            console.log('[DEBUG Judge]', {
-              isAnswer: jRes.object?.isAnswer,
-              answer: jRes.object?.answer,
-              confidence: jRes.object?.confidence,
-              threshold: config.confidenceThreshold,
-              passesThreshold: jRes.object?.confidence >= config.confidenceThreshold
-            });
 
             if (jRes.object?.isAnswer && jRes.object.confidence >= config.confidenceThreshold) {
               winner = {

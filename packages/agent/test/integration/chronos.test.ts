@@ -33,11 +33,11 @@ describe("Integration: Chronos (Temporal Physics)", () => {
       
       // Target B: Before (11:00)
       // @ts-expect-error
-      await graph.addNode("note_before", ["Note"], {}, new Date(BASE_TIME - ONE_HOUR)); // 11:00
+      await graph.addNode("note_before", ["Note"], {}, { validFrom: new Date(BASE_TIME - ONE_HOUR) }); // 11:00
 
       // Target C: After (14:00)
       // @ts-expect-error
-      await graph.addNode("note_after", ["Note"], {}, new Date(BASE_TIME + 2 * ONE_HOUR)); // 14:00
+      await graph.addNode("note_after", ["Note"], {}, { validFrom: new Date(BASE_TIME + 2 * ONE_HOUR) }); // 14:00
 
       // Connect them all
       // @ts-expect-error
@@ -46,9 +46,9 @@ describe("Integration: Chronos (Temporal Physics)", () => {
         validTo: new Date(BASE_TIME + 45 * 60 * 1000) // Must end within window for DURING
       });
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_before", "HAS_NOTE", {}, new Date(BASE_TIME - ONE_HOUR));
+      await graph.addEdge("meeting", "note_before", "HAS_NOTE", {}, { validFrom: new Date(BASE_TIME - ONE_HOUR) });
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_after", "HAS_NOTE", {}, new Date(BASE_TIME + 2 * ONE_HOUR));
+      await graph.addEdge("meeting", "note_after", "HAS_NOTE", {}, { validFrom: new Date(BASE_TIME + 2 * ONE_HOUR) });
 
       // Define Window: 12:00 -> 13:00
       const wStart = new Date(BASE_TIME);
@@ -103,18 +103,27 @@ describe("Integration: Chronos (Temporal Physics)", () => {
         [new Date(t1.getTime() + 1000).toISOString()] // Ends right after T1
       );
 
-      // Manually sync native graph (since we bypassed addEdge/removeEdge)
-      graph.native.removeEdge("anchor", "target", "LINK");
+      // Debug: Check what's in the database and convert to microseconds
+      // @ts-expect-error
+      const dbEdges = await graph.db.query(`
+        SELECT source, target, type, valid_from, valid_to,
+               date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from) as vf_micros,
+               date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to) as vt_micros
+        FROM edges ORDER BY valid_from
+      `);
+      console.log('[DEBUG] Edges in DB:');
+      for (const edge of dbEdges) {
+        console.log('  ', edge.type, 'vf_micros:', edge.vf_micros?.toString(), 'vt_micros:', edge.vt_micros?.toString());
+      }
+      console.log('[DEBUG] Native edge count:', graph.native.edgeCount);
+      console.log('[DEBUG] Native node count:', graph.native.nodeCount);
+      console.log('[DEBUG] T1 in milliseconds:', t1.getTime());
+      console.log('[DEBUG] T1 in microseconds:', t1.getTime() * 1000);
       
-      // Fix: We MUST re-add the edge with the closed validity window so that T1 queries (historical) 
-      // can still find it. removeEdge deletes it entirely from RAM.
-      // Native expects MILLISECONDS (f64), it will multiply to micros internally.
-      const vf = t1.getTime();
-      const vt = (t1.getTime() + 1000);
-      graph.native.addEdge("anchor", "target", "LINK", vf, vt, 0);
-
       // Now request the diff in order: T1 -> T2 -> T3
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
+      
+      console.log('[DEBUG] Out-of-order test timeline:', JSON.stringify(result.timeline, null, 2));
       
       // T1 Snapshot: LINK exists
       const snap1 = result.timeline[0];
@@ -146,17 +155,17 @@ describe("Integration: Chronos (Temporal Physics)", () => {
       // Anchor: "Failure" at T=0 (Now)
       const now = new Date();
       // @ts-expect-error
-      await graph.addNode("failure", ["Failure"], {}, now);
+      await graph.addNode("failure", ["Failure"], {}, { validFrom: now });
 
       // Target: "CPU_Spike" at T=-30m (Inside window)
       const tInside = new Date(now.getTime() - 30 * 60 * 1000);
       // @ts-expect-error
-      await graph.addNode("cpu_spike", ["Metric"], { val: 99 }, tInside);
+      await graph.addNode("cpu_spike", ["Metric"], { val: 99 }, { validFrom: tInside });
       
       // Target: "CPU_Spike" at T=-90m (Outside window)
       const tOutside = new Date(now.getTime() - 90 * 60 * 1000);
       // @ts-expect-error
-      await graph.addNode("cpu_spike_old", ["Metric"], { val: 80 }, tOutside);
+      await graph.addNode("cpu_spike_old", ["Metric"], { val: 80 }, { validFrom: tOutside });
 
       const res = await chronos.analyzeCorrelation("failure", "Metric", windowMinutes);
 

@@ -19,14 +19,10 @@ describe("Unit: Chronos (Temporal Physics)", () => {
       // @ts-expect-error
       await graph.addNode("target", ["Entity"], {});
 
-      // T1: Edge exists
-      await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t1 });
+      // T1: Edge exists (valid from T1 to T2)
+      await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t1, validTo: t2 });
 
-      // T2: Edge removed (closed)
-      // Use the proper deleteEdge API to ensure both DB and Rust index are updated
-      await graph.deleteEdge("anchor", "target", "CONN");
-
-      // T3: Edge re-created (new instance)
+      // T3: Edge re-created (new instance, valid from T3 onwards)
       await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t3 });
 
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
