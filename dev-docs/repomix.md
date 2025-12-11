@@ -37,11 +37,16 @@ packages/
       e2e/
         labyrinth.test.ts
         mutation.test.ts
+        resilience.test.ts
+        time-travel.test.ts
       integration/
         chronos.test.ts
+        governance.test.ts
         tools.test.ts
       unit/
+        chronos.test.ts
         governance.test.ts
+        graph-tools.test.ts
         temporal.test.ts
       utils/
         synthetic-llm.ts
@@ -66,6 +71,519 @@ tsconfig.json
 ```
 
 # Files
+
+## File: packages/agent/test/e2e/resilience.test.ts
+````typescript
+import { describe, it, expect, beforeAll, mock } from "bun:test";
+import { runWithTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scoutAgent } from "../../src/mastra/agents/scout-agent";
+import { judgeAgent } from "../../src/mastra/agents/judge-agent";
+import { routerAgent } from "../../src/mastra/agents/router-agent";
+import { labyrinthWorkflow } from "../../src/mastra/workflows/labyrinth-workflow";
+
+describe("E2E: Chaos Monkey (Resilience)", () => {
+  let llm: SyntheticLLM;
+
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    llm.mockAgent(scoutAgent);
+    llm.mockAgent(judgeAgent);
+    llm.mockAgent(routerAgent);
+  });
+
+  it("handles Brain Damage (Malformed JSON from Scout)", async () => {
+    await runWithTestGraph(async (graph) => {
+      // @ts-expect-error
+      await graph.addNode("start", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addNode("end", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addEdge("start", "end", "LINK", {});
+
+      // 1. Sabotage the Scout Agent for this specific run
+      // We override the generate method to throw garbage
+      const originalGenerate = scoutAgent.generate;
+      
+      // @ts-expect-error - hijacking
+      scoutAgent.generate = mock(async () => {
+        return {
+          text: "{ NOT VALID JSON ",
+          object: null, // Simulate parser failure or raw text return
+          usage: { totalTokens: 0 }
+        };
+      });
+
+      try {
+        const run = await labyrinthWorkflow.createRunAsync();
+        const res = await run.start({
+          inputData: {
+            goal: "Garbage In",
+            start: "start",
+            maxHops: 2
+          }
+        });
+
+        // The workflow should complete, but find nothing because the thread was killed
+        // @ts-expect-error
+        const artifact = res.results.artifact;
+        expect(artifact).toBeNull(); // No winner found
+
+      } finally {
+        // Restore sanity
+        scoutAgent.generate = originalGenerate;
+      }
+    });
+  });
+
+  it("handles Exhaustion (Max Hops Reached)", async () => {
+    await runWithTestGraph(async (graph) => {
+      // Infinite Chain: 1 -> 2 -> 3 ...
+      // @ts-expect-error
+      await graph.addNode("1", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addNode("2", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addEdge("1", "2", "NEXT", {});
+      // @ts-expect-error
+      await graph.addEdge("2", "3", "NEXT", {}); // Ghost edge to 3
+
+      // Train Scout to always move NEXT
+      llm.setDefault({
+        action: "MOVE",
+        edgeType: "NEXT",
+        confidence: 0.9,
+        reasoning: "Forever onward"
+      });
+
+      // Judge never satisfied
+      llm.addResponse("search", { isAnswer: false, confidence: 0 });
+
+      // Router
+      llm.addResponse("search", { domain: "global" });
+
+      const run = await labyrinthWorkflow.createRunAsync();
+      const res = await run.start({
+        inputData: {
+          goal: "search",
+          start: "1",
+          maxHops: 1 // Strict limit
+        }
+      });
+
+      // @ts-expect-error
+      const artifact = res.results.artifact;
+      
+      // Should result in null (failure to find) rather than hanging
+      expect(artifact).toBeNull();
+    });
+  });
+});
+````
+
+## File: packages/agent/test/e2e/time-travel.test.ts
+````typescript
+import { describe, it, expect, beforeAll } from "bun:test";
+import { runWithTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scoutAgent } from "../../src/mastra/agents/scout-agent";
+import { judgeAgent } from "../../src/mastra/agents/judge-agent";
+import { routerAgent } from "../../src/mastra/agents/router-agent";
+import { labyrinthWorkflow } from "../../src/mastra/workflows/labyrinth-workflow";
+
+describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
+  let llm: SyntheticLLM;
+
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    llm.mockAgent(scoutAgent);
+    llm.mockAgent(judgeAgent);
+    llm.mockAgent(routerAgent);
+  });
+
+  it("returns different answers for 2023 vs 2024 contexts", async () => {
+    await runWithTestGraph(async (graph) => {
+      // Topology: Employee managed by different people at different times
+      // @ts-expect-error
+      await graph.addNode("dave", ["Employee"], { name: "Dave" });
+      // @ts-expect-error
+      await graph.addNode("alice", ["Manager"], { name: "Alice" }); // 2023
+      // @ts-expect-error
+      await graph.addNode("bob", ["Manager"], { name: "Bob" });     // 2024
+
+      const t2023_start = new Date("2023-01-01").toISOString();
+      const t2023_end   = new Date("2023-12-31").toISOString();
+      const t2024_start = new Date("2024-01-01").toISOString();
+
+      // Dave --(MANAGED_BY)--> Alice (2023 only)
+      // @ts-expect-error
+      await graph.addEdges([{ 
+        source: "dave", target: "alice", type: "MANAGED_BY", properties: {}, 
+        validFrom: new Date(t2023_start), validTo: new Date(t2023_end) 
+      }]);
+
+      // Dave --(MANAGED_BY)--> Bob (2024 onwards)
+      // @ts-expect-error
+      await graph.addEdges([{ 
+        source: "dave", target: "bob", type: "MANAGED_BY", properties: {}, 
+        validFrom: new Date(t2024_start)
+      }]);
+
+      // --- Train the Synthetic Brain ---
+      
+      // Router: Always Global
+      llm.addResponse("Who managed Dave", { domain: "global", confidence: 1.0, reasoning: "HR Query" });
+
+      // Scout: Sees MANAGED_BY edges. 
+      // NOTE: The Scout prompt contains the sector summary. 
+      // The sector summary is generated by GraphTools, which respects `asOf`.
+      // So if asOf=2023, Scout only sees Alice. If asOf=2024, Scout only sees Bob.
+      
+      // Generic move response (Scout decides based on what it sees)
+      // We'll trust the "Ghost Earth" logic: if it sees an edge, it takes it.
+      llm.setDefault({
+        action: "MOVE",
+        edgeType: "MANAGED_BY",
+        confidence: 0.9,
+        reasoning: "Following management chain"
+      });
+
+      // Special case: If at Alice or Bob, Check for answer
+      llm.addResponse(`Node: "alice"`, { action: "CHECK", confidence: 1.0, reasoning: "Checking Alice" });
+      llm.addResponse(`Node: "bob"`, { action: "CHECK", confidence: 1.0, reasoning: "Checking Bob" });
+
+      // Judge: Confirms answer
+      llm.addResponse(`Node: "alice"`, { isAnswer: true, answer: "Manager was Alice", confidence: 1.0 }); // Wrong prompt key, relying on content retrieval mock implicitly or explicit pattern
+      // Let's make Judge robust:
+      llm.addResponse(`"name":"Alice"`, { isAnswer: true, answer: "Manager was Alice", confidence: 1.0 });
+      llm.addResponse(`"name":"Bob"`, { isAnswer: true, answer: "Manager was Bob", confidence: 1.0 });
+
+
+      // --- Execution 1: Query as of mid-2023 ---
+      const run2023 = await labyrinthWorkflow.createRunAsync();
+      const res2023 = await run2023.start({
+        inputData: {
+          goal: "Who managed Dave?",
+          start: "dave",
+          timeContext: { asOf: new Date("2023-06-15").getTime() }
+        }
+      });
+
+      // @ts-expect-error
+      const art2023 = res2023.results.artifact;
+      expect(art2023).toBeDefined();
+      expect(art2023.answer).toContain("Alice");
+      expect(art2023.sources).toContain("alice");
+
+
+      // --- Execution 2: Query as of 2024 ---
+      const run2024 = await labyrinthWorkflow.createRunAsync();
+      const res2024 = await run2024.start({
+        inputData: {
+          goal: "Who managed Dave?",
+          start: "dave",
+          timeContext: { asOf: new Date("2024-06-15").getTime() }
+        }
+      });
+
+      // @ts-expect-error
+      const art2024 = res2024.results.artifact;
+      expect(art2024).toBeDefined();
+      expect(art2024.answer).toContain("Bob");
+      expect(art2024.sources).toContain("bob");
+    });
+  });
+});
+````
+
+## File: packages/agent/test/integration/governance.test.ts
+````typescript
+import { describe, it, expect, beforeEach } from "bun:test";
+import { sectorScanTool, topologyScanTool } from "../../src/mastra/tools";
+import { getSchemaRegistry } from "../../src/governance/schema-registry";
+import { runWithTestGraph } from "../utils/test-graph";
+
+describe("Integration: Governance Enforcement", () => {
+  beforeEach(() => {
+    // Reset registry to ensure clean state
+    const registry = getSchemaRegistry();
+    // Register test domains
+    registry.register({
+      name: "Medical",
+      description: "Health data only",
+      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
+    });
+    registry.register({
+      name: "Financial",
+      description: "Money data only",
+      allowedEdges: ["BOUGHT", "OWES"]
+    });
+  });
+
+  it("sectorScanTool: blinds agent to unauthorized edges", async () => {
+    await runWithTestGraph(async (graph) => {
+      // Setup: A node with mixed sensitive data
+      // @ts-expect-error
+      await graph.addNode("patient_zero", ["Person"], {});
+      
+      // Medical Edge
+      // @ts-expect-error
+      await graph.addEdge("patient_zero", "flu", "HAS_SYMPTOM", {});
+      
+      // Financial Edge
+      // @ts-expect-error
+      await graph.addEdge("patient_zero", "hospital", "OWES", { amount: 5000 });
+
+      // 1. Run as "Medical" Agent
+      // Mimic Mastra tool execution context
+      const medResult = await sectorScanTool.execute({
+        context: { nodeIds: ["patient_zero"] },
+        // @ts-expect-error - Mocking runtime context
+        runtimeContext: { get: (key: string) => key === 'domain' ? 'Medical' : undefined }
+      });
+
+      const medSummary = medResult.summary;
+      expect(medSummary.find(s => s.edgeType === "HAS_SYMPTOM")).toBeDefined();
+      expect(medSummary.find(s => s.edgeType === "OWES")).toBeUndefined(); // BLOCKED
+
+      // 2. Run as "Financial" Agent
+      const finResult = await sectorScanTool.execute({
+        context: { nodeIds: ["patient_zero"] },
+        // @ts-expect-error
+        runtimeContext: { get: (key: string) => key === 'domain' ? 'Financial' : undefined }
+      });
+
+      const finSummary = finResult.summary;
+      expect(finSummary.find(s => s.edgeType === "OWES")).toBeDefined();
+      expect(finSummary.find(s => s.edgeType === "HAS_SYMPTOM")).toBeUndefined(); // BLOCKED
+    });
+  });
+
+  it("topologyScanTool: prevents traversal of unauthorized edges", async () => {
+    await runWithTestGraph(async (graph) => {
+      // @ts-expect-error
+      await graph.addNode("A", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addNode("B", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addEdge("A", "B", "SECRET_LINK", {});
+
+      const registry = getSchemaRegistry();
+      registry.register({
+        name: "Public",
+        description: "Public info",
+        allowedEdges: ["PUBLIC_LINK"]
+      });
+
+      // Attempt to traverse SECRET_LINK while in Public domain
+      const result = await topologyScanTool.execute({
+        context: { nodeIds: ["A"], edgeType: "SECRET_LINK" },
+        // @ts-expect-error
+        runtimeContext: { get: (key: string) => key === 'domain' ? 'Public' : undefined }
+      });
+
+      // Should return empty, effectively invisible
+      expect(result.neighborIds).toEqual([]);
+    });
+  });
+});
+````
+
+## File: packages/agent/test/unit/chronos.test.ts
+````typescript
+import { describe, it, expect } from "bun:test";
+import { Chronos } from "../../src/agent/chronos";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { runWithTestGraph } from "../utils/test-graph";
+
+describe("Unit: Chronos (Temporal Physics)", () => {
+  it("evolutionaryDiff: detects addition, removal, and persistence", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
+      const chronos = new Chronos(graph, tools);
+
+      const t1 = new Date("2024-01-01T00:00:00Z");
+      const t2 = new Date("2024-02-01T00:00:00Z");
+      const t3 = new Date("2024-03-01T00:00:00Z");
+
+      // Setup Anchor
+      // @ts-expect-error
+      await graph.addNode("anchor", ["Entity"], {});
+      // @ts-expect-error
+      await graph.addNode("target", ["Entity"], {});
+
+      // T1: Edge exists
+      // @ts-expect-error
+      await graph.addEdge("anchor", "target", "CONN", {}, t1);
+
+      // T2: Edge removed (closed)
+      // Simulating "CLOSE_EDGE" by setting valid_to manually in DB or via edge update
+      // For this test, let's assume validFrom/validTo logic in getSectorSummary filters it out.
+      // We'll simulate it by updating the edge valid_to to be before T2.
+      // @ts-expect-error
+      await graph.db.execute(
+        "UPDATE edges SET valid_to = ? WHERE type = 'CONN'", 
+        [new Date(t1.getTime() + 1000).toISOString()] // Closed shortly after T1
+      );
+
+      // T3: Edge re-created (new instance)
+      // @ts-expect-error
+      await graph.addEdge("anchor", "target", "CONN", {}, t3);
+
+      const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
+      
+      // Snapshot 1 (T1): Added (Initial)
+      expect(result.timeline[0].addedEdges[0].edgeType).toBe("CONN");
+      
+      // Snapshot 2 (T2): Removed (Compared to T1)
+      // At T2, the edge is invalid (closed), so count is 0. 
+      // Diff logic: T1(1) vs T2(0) -> Removed
+      expect(result.timeline[1].removedEdges[0].edgeType).toBe("CONN");
+      
+      // Snapshot 3 (T3): Added (Compared to T2)
+      // T2(0) vs T3(1) -> Added
+      expect(result.timeline[2].addedEdges[0].edgeType).toBe("CONN");
+    });
+  });
+
+  it("analyzeCorrelation: respects strict time windows", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
+      const chronos = new Chronos(graph, tools);
+
+      const anchorTime = new Date("2025-01-01T12:00:00Z");
+      const windowMins = 60; // 1 hour window: 11:00 -> 12:00
+
+      // Anchor Node
+      // @ts-expect-error
+      await graph.addNodes([{ id: "A", labels: ["Anchor"], properties: {}, validFrom: anchorTime }]);
+
+      // Event 1: Inside Window (11:30)
+      const tInside = new Date(anchorTime.getTime() - (30 * 60 * 1000));
+      // @ts-expect-error
+      await graph.addNodes([{ id: "E1", labels: ["Event"], properties: {}, validFrom: tInside }]);
+
+      // Event 2: Outside Window (10:30)
+      const tOutside = new Date(anchorTime.getTime() - (90 * 60 * 1000));
+      // @ts-expect-error
+      await graph.addNodes([{ id: "E2", labels: ["Event"], properties: {}, validFrom: tOutside }]);
+
+      // Event 3: Future (12:30) - Causality check (should not be correlated if we look backwards)
+      const tFuture = new Date(anchorTime.getTime() + (30 * 60 * 1000));
+      // @ts-expect-error
+      await graph.addNodes([{ id: "E3", labels: ["Event"], properties: {}, validFrom: tFuture }]);
+
+      const result = await chronos.analyzeCorrelation("A", "Event", windowMins);
+
+      // Should only find E1
+      expect(result.sampleSize).toBe(1);
+      expect(result.correlationScore).toBe(1.0);
+    });
+  });
+});
+````
+
+## File: packages/agent/test/unit/graph-tools.test.ts
+````typescript
+import { describe, it, expect } from "bun:test";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { runWithTestGraph } from "../utils/test-graph";
+
+describe("Unit: GraphTools (Physics Layer)", () => {
+  it("getNavigationalMap: handles cycles gracefully (Infinite Loop Protection)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
+
+      // Create a cycle: A <-> B
+      // @ts-expect-error - dynamic graph
+      await graph.addNode("A", ["Entity"], { name: "A" });
+      // @ts-expect-error
+      await graph.addNode("B", ["Entity"], { name: "B" });
+
+      // @ts-expect-error
+      await graph.addEdge("A", "B", "LOOP", {});
+      // @ts-expect-error
+      await graph.addEdge("B", "A", "LOOP", {});
+
+      // Recursion depth 3
+      const { map, truncated } = await tools.getNavigationalMap("A", 3);
+
+      // Should show A -> B -> A -> B
+      // The logic clamps at max depth, preventing infinite recursion
+      expect(map).toContain("[ROOT] A");
+      expect(map).toContain("(B)");
+      
+      // We expect some repetition due to depth=3, but it must not crash or hang
+      const occurrencesOfB = map.match(/\(B\)/g)?.length || 0;
+      expect(occurrencesOfB).toBeGreaterThanOrEqual(1);
+      
+      // Should not have exploded the line count limit immediately
+      expect(truncated).toBe(false);
+    });
+  });
+
+  it("reinforcePath: increments edge heat (Pheromones)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
+
+      // A -> B
+      // @ts-expect-error
+      await graph.addNode("start", ["Start"], {});
+      // @ts-expect-error
+      await graph.addNode("end", ["End"], {});
+      // @ts-expect-error
+      await graph.addEdge("start", "end", "PATH", { weight: 1 });
+
+      // Initial state: heat is 0 (or default)
+      const initialSummary = await tools.getSectorSummary(["start"]);
+      const initialHeat = initialSummary.find(s => s.edgeType === "PATH")?.avgHeat || 0;
+
+      // Reinforce
+      await tools.reinforcePath(["start", "end"], [undefined, "PATH"], 1.0);
+
+      // Check heat increase
+      const newSummary = await tools.getSectorSummary(["start"]);
+      const newHeat = newSummary.find(s => s.edgeType === "PATH")?.avgHeat || 0;
+
+      // Note: In-memory mock might not implement the full u8 heat decay math, 
+      // but we expect the command to have been issued and state updated if supported.
+      // If the mock supports it:
+      expect(newHeat).toBeGreaterThan(initialHeat);
+    });
+  });
+
+  it("getSectorSummary: strictly enforces allowedEdgeTypes (Governance)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
+
+      // Root connected to Safe and Unsafe
+      // @ts-expect-error
+      await graph.addNode("root", ["Root"], {});
+      // @ts-expect-error
+      await graph.addNode("safe", ["Child"], {});
+      // @ts-expect-error
+      await graph.addNode("unsafe", ["Child"], {});
+
+      // @ts-expect-error
+      await graph.addEdge("root", "safe", "SAFE_LINK", {});
+      // @ts-expect-error
+      await graph.addEdge("root", "unsafe", "FORBIDDEN_LINK", {});
+
+      // 1. Unrestricted
+      const all = await tools.getSectorSummary(["root"]);
+      expect(all.length).toBe(2);
+
+      // 2. Restricted
+      const restricted = await tools.getSectorSummary(["root"], undefined, ["SAFE_LINK"]);
+      expect(restricted.length).toBe(1);
+      expect(restricted[0].edgeType).toBe("SAFE_LINK");
+      
+      const forbidden = restricted.find(r => r.edgeType === "FORBIDDEN_LINK");
+      expect(forbidden).toBeUndefined();
+    });
+  });
+});
+````
 
 ## File: dev-docs/MONOREPO.md
 ````markdown
@@ -214,19 +732,32 @@ export const config = {
 
 ## File: packages/agent/src/lib/graph-instance.ts
 ````typescript
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { QuackGraph } from '@quackgraph/graph';
 
-let graphInstance: QuackGraph | null = null;
+const graphStorage = new AsyncLocalStorage<QuackGraph>();
+let globalGraphInstance: QuackGraph | null = null;
 
 export function setGraphInstance(graph: QuackGraph) {
-  graphInstance = graph;
+  globalGraphInstance = graph;
+}
+
+export function runWithGraph<T>(graph: QuackGraph, callback: () => T): T {
+  return graphStorage.run(graph, callback);
+}
+
+export function enterGraphContext(graph: QuackGraph) {
+  graphStorage.enterWith(graph);
 }
 
 export function getGraphInstance(): QuackGraph {
-  if (!graphInstance) {
-    throw new Error('Graph instance not initialized. Call setGraphInstance() first.');
+  const storeGraph = graphStorage.getStore();
+  if (storeGraph) return storeGraph;
+
+  if (!globalGraphInstance) {
+    throw new Error('Graph instance not initialized. Call setGraphInstance() or run within runWithGraph context.');
   }
-  return graphInstance;
+  return globalGraphInstance;
 }
 ````
 
@@ -282,6 +813,488 @@ export function resolveRelativeTime(input: string, referenceDate: Date = new Dat
 }
 ````
 
+## File: packages/agent/test/unit/governance.test.ts
+````typescript
+import { describe, it, expect, beforeEach } from "bun:test";
+import { SchemaRegistry } from "../../src/governance/schema-registry";
+
+describe("Governance (SchemaRegistry)", () => {
+  let registry: SchemaRegistry;
+
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+  });
+
+  it("registers and retrieves domains", () => {
+    registry.register({
+      name: "Medical",
+      description: "Health data",
+      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
+    });
+
+    const domain = registry.getDomain("Medical");
+    expect(domain).toBeDefined();
+    expect(domain?.allowedEdges).toContain("TREATED_WITH");
+  });
+
+  it("handles case-insensitive domain names", () => {
+    registry.register({
+      name: "Finance",
+      description: "Money",
+      allowedEdges: []
+    });
+    expect(registry.getDomain("finance")).toBeDefined();
+    expect(registry.getDomain("FINANCE")).toBeDefined();
+  });
+
+  it("enforces whitelists (allowedEdges)", () => {
+    registry.register({
+      name: "Strict",
+      description: "Only A and B",
+      allowedEdges: ["A", "B"]
+    });
+
+    expect(registry.isEdgeAllowed("Strict", "A")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "B")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "C")).toBe(false); // blocked
+  });
+
+  it("enforces blacklists (excludedEdges)", () => {
+    registry.register({
+      name: "OpenButSafe",
+      description: "Everything except DANGER",
+      allowedEdges: [], // All allowed by default
+      excludedEdges: ["DANGER"]
+    });
+
+    expect(registry.isEdgeAllowed("OpenButSafe", "SAFE")).toBe(true);
+    expect(registry.isEdgeAllowed("OpenButSafe", "DANGER")).toBe(false); // blocked
+  });
+
+  it("defaults to permissive if domain not found", () => {
+    // If a domain doesn't exist, we usually default to global/permissive 
+    // or the registry returns true as per implementation
+    expect(registry.isEdgeAllowed("UnknownDomain", "ANYTHING")).toBe(true);
+  });
+
+  it("getValidEdges returns undefined for unrestricted domains", () => {
+    registry.register({
+      name: "Global",
+      description: "All access",
+      allowedEdges: []
+    });
+    // Implementation details: empty allowedEdges usually means 'undefined' (all) in return 
+    // or empty array depending on implementation. 
+    // Checking src: `if (domain.allowedEdges.length === 0 ...) return undefined;`
+    expect(registry.getValidEdges("Global")).toBeUndefined();
+  });
+
+  it("getValidEdges returns specific list for restricted domains", () => {
+    registry.register({
+      name: "Restricted",
+      description: "Restricted",
+      allowedEdges: ["A"]
+    });
+    expect(registry.getValidEdges("Restricted")).toEqual(["A"]);
+  });
+});
+````
+
+## File: packages/agent/test/unit/temporal.test.ts
+````typescript
+import { describe, it, expect } from "bun:test";
+import { resolveRelativeTime } from "../../src/utils/temporal";
+
+describe("Temporal Logic (resolveRelativeTime)", () => {
+  // Fixed reference time: 2025-01-01T12:00:00Z
+  // Timestamp: 1735732800000
+  const refDate = new Date("2025-01-01T12:00:00Z");
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_HOUR = 60 * 60 * 1000;
+
+  it("resolves exact keywords", () => {
+    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
+    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
+    
+    const yesterday = resolveRelativeTime("yesterday", refDate);
+    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
+
+    const tomorrow = resolveRelativeTime("tomorrow", refDate);
+    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
+  });
+
+  it("resolves 'X time ago' patterns", () => {
+    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
+    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
+
+    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
+    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
+  });
+
+  it("resolves 'in X time' patterns", () => {
+    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
+    // 3 weeks = 21 days
+    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
+  });
+
+  it("resolves absolute dates", () => {
+    const iso = "2023-10-05T00:00:00.000Z";
+    const result = resolveRelativeTime(iso, refDate);
+    expect(result?.toISOString()).toBe(iso);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
+  });
+});
+````
+
+## File: packages/agent/test/setup.ts
+````typescript
+import { beforeAll, afterAll } from "bun:test";
+
+beforeAll(() => {
+  // specific global setup if needed
+  // console.log("🔒 Starting Zero-Trust Verification Suite");
+});
+
+afterAll(() => {
+  // specific global teardown if needed
+});
+````
+
+## File: packages/agent/.env.example
+````
+# Server Configuration
+MASTRA_PORT=4111
+LOG_LEVEL=info
+
+# Agent Models (Granular Control)
+# You can switch providers per agent (e.g., use a cheaper model for routing, smarter for judging)
+AGENT_SCOUT_MODEL=groq/llama-3.3-70b-versatile
+AGENT_JUDGE_MODEL=groq/llama-3.3-70b-versatile
+AGENT_ROUTER_MODEL=groq/llama-3.3-70b-versatile
+AGENT_SCRIBE_MODEL=groq/llama-3.3-70b-versatile
+
+# API Keys
+# GROQ_API_KEY=gsk_...
+# OPENAI_API_KEY=sk-...
+# ANTHROPIC_API_KEY=sk-ant-...
+````
+
+## File: packages/agent/mastra.config.ts
+````typescript
+import { mastra } from './src/mastra';
+
+export const config = mastra;
+````
+
+## File: packages/agent/tsconfig.json
+````json
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "src/**/*"
+  ],
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  }
+}
+````
+
+## File: packages/agent/tsup.config.ts
+````typescript
+import { defineConfig } from 'tsup';
+
+export default defineConfig({
+  entry: ['src/index.ts'],
+  format: ['cjs', 'esm'],
+  dts: true,
+  splitting: false,
+  sourcemap: true,
+  clean: true,
+});
+````
+
+## File: scripts/git-sync.ts
+````typescript
+#!/usr/bin/env bun
+/**
+ * Git Sync Script - Federated Push for Nested Repositories
+ * 
+ * This script handles the synchronization of the nested git structure:
+ * - quackgraph-agent (parent) -> Contains packages/agent
+ * - packages/quackgraph (nested repo) -> The core engine
+ * 
+ * Usage:
+ *   bun run scripts/git-sync.ts [message]
+ *   bun run push:all
+ * 
+ * The script will:
+ * 1. Check if the inner repo (packages/quackgraph) has changes
+ * 2. Commit and push the inner repo if needed
+ * 3. Update the parent repo with any changes (including submodule pointer if configured)
+ * 4. Push the parent repo
+ */
+
+import { $ } from "bun";
+
+const INNER_REPO_PATH = "packages/quackgraph";
+const ROOT_DIR = import.meta.dir.replace("/scripts", "");
+
+interface GitStatus {
+    isDirty: boolean;
+    isAhead: boolean;
+    branch: string;
+}
+
+async function getGitStatus(cwd: string): Promise<GitStatus> {
+    try {
+        // Check for uncommitted changes
+        const statusResult = await $`git -C ${cwd} status --porcelain`.text();
+        const isDirty = statusResult.trim().length > 0;
+
+        // Get current branch
+        const branchResult = await $`git -C ${cwd} rev-parse --abbrev-ref HEAD`.text();
+        const branch = branchResult.trim();
+
+        // Check if ahead of remote
+        let isAhead = false;
+        try {
+            const aheadResult = await $`git -C ${cwd} rev-list --count @{upstream}..HEAD 2>/dev/null`.text();
+            isAhead = parseInt(aheadResult.trim(), 10) > 0;
+        } catch {
+            // No upstream configured, assume not ahead
+            isAhead = false;
+        }
+
+        return { isDirty, isAhead, branch };
+    } catch (error) {
+        console.error(`Error getting git status for ${cwd}:`, error);
+        throw error;
+    }
+}
+
+async function commitAndPush(cwd: string, message: string, repoName: string): Promise<boolean> {
+    const status = await getGitStatus(cwd);
+
+    console.log(`\n📦 [${repoName}] Status:`);
+    console.log(`   Branch: ${status.branch}`);
+    console.log(`   Dirty: ${status.isDirty}`);
+    console.log(`   Ahead of remote: ${status.isAhead}`);
+
+    if (!status.isDirty && !status.isAhead) {
+        console.log(`   ✅ Nothing to push for ${repoName}`);
+        return false;
+    }
+
+    if (status.isDirty) {
+        console.log(`\n   📝 Staging and committing changes in ${repoName}...`);
+        await $`git -C ${cwd} add -A`.quiet();
+        await $`git -C ${cwd} commit -m ${message}`.quiet();
+        console.log(`   ✅ Committed: "${message}"`);
+    }
+
+    console.log(`\n   🚀 Pushing ${repoName} to remote...`);
+    try {
+        await $`git -C ${cwd} push`.quiet();
+        console.log(`   ✅ Successfully pushed ${repoName}`);
+        return true;
+    } catch (error) {
+        console.error(`   ❌ Failed to push ${repoName}:`, error);
+        throw error;
+    }
+}
+
+async function syncRepos(): Promise<void> {
+    // Get commit message from args or use default
+    const args = process.argv.slice(2);
+    const commitMessage = args.join(" ") || `sync: ${new Date().toISOString()}`;
+
+    console.log("🔄 Git Sync - Federated Repository Push");
+    console.log("=========================================");
+    console.log(`📝 Commit message: "${commitMessage}"`);
+
+    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
+
+    // Step 1: Handle inner repository (quackgraph core)
+    console.log("\n\n🔷 Step 1: Processing inner repository (quackgraph core)...");
+    try {
+        await commitAndPush(innerRepoPath, commitMessage, "quackgraph");
+    } catch (error) {
+        console.error("❌ Failed to sync inner repository");
+        throw error;
+    }
+
+    // Step 2: Handle parent repository (quackgraph-agent)
+    console.log("\n\n🔷 Step 2: Processing parent repository (quackgraph-agent)...");
+    try {
+        await commitAndPush(ROOT_DIR, commitMessage, "quackgraph-agent");
+    } catch (error) {
+        console.error("❌ Failed to sync parent repository");
+        throw error;
+    }
+
+    console.log("\n\n=========================================");
+    console.log("✅ Git sync completed successfully!");
+    console.log("=========================================\n");
+}
+
+// Run the sync
+syncRepos().catch((error) => {
+    console.error("\n❌ Sync failed:", error);
+    process.exit(1);
+});
+````
+
+## File: LICENSE
+````
+MIT License
+
+Copyright (c) 2025 quackgraph
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
+## File: relay.config.json
+````json
+{
+  "$schema": "https://relay.noca.pro/schema.json",
+  "projectId": "quackgraph-agent",
+  "core": {
+    "logLevel": "info",
+    "enableNotifications": false,
+    "watchConfig": false
+  },
+  "watcher": {
+    "clipboardPollInterval": 2000,
+    "preferredStrategy": "auto"
+  },
+  "patch": {
+    "approvalMode": "manual",
+    "approvalOnErrorCount": 0,
+    "linter": "",
+    "preCommand": "",
+    "postCommand": "",
+    "minFileChanges": 0
+  },
+  "git": {
+    "autoGitBranch": false,
+    "gitBranchPrefix": "relay/",
+    "gitBranchTemplate": "gitCommitMsg"
+  }
+}
+````
+
+## File: tsconfig.json
+````json
+{
+    "compilerOptions": {
+        // Environment setup & latest features
+        "lib": [
+            "ESNext"
+        ],
+        "target": "ESNext",
+        "module": "Preserve",
+        "moduleDetection": "force",
+        "jsx": "react-jsx",
+        "allowJs": true,
+        // Bundler mode
+        "moduleResolution": "bundler",
+        "allowImportingTsExtensions": true,
+        "verbatimModuleSyntax": true,
+        "noEmit": true,
+        // Best practices
+        "strict": true,
+        "skipLibCheck": true,
+        "noFallthroughCasesInSwitch": true,
+        "noUncheckedIndexedAccess": true,
+        "noImplicitOverride": true,
+        // Some stricter flags (disabled by default)
+        "noUnusedLocals": false,
+        "noUnusedParameters": false,
+        "noPropertyAccessFromIndexSignature": false
+    },
+    "include": [
+        "packages/agent/src/**/*",
+        "packages/quackgraph/packages/*/src/**/*"
+    ]
+}
+````
+
+## File: packages/agent/src/mastra/agents/scribe-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
+import { config } from '../../lib/config';
+
+export const scribeAgent = new Agent({
+  name: 'Scribe Agent',
+  instructions: async ({ runtimeContext }) => {
+    const asOf = runtimeContext?.get('asOf') as number | undefined;
+    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
+
+    return `
+    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
+    Current System Time: ${timeStr}
+
+    Your Goal:
+    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
+
+    Rules:
+    1. **Entity Resolution First**: Never guess Node IDs. 
+       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
+       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
+    
+    2. **Temporal Grounding**:
+       - The graph requires ISO 8601 timestamps.
+       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
+       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
+
+    3. **Atomic Operations**:
+       - Output a list of operations that represent the full state change.
+       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
+
+    4. **Ambiguity**:
+       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
+  `;
+  },
+  model: {
+    id: config.agents.scribe.model.id,
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+  tools: {
+    // Scribe needs to see before it writes
+    topologyScanTool,
+    contentRetrievalTool,
+    sectorScanTool
+  }
+});
+````
+
 ## File: packages/agent/test/e2e/labyrinth.test.ts
 ````typescript
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
@@ -292,7 +1305,6 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { Labyrinth } from "../../src/labyrinth";
 import type { QuackGraph } from "@quackgraph/graph";
-import { config } from "../../src/lib/config";
 
 describe("E2E: Labyrinth (Traversal Workflow)", () => {
   let graph: QuackGraph;
@@ -440,7 +1452,7 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
     expect(artifact?.sources).toContain("success");
     
     // Use getTrace to verify forking happened
-    const trace = await labyrinth.getTrace(artifact?.traceId || "");
+    const _trace = await labyrinth.getTrace(artifact?.traceId || "");
     // In our implementation, execution trace is in metadata
     // We expect at least 2 threads to have existed
     // The winner thread + dead thread(s)
@@ -865,142 +1877,6 @@ describe("Integration: Graph Tools (Physics Layer)", () => {
 });
 ````
 
-## File: packages/agent/test/unit/governance.test.ts
-````typescript
-import { describe, it, expect, beforeEach } from "bun:test";
-import { SchemaRegistry } from "../../src/governance/schema-registry";
-
-describe("Governance (SchemaRegistry)", () => {
-  let registry: SchemaRegistry;
-
-  beforeEach(() => {
-    registry = new SchemaRegistry();
-  });
-
-  it("registers and retrieves domains", () => {
-    registry.register({
-      name: "Medical",
-      description: "Health data",
-      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
-    });
-
-    const domain = registry.getDomain("Medical");
-    expect(domain).toBeDefined();
-    expect(domain?.allowedEdges).toContain("TREATED_WITH");
-  });
-
-  it("handles case-insensitive domain names", () => {
-    registry.register({
-      name: "Finance",
-      description: "Money",
-      allowedEdges: []
-    });
-    expect(registry.getDomain("finance")).toBeDefined();
-    expect(registry.getDomain("FINANCE")).toBeDefined();
-  });
-
-  it("enforces whitelists (allowedEdges)", () => {
-    registry.register({
-      name: "Strict",
-      description: "Only A and B",
-      allowedEdges: ["A", "B"]
-    });
-
-    expect(registry.isEdgeAllowed("Strict", "A")).toBe(true);
-    expect(registry.isEdgeAllowed("Strict", "B")).toBe(true);
-    expect(registry.isEdgeAllowed("Strict", "C")).toBe(false); // blocked
-  });
-
-  it("enforces blacklists (excludedEdges)", () => {
-    registry.register({
-      name: "OpenButSafe",
-      description: "Everything except DANGER",
-      allowedEdges: [], // All allowed by default
-      excludedEdges: ["DANGER"]
-    });
-
-    expect(registry.isEdgeAllowed("OpenButSafe", "SAFE")).toBe(true);
-    expect(registry.isEdgeAllowed("OpenButSafe", "DANGER")).toBe(false); // blocked
-  });
-
-  it("defaults to permissive if domain not found", () => {
-    // If a domain doesn't exist, we usually default to global/permissive 
-    // or the registry returns true as per implementation
-    expect(registry.isEdgeAllowed("UnknownDomain", "ANYTHING")).toBe(true);
-  });
-
-  it("getValidEdges returns undefined for unrestricted domains", () => {
-    registry.register({
-      name: "Global",
-      description: "All access",
-      allowedEdges: []
-    });
-    // Implementation details: empty allowedEdges usually means 'undefined' (all) in return 
-    // or empty array depending on implementation. 
-    // Checking src: `if (domain.allowedEdges.length === 0 ...) return undefined;`
-    expect(registry.getValidEdges("Global")).toBeUndefined();
-  });
-
-  it("getValidEdges returns specific list for restricted domains", () => {
-    registry.register({
-      name: "Restricted",
-      description: "Restricted",
-      allowedEdges: ["A"]
-    });
-    expect(registry.getValidEdges("Restricted")).toEqual(["A"]);
-  });
-});
-````
-
-## File: packages/agent/test/unit/temporal.test.ts
-````typescript
-import { describe, it, expect } from "bun:test";
-import { resolveRelativeTime } from "../../src/utils/temporal";
-
-describe("Temporal Logic (resolveRelativeTime)", () => {
-  // Fixed reference time: 2025-01-01T12:00:00Z
-  // Timestamp: 1735732800000
-  const refDate = new Date("2025-01-01T12:00:00Z");
-  const ONE_DAY = 24 * 60 * 60 * 1000;
-  const ONE_HOUR = 60 * 60 * 1000;
-
-  it("resolves exact keywords", () => {
-    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
-    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
-    
-    const yesterday = resolveRelativeTime("yesterday", refDate);
-    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
-
-    const tomorrow = resolveRelativeTime("tomorrow", refDate);
-    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
-  });
-
-  it("resolves 'X time ago' patterns", () => {
-    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
-    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
-
-    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
-    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
-  });
-
-  it("resolves 'in X time' patterns", () => {
-    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
-    // 3 weeks = 21 days
-    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
-  });
-
-  it("resolves absolute dates", () => {
-    const iso = "2023-10-05T00:00:00.000Z";
-    const result = resolveRelativeTime(iso, refDate);
-    expect(result?.toISOString()).toBe(iso);
-  });
-
-  it("returns null for garbage input", () => {
-    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
-  });
-});
-````
-
 ## File: packages/agent/test/utils/synthetic-llm.ts
 ````typescript
 import { mock } from "bun:test";
@@ -1033,6 +1909,7 @@ export class SyntheticLLM {
   // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
   mockAgent(agent: Agent<any, any, any>) {
     // @ts-expect-error - Overwriting the generate method for testing
+    // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
     agent.generate = mock(async (prompt: string, _options?: any) => {
       // 1. Check for keyword matches
       for (const [key, val] of this.responses) {
@@ -1061,7 +1938,7 @@ export class SyntheticLLM {
 ## File: packages/agent/test/utils/test-graph.ts
 ````typescript
 import { QuackGraph } from '@quackgraph/graph';
-import { setGraphInstance } from '../../src/lib/graph-instance';
+import { setGraphInstance, enterGraphContext, runWithGraph } from '../../src/lib/graph-instance';
 
 /**
  * Factory for creating ephemeral, in-memory graph instances.
@@ -1083,357 +1960,43 @@ export async function createTestGraph(): Promise<QuackGraph> {
     await graph.initialize();
   }
 
-  // Set as global instance for the test context (so tools can pick it up)
+  // 1. Try to set isolation context for this async flow (Best effort for legacy tests)
+  enterGraphContext(graph);
+
+  // 2. Set as global instance for the test context (fallback)
   setGraphInstance(graph);
 
   return graph;
 }
-````
 
-## File: packages/agent/test/setup.ts
-````typescript
-import { beforeAll, afterAll } from "bun:test";
-
-beforeAll(() => {
-  // specific global setup if needed
-  // console.log("🔒 Starting Zero-Trust Verification Suite");
-});
-
-afterAll(() => {
-  // specific global teardown if needed
-});
-````
-
-## File: packages/agent/.env.example
-````
-# Server Configuration
-MASTRA_PORT=4111
-LOG_LEVEL=info
-
-# Agent Models (Granular Control)
-# You can switch providers per agent (e.g., use a cheaper model for routing, smarter for judging)
-AGENT_SCOUT_MODEL=groq/llama-3.3-70b-versatile
-AGENT_JUDGE_MODEL=groq/llama-3.3-70b-versatile
-AGENT_ROUTER_MODEL=groq/llama-3.3-70b-versatile
-AGENT_SCRIBE_MODEL=groq/llama-3.3-70b-versatile
-
-# API Keys
-# GROQ_API_KEY=gsk_...
-# OPENAI_API_KEY=sk-...
-# ANTHROPIC_API_KEY=sk-ant-...
-````
-
-## File: packages/agent/mastra.config.ts
-````typescript
-import { mastra } from './src/mastra';
-
-export const config = mastra;
-````
-
-## File: packages/agent/tsconfig.json
-````json
-{
-  "extends": "../../tsconfig.json",
-  "include": [
-    "src/**/*"
-  ],
-  "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src"
-  }
-}
-````
-
-## File: packages/agent/tsup.config.ts
-````typescript
-import { defineConfig } from 'tsup';
-
-export default defineConfig({
-  entry: ['src/index.ts'],
-  format: ['cjs', 'esm'],
-  dts: true,
-  splitting: false,
-  sourcemap: true,
-  clean: true,
-});
-````
-
-## File: scripts/git-sync.ts
-````typescript
-#!/usr/bin/env bun
 /**
- * Git Sync Script - Federated Push for Nested Repositories
- * 
- * This script handles the synchronization of the nested git structure:
- * - quackgraph-agent (parent) -> Contains packages/agent
- * - packages/quackgraph (nested repo) -> The core engine
- * 
- * Usage:
- *   bun run scripts/git-sync.ts [message]
- *   bun run push:all
- * 
- * The script will:
- * 1. Check if the inner repo (packages/quackgraph) has changes
- * 2. Commit and push the inner repo if needed
- * 3. Update the parent repo with any changes (including submodule pointer if configured)
- * 4. Push the parent repo
+ * Isolated execution wrapper for new tests.
+ * Ensures graph is closed after use and strictly isolated via AsyncLocalStorage.
  */
+export async function runWithTestGraph<T>(callback: (graph: QuackGraph) => Promise<T>): Promise<T> {
+  const graph = new QuackGraph({
+    storage: ':memory:',
+    dbUrl: ':memory:',
+  });
 
-import { $ } from "bun";
+  // @ts-expect-error - Checking for potential init method
+  if (typeof graph.initialize === 'function') {
+    // @ts-expect-error
+    await graph.initialize();
+  }
 
-const INNER_REPO_PATH = "packages/quackgraph";
-const ROOT_DIR = import.meta.dir.replace("/scripts", "");
-
-interface GitStatus {
-    isDirty: boolean;
-    isAhead: boolean;
-    branch: string;
-}
-
-async function getGitStatus(cwd: string): Promise<GitStatus> {
-    try {
-        // Check for uncommitted changes
-        const statusResult = await $`git -C ${cwd} status --porcelain`.text();
-        const isDirty = statusResult.trim().length > 0;
-
-        // Get current branch
-        const branchResult = await $`git -C ${cwd} rev-parse --abbrev-ref HEAD`.text();
-        const branch = branchResult.trim();
-
-        // Check if ahead of remote
-        let isAhead = false;
-        try {
-            const aheadResult = await $`git -C ${cwd} rev-list --count @{upstream}..HEAD 2>/dev/null`.text();
-            isAhead = parseInt(aheadResult.trim(), 10) > 0;
-        } catch {
-            // No upstream configured, assume not ahead
-            isAhead = false;
-        }
-
-        return { isDirty, isAhead, branch };
-    } catch (error) {
-        console.error(`Error getting git status for ${cwd}:`, error);
-        throw error;
+  try {
+    return await runWithGraph(graph, async () => {
+      return await callback(graph);
+    });
+  } finally {
+    // @ts-expect-error
+    if (typeof graph.close === 'function') {
+      // @ts-expect-error
+      await graph.close();
     }
-}
-
-async function commitAndPush(cwd: string, message: string, repoName: string): Promise<boolean> {
-    const status = await getGitStatus(cwd);
-
-    console.log(`\n📦 [${repoName}] Status:`);
-    console.log(`   Branch: ${status.branch}`);
-    console.log(`   Dirty: ${status.isDirty}`);
-    console.log(`   Ahead of remote: ${status.isAhead}`);
-
-    if (!status.isDirty && !status.isAhead) {
-        console.log(`   ✅ Nothing to push for ${repoName}`);
-        return false;
-    }
-
-    if (status.isDirty) {
-        console.log(`\n   📝 Staging and committing changes in ${repoName}...`);
-        await $`git -C ${cwd} add -A`.quiet();
-        await $`git -C ${cwd} commit -m ${message}`.quiet();
-        console.log(`   ✅ Committed: "${message}"`);
-    }
-
-    console.log(`\n   🚀 Pushing ${repoName} to remote...`);
-    try {
-        await $`git -C ${cwd} push`.quiet();
-        console.log(`   ✅ Successfully pushed ${repoName}`);
-        return true;
-    } catch (error) {
-        console.error(`   ❌ Failed to push ${repoName}:`, error);
-        throw error;
-    }
-}
-
-async function syncRepos(): Promise<void> {
-    // Get commit message from args or use default
-    const args = process.argv.slice(2);
-    const commitMessage = args.join(" ") || `sync: ${new Date().toISOString()}`;
-
-    console.log("🔄 Git Sync - Federated Repository Push");
-    console.log("=========================================");
-    console.log(`📝 Commit message: "${commitMessage}"`);
-
-    const innerRepoPath = `${ROOT_DIR}/${INNER_REPO_PATH}`;
-
-    // Step 1: Handle inner repository (quackgraph core)
-    console.log("\n\n🔷 Step 1: Processing inner repository (quackgraph core)...");
-    try {
-        await commitAndPush(innerRepoPath, commitMessage, "quackgraph");
-    } catch (error) {
-        console.error("❌ Failed to sync inner repository");
-        throw error;
-    }
-
-    // Step 2: Handle parent repository (quackgraph-agent)
-    console.log("\n\n🔷 Step 2: Processing parent repository (quackgraph-agent)...");
-    try {
-        await commitAndPush(ROOT_DIR, commitMessage, "quackgraph-agent");
-    } catch (error) {
-        console.error("❌ Failed to sync parent repository");
-        throw error;
-    }
-
-    console.log("\n\n=========================================");
-    console.log("✅ Git sync completed successfully!");
-    console.log("=========================================\n");
-}
-
-// Run the sync
-syncRepos().catch((error) => {
-    console.error("\n❌ Sync failed:", error);
-    process.exit(1);
-});
-````
-
-## File: LICENSE
-````
-MIT License
-
-Copyright (c) 2025 quackgraph
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-````
-
-## File: relay.config.json
-````json
-{
-  "$schema": "https://relay.noca.pro/schema.json",
-  "projectId": "quackgraph-agent",
-  "core": {
-    "logLevel": "info",
-    "enableNotifications": false,
-    "watchConfig": false
-  },
-  "watcher": {
-    "clipboardPollInterval": 2000,
-    "preferredStrategy": "auto"
-  },
-  "patch": {
-    "approvalMode": "manual",
-    "approvalOnErrorCount": 0,
-    "linter": "",
-    "preCommand": "",
-    "postCommand": "",
-    "minFileChanges": 0
-  },
-  "git": {
-    "autoGitBranch": false,
-    "gitBranchPrefix": "relay/",
-    "gitBranchTemplate": "gitCommitMsg"
   }
 }
-````
-
-## File: tsconfig.json
-````json
-{
-    "compilerOptions": {
-        // Environment setup & latest features
-        "lib": [
-            "ESNext"
-        ],
-        "target": "ESNext",
-        "module": "Preserve",
-        "moduleDetection": "force",
-        "jsx": "react-jsx",
-        "allowJs": true,
-        // Bundler mode
-        "moduleResolution": "bundler",
-        "allowImportingTsExtensions": true,
-        "verbatimModuleSyntax": true,
-        "noEmit": true,
-        // Best practices
-        "strict": true,
-        "skipLibCheck": true,
-        "noFallthroughCasesInSwitch": true,
-        "noUncheckedIndexedAccess": true,
-        "noImplicitOverride": true,
-        // Some stricter flags (disabled by default)
-        "noUnusedLocals": false,
-        "noUnusedParameters": false,
-        "noPropertyAccessFromIndexSignature": false
-    },
-    "include": [
-        "packages/agent/src/**/*",
-        "packages/quackgraph/packages/*/src/**/*"
-    ]
-}
-````
-
-## File: packages/agent/src/mastra/agents/scribe-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-import { LibSQLStore } from '@mastra/libsql';
-import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
-import { config } from '../../lib/config';
-
-export const scribeAgent = new Agent({
-  name: 'Scribe Agent',
-  instructions: async ({ runtimeContext }) => {
-    const asOf = runtimeContext?.get('asOf') as number | undefined;
-    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
-
-    return `
-    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
-    Current System Time: ${timeStr}
-
-    Your Goal:
-    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
-
-    Rules:
-    1. **Entity Resolution First**: Never guess Node IDs. 
-       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
-       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
-    
-    2. **Temporal Grounding**:
-       - The graph requires ISO 8601 timestamps.
-       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
-       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
-
-    3. **Atomic Operations**:
-       - Output a list of operations that represent the full state change.
-       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
-
-    4. **Ambiguity**:
-       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
-  `;
-  },
-  model: {
-    id: config.agents.scribe.model.id,
-  },
-  memory: new Memory({
-    storage: new LibSQLStore({
-      url: ':memory:'
-    })
-  }),
-  tools: {
-    // Scribe needs to see before it writes
-    topologyScanTool,
-    contentRetrievalTool,
-    sectorScanTool
-  }
-});
 ````
 
 ## File: packages/agent/biome.json

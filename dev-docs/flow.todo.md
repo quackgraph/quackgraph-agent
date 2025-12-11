@@ -1,3 +1,8 @@
+
+is the external agent can see temporal evolution of the overall graph nodes edges relationship network?
+
+===
+
 I feel like labyrint doing too much on its own where mastra natively provide everything to implement like runtimeContext, worfklow, step, memory
 
 
