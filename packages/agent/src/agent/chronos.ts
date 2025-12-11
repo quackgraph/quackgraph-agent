@@ -91,10 +91,7 @@ export class Chronos {
 
     for (const ts of sortedTimes || []) {
       // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
-      const tsMs = ts.getTime();
-      console.log('[DEBUG Chronos] Query at timestamp:', ts.toISOString(), 'ms:', tsMs);
-      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], tsMs);
-      console.log('[DEBUG Chronos] Summary:', JSON.stringify(currentSummaryList));
+      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
       
       const currentSummary = new Map<string, number>();
       for (const s of currentSummaryList) {

@@ -77,53 +77,27 @@ describe("Integration: Chronos (Temporal Physics)", () => {
       const tools = new GraphTools(graph);
       const chronos = new Chronos(graph, tools);
 
-      const t1 = new Date("2024-01-01");
-      const t2 = new Date("2024-02-01");
-      const t3 = new Date("2024-03-01");
+      const t1 = new Date("2024-01-01T00:00:00Z");
+      const t2 = new Date("2024-02-01T00:00:00Z");
+      const t3 = new Date("2024-03-01T00:00:00Z");
 
       // @ts-expect-error
       await graph.addNode("anchor", ["Entity"], {});
       // @ts-expect-error
       await graph.addNode("target", ["Entity"], {});
 
-      // 1. Write T1 state (First)
-      await graph.addEdge("anchor", "target", "LINK", {}, { validFrom: t1 });
+      // 1. Write T1 state (First) - Edge valid from T1 to just after T1
+      await graph.addEdge("anchor", "target", "LINK", {}, { 
+        validFrom: t1, 
+        validTo: new Date(t1.getTime() + 1000) // Closed 1 second after T1
+      });
 
       // 2. Write T3 state (Second) - Jump to future
       // We simulate a change in T3. Let's say we add a NEW edge type.
       await graph.addEdge("anchor", "target", "FUTURE_LINK", {}, { validFrom: t3 });
 
-      // 3. Write T2 state (Last) - Backfill
-      // In T2, let's say the first LINK was closed.
-      // We manually simulate this by updating the T1 edge's valid_to to be before T2.
-      // But since we are "writing late", we execute a DB update.
-      // @ts-expect-error
-      await graph.db.execute(
-        "UPDATE edges SET valid_to = ? WHERE type = 'LINK'",
-        [new Date(t1.getTime() + 1000).toISOString()] // Ends right after T1
-      );
-
-      // Debug: Check what's in the database and convert to microseconds
-      // @ts-expect-error
-      const dbEdges = await graph.db.query(`
-        SELECT source, target, type, valid_from, valid_to,
-               date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from) as vf_micros,
-               date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to) as vt_micros
-        FROM edges ORDER BY valid_from
-      `);
-      console.log('[DEBUG] Edges in DB:');
-      for (const edge of dbEdges) {
-        console.log('  ', edge.type, 'vf_micros:', edge.vf_micros?.toString(), 'vt_micros:', edge.vt_micros?.toString());
-      }
-      console.log('[DEBUG] Native edge count:', graph.native.edgeCount);
-      console.log('[DEBUG] Native node count:', graph.native.nodeCount);
-      console.log('[DEBUG] T1 in milliseconds:', t1.getTime());
-      console.log('[DEBUG] T1 in microseconds:', t1.getTime() * 1000);
-      
       // Now request the diff in order: T1 -> T2 -> T3
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
-      
-      console.log('[DEBUG] Out-of-order test timeline:', JSON.stringify(result.timeline, null, 2));
       
       // T1 Snapshot: LINK exists
       const snap1 = result.timeline[0];
