@@ -24,13 +24,13 @@
   },
   "include": 
 [
-  "packages/agent/src/agent/chronos.ts",
-  "packages/agent/test/e2e/mutation.test.ts",
-  "packages/agent/test/utils/result-helper.ts",
-  "packages/agent/test/utils/synthetic-llm.ts",
-  "packages/quackgraph/crates/quack_core/src/topology.rs",
-  "packages/quackgraph/packages/quack-graph/src/schema.ts"
-],
+  "packages/quackgraph/packages/native/src/lib.rs",
+  "packages/quackgraph/packages/quack-graph/src/graph.ts",
+  "packages/quackgraph/test/integration/concurrency.test.ts",
+  "packages/quackgraph/test/integration/temporal.test.ts"
+]
+
+,
   "ignore": {
     "useGitignore": true,
     "useDefaultPatterns": true,
@@ -46,7 +46,7 @@
       "packages/quackgraph/.gitignore",
       "packages/quackgraph/tsconfig.tsbuildinfo",
 "packages/quackgraph/packages/quack-graph/dist",
-      "packages/quackgraph/test/",
+//      "packages/quackgraph/test/",
       "packages/quackgraph/test-docs/",
       "packages/quackgraph/test/e2e/",
       "packages/quackgraph/src",
