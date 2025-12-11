@@ -246,17 +246,26 @@ const speculativeTraversal = createStep({
             ${summaryList}
           `;
 
-          // Note: We inject runtimeContext here to ensure tools called by Scout respect "Time" and "Domain"
-          const res = await scout.generate(prompt, {
-            structuredOutput: { schema: ScoutDecisionSchema },
-            memory: {
-              thread: cursor.id,
-              resource: state.governance?.query || 'global-query'
-            },
-            // Pass "Ghost Earth" context to the agent runtime
-            // @ts-expect-error - Mastra experimental context injection
-            runtimeContext: { asOf: asOfTs, domain: domain }
-          });
+          // biome-ignore lint/suspicious/noExplicitAny: Agent result is loosely typed
+          let res: any;
+          try {
+            // Note: We inject runtimeContext here to ensure tools called by Scout respect "Time" and "Domain"
+            res = await scout.generate(prompt, {
+              structuredOutput: { schema: ScoutDecisionSchema },
+              memory: {
+                thread: cursor.id,
+                resource: state.governance?.query || 'global-query'
+              },
+              // Pass "Ghost Earth" context to the agent runtime
+              // @ts-expect-error - Mastra experimental context injection
+              runtimeContext: { asOf: asOfTs, domain: domain }
+            });
+          } catch (err) {
+             console.warn(`Thread ${cursor.id} agent generation failed:`, err);
+             deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
+             threadSpan?.end({ output: { error: 'agent_failure' } });
+             return;
+          }
 
           // @ts-expect-error usage tracking
           if (res.usage) tokensUsed += (res.usage.promptTokens || 0) + (res.usage.completionTokens || 0);

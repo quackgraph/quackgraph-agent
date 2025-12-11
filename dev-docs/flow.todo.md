@@ -1,3 +1,10 @@
+
+===
+
+agent should be able to freely perform complex querying and aggregation and custom duckdb operations
+
+===
+
 well db - memory sync should happen natively in core package/quackgraph without additional api to use by external, auto hydrate? on every direct duckdb change? without requiring anyone to call reload/hydrate, so should not be concern for packages/agent and everyone can modify db directly without any problem
 
 ===

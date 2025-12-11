@@ -6,6 +6,16 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { mastra } from "../../src/mastra/index";
 
+interface WorkflowResult {
+  artifact: {
+    answer: string;
+    confidence: number;
+    sources: string[];
+    traceId: string;
+    metadata?: unknown;
+  } | null;
+}
+
 describe("E2E: Labyrinth (Advanced)", () => {
   let llm: SyntheticLLM;
 
@@ -87,10 +97,11 @@ describe("E2E: Labyrinth (Advanced)", () => {
       });
 
       // @ts-expect-error
-      const artifact = res.results?.artifact;
+      const results = res.results as WorkflowResult;
+      const artifact = results?.artifact;
       
       expect(artifact).toBeDefined();
-      expect(artifact.sources).toContain("goal");
+      expect(artifact?.sources).toContain("goal");
 
       // We implicitly proved forking works because the "Primary" move was LEFT (Dead End),
       // but the agent found the goal via RIGHT (Alternative), which was only explored due to forking.

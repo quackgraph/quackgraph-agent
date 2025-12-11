@@ -5,6 +5,11 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { mastra } from "../../src/mastra/index";
 import { generateTimeSeries } from "../utils/generators";
 
+interface MetabolismResult {
+  success: boolean;
+  summary: string;
+}
+
 describe("E2E: Metabolism (The Dreaming Graph)", () => {
   let llm: SyntheticLLM;
 
@@ -38,7 +43,8 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
 
       // 4. Verify Success
       // @ts-expect-error
-      expect(res.results?.success).toBe(true);
+      const results = res.results as MetabolismResult;
+      expect(results?.success).toBe(true);
 
       // 5. Verify Physics (Graph State)
       // Old nodes should be gone (or disconnected/deleted)

@@ -20,8 +20,7 @@ describe("Unit: Chronos (Temporal Physics)", () => {
       await graph.addNode("target", ["Entity"], {});
 
       // T1: Edge exists
-      // @ts-expect-error
-      await graph.addEdge("anchor", "target", "CONN", {}, t1);
+      await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t1 });
 
       // T2: Edge removed (closed)
       // Simulating "CLOSE_EDGE" by setting valid_to manually in DB or via edge update
@@ -34,8 +33,7 @@ describe("Unit: Chronos (Temporal Physics)", () => {
       );
 
       // T3: Edge re-created (new instance)
-      // @ts-expect-error
-      await graph.addEdge("anchor", "target", "CONN", {}, t3);
+      await graph.addEdge("anchor", "target", "CONN", {}, { validFrom: t3 });
 
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
       
@@ -45,10 +43,12 @@ describe("Unit: Chronos (Temporal Physics)", () => {
       // Snapshot 2 (T2): Removed (Compared to T1)
       // At T2, the edge is invalid (closed), so count is 0. 
       // Diff logic: T1(1) vs T2(0) -> Removed
+      expect(result.timeline[1].removedEdges.length).toBeGreaterThan(0);
       expect(result.timeline[1].removedEdges[0].edgeType).toBe("CONN");
       
       // Snapshot 3 (T3): Added (Compared to T2)
       // T2(0) vs T3(1) -> Added
+      expect(result.timeline[2].addedEdges.length).toBeGreaterThan(0);
       expect(result.timeline[2].addedEdges[0].edgeType).toBe("CONN");
     });
   });

@@ -6,6 +6,13 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { mastra } from "../../src/mastra/index";
 
+interface LabyrinthResult {
+  artifact: {
+    answer: string;
+    sources: string[];
+  } | null;
+}
+
 describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
   let llm: SyntheticLLM;
 
@@ -85,10 +92,10 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       });
 
       // @ts-expect-error
-      const art2023 = res2023.results?.artifact;
+      const art2023 = (res2023.results as LabyrinthResult)?.artifact;
       expect(art2023).toBeDefined();
-      expect(art2023.answer).toContain("Alice");
-      expect(art2023.sources).toContain("alice");
+      expect(art2023?.answer).toContain("Alice");
+      expect(art2023?.sources).toContain("alice");
 
 
       // --- Execution 2: Query as of 2024 ---
@@ -102,10 +109,10 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       });
 
       // @ts-expect-error
-      const art2024 = res2024.results?.artifact;
+      const art2024 = (res2024.results as LabyrinthResult)?.artifact;
       expect(art2024).toBeDefined();
-      expect(art2024.answer).toContain("Bob");
-      expect(art2024.sources).toContain("bob");
+      expect(art2024?.answer).toContain("Bob");
+      expect(art2024?.sources).toContain("bob");
     });
   });
 });

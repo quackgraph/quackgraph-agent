@@ -41,7 +41,7 @@ const analyzeIntent = createStep({
     });
 
     const decision = res.object;
-    if (!decision) throw new Error("Scribe returned no decision");
+    if (!decision) throw new Error("Scribe returned no structured decision");
 
     return {
       operations: decision.operations,
@@ -70,6 +70,10 @@ const applyMutations = createStep({
 
     const graph = getGraphInstance();
     const ops = inputData.operations;
+
+    if (!ops || !Array.isArray(ops)) {
+        return { success: false, summary: "No operations returned by agent." };
+    }
     
     // Arrays for Batching
     // biome-ignore lint/suspicious/noExplicitAny: Batch types

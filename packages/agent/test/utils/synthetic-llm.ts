@@ -33,6 +33,7 @@ export class SyntheticLLM {
       // 1. Check for keyword matches
       for (const [key, val] of this.responses) {
         if (prompt.includes(key)) {
+          // Return a structured response that mimics Mastra's expected output
           return {
             text: JSON.stringify(val),
             object: val,
@@ -40,6 +41,9 @@ export class SyntheticLLM {
           };
         }
       }
+
+      // Log warning for debugging
+      console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 50)}...". Using default.`);
 
       // 2. Fallback
       return {

@@ -103,7 +103,10 @@ export class Labyrinth {
             // 3. Extract Result
             // @ts-expect-error - Result payload typing
             const artifact = result.results?.artifact as LabyrinthArtifact | null;
-            
+            if (!artifact && result.status === 'failed') {
+                 throw new Error(`Workflow failed: ${result.error?.message || 'Unknown error'}`);
+            }
+
             if (artifact) {
               // Sync traceId with the actual Run ID for retrievability
               // @ts-expect-error - runId access

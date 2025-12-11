@@ -1,9 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect } from "bun:test";
 import { Chronos } from "../../src/agent/chronos";
 import { GraphTools } from "../../src/tools/graph-tools";
 import { runWithTestGraph } from "../utils/test-graph";
 import { generateTimeSeries } from "../utils/generators";
-import type { QuackGraph } from "@quackgraph/graph";
 
 describe("Integration: Chronos (Temporal Physics)", () => {
   
@@ -42,7 +41,10 @@ describe("Integration: Chronos (Temporal Physics)", () => {
 
       // Connect them all
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_inside", "HAS_NOTE", {}, new Date(BASE_TIME + 15 * 60 * 1000));
+      await graph.addEdge("meeting", "note_inside", "HAS_NOTE", {}, { 
+        validFrom: new Date(BASE_TIME + 15 * 60 * 1000),
+        validTo: new Date(BASE_TIME + 45 * 60 * 1000) // Must end within window for DURING
+      });
       // @ts-expect-error
       await graph.addEdge("meeting", "note_before", "HAS_NOTE", {}, new Date(BASE_TIME - ONE_HOUR));
       // @ts-expect-error
@@ -85,13 +87,11 @@ describe("Integration: Chronos (Temporal Physics)", () => {
       await graph.addNode("target", ["Entity"], {});
 
       // 1. Write T1 state (First)
-      // @ts-expect-error
-      await graph.addEdge("anchor", "target", "LINK", {}, t1);
+      await graph.addEdge("anchor", "target", "LINK", {}, { validFrom: t1 });
 
       // 2. Write T3 state (Second) - Jump to future
       // We simulate a change in T3. Let's say we add a NEW edge type.
-      // @ts-expect-error
-      await graph.addEdge("anchor", "target", "FUTURE_LINK", {}, t3);
+      await graph.addEdge("anchor", "target", "FUTURE_LINK", {}, { validFrom: t3 });
 
       // 3. Write T2 state (Last) - Backfill
       // In T2, let's say the first LINK was closed.
@@ -105,7 +105,12 @@ describe("Integration: Chronos (Temporal Physics)", () => {
 
       // Manually sync native graph (since we bypassed addEdge/removeEdge)
       graph.native.removeEdge("anchor", "target", "LINK");
-      // Note: We don't need to re-add it for T2 view because it's effectively gone in T2.
+      
+      // Fix: We MUST re-add the edge with the closed validity window so that T1 queries (historical) 
+      // can still find it. removeEdge deletes it entirely from RAM.
+      const vf = t1.getTime() * 1000;
+      const vt = (t1.getTime() + 1000) * 1000;
+      graph.native.addEdge("anchor", "target", "LINK", vf, vt, 0);
 
       // Now request the diff in order: T1 -> T2 -> T3
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);

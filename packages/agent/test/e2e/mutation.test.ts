@@ -4,6 +4,12 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
 import { mastra } from "../../src/mastra/index";
 import type { QuackGraph } from "@quackgraph/graph";
+import { z } from "zod";
+
+const MutationResultSchema = z.object({
+  success: z.boolean(),
+  summary: z.string()
+});
 
 describe("E2E: Mutation Workflow (The Scribe)", () => {
   let graph: QuackGraph;
@@ -21,7 +27,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
   afterEach(async () => {
     // @ts-expect-error
-    if (typeof graph.close === 'function') await graph.close();
+    if (graph && typeof graph.close === 'function') await graph.close();
   });
 
   it("Scenario: Create Node ('Create a user named Bob')", async () => {
@@ -50,10 +56,16 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 3. Verify Result
-    // @ts-expect-error
-    expect(result.results?.success).toBe(true);
-    // @ts-expect-error
-    expect(result.results?.summary).toContain("Created Node bob_1");
+    // @ts-expect-error - Mastra generic return type
+    const rawResults = result.results;
+    
+    const parsed = MutationResultSchema.safeParse(rawResults);
+    if (!parsed.success) {
+      throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
+    }
+    
+    expect(parsed.data.success).toBe(true);
+    expect(parsed.data.summary).toContain("Created Node bob_1");
 
     // 4. Verify Side Effects (Graph Physics)
     const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
@@ -96,7 +108,13 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    expect(result.results?.success).toBe(true);
+    const rawResults = result.results;
+    const parsed = MutationResultSchema.safeParse(rawResults);
+    if (!parsed.success) {
+      throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
+    }
+
+    expect(parsed.data.success).toBe(true);
 
     // 4. Verify Side Effects (Time Travel)
     // The edge should still exist physically but have a valid_to set
@@ -136,11 +154,13 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    expect(result.results?.success).toBe(false);
-    // @ts-expect-error
-    expect(result.results?.summary).toContain("Clarification needed");
-    // @ts-expect-error
-    expect(result.results?.summary).toContain("The Ford or the Chevy");
+    const rawResults = result.results;
+    const parsed = MutationResultSchema.safeParse(rawResults);
+    if (!parsed.success) throw new Error("Invalid Result");
+
+    expect(parsed.data.success).toBe(false);
+    expect(parsed.data.summary).toContain("Clarification needed");
+    expect(parsed.data.summary).toContain("The Ford or the Chevy");
 
     // 4. Verify Safety (No deletes happened)
     const cars = await graph.match([]).where({ labels: ["Car"] }).select();
