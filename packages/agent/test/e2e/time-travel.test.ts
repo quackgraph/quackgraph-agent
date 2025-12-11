@@ -18,9 +18,10 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(scoutAgent);
-    llm.mockAgent(judgeAgent);
-    llm.mockAgent(routerAgent);
+    // Safe defaults
+    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
+    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
+    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
   });
 
   it("returns different answers for 2023 vs 2024 contexts", async () => {
@@ -67,7 +68,11 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
         action: "MOVE",
         edgeType: "MANAGED_BY",
         confidence: 0.9,
-        reasoning: "Following management chain"
+        reasoning: "Following management chain",
+        // Safety fields for other agents (Router/Judge) if they fall back
+        domain: "global",
+        isAnswer: false,
+        answer: "Fallback"
       });
 
       // Special case: If at Alice or Bob, Check for answer
@@ -92,6 +97,9 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       });
 
       // @ts-expect-error
+      if (res2023.status === "failed") throw new Error(`Workflow failed: ${res2023.error?.message}`);
+
+      // @ts-expect-error
       const art2023 = (res2023.results as LabyrinthResult)?.artifact;
       expect(art2023).toBeDefined();
       expect(art2023?.answer).toContain("Alice");
@@ -107,6 +115,9 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
           timeContext: { asOf: new Date("2024-06-15").getTime() }
         }
       });
+
+      // @ts-expect-error
+      if (res2024.status === "failed") throw new Error(`Workflow failed: ${res2024.error?.message}`);
 
       // @ts-expect-error
       const art2024 = (res2024.results as LabyrinthResult)?.artifact;

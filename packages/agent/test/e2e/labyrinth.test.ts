@@ -14,9 +14,10 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(scoutAgent);
-    llm.mockAgent(judgeAgent);
-    llm.mockAgent(routerAgent);
+    // Providing safe defaults for each agent type to pass Zod schemas
+    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
+    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
+    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
   });
 
   beforeEach(async () => {

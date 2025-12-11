@@ -9,7 +9,7 @@ describe("E2E: Scribe (Complex Mutations)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(scribeAgent);
+    llm.mockAgent(scribeAgent, { operations: [], reasoning: "Default", requiresClarification: undefined });
   });
 
   it("Halts on Ambiguity ('Delete the blue car')", async () => {
@@ -31,6 +31,9 @@ describe("E2E: Scribe (Complex Mutations)", () => {
       const res = await run.start({
         inputData: { query: "Delete the blue car" }
       });
+
+      // @ts-expect-error
+      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // @ts-expect-error
       expect(res.results?.success).toBe(false);
@@ -70,8 +73,11 @@ describe("E2E: Scribe (Complex Mutations)", () => {
       });
 
       const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
-      await run.start({ inputData: { query: "I sold the bike yesterday" } });
+      const res = await run.start({ inputData: { query: "I sold the bike yesterday" } });
 
+      // @ts-expect-error
+      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
+      
       // Verify Physics: Edge should not exist in "Present" view
       // traverse() defaults to now()
       const currentItems = await graph.native.traverse(["me"], "OWNS", "out");

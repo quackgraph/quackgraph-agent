@@ -20,8 +20,8 @@ export class GraphTools {
       ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
     }
     
-    // Convert ms to microseconds for Native Rust layer
-    return ms !== undefined ? ms * 1000 : undefined;
+    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally
+    return ms;
   }
 
   /**

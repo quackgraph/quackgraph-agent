@@ -7,7 +7,28 @@ import type { Agent } from "@mastra/core/agent";
  */
 export class SyntheticLLM {
   private responses: Map<string, object> = new Map();
-  private defaultResponse: object = { error: "No matching synthetic response configured" };
+  
+  // A "God Object" default that satisfies Scout, Judge, Router, and Scribe schemas
+  // to prevent Zod validation errors during test fallbacks.
+  private globalDefault: object = { 
+    // Scout (Action Union)
+    action: "ABORT",
+    
+    // Router
+    domain: "global",
+    
+    // Judge
+    isAnswer: false,
+    answer: "Synthetic Fallback",
+    
+    // Scribe
+    operations: [],
+    requiresClarification: undefined,
+
+    // Common
+    confidence: 0.0,
+    reasoning: "No matching synthetic response configured (Fallback)." 
+  };
 
   /**
    * Register a response trigger.
@@ -19,14 +40,16 @@ export class SyntheticLLM {
   }
 
   setDefault(response: object) {
-    this.defaultResponse = response;
+    this.globalDefault = response;
   }
 
   /**
    * Hijacks the `generate` method of a Mastra agent to return synthetic data.
+   * @param agent The agent to mock
+   * @param agentDefault Optional default response specific to this agent
    */
   // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
-  mockAgent(agent: Agent<any, any, any>) {
+  mockAgent(agent: Agent<any, any, any>, agentDefault?: object) {
     // @ts-expect-error - Overwriting the generate method for testing
     // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
     agent.generate = mock(async (prompt: string, _options?: any) => {
@@ -42,13 +65,16 @@ export class SyntheticLLM {
         }
       }
 
-      // Log warning for debugging
-      console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 50)}...". Using default.`);
-
       // 2. Fallback
+      // Use agent-specific default if provided, otherwise global default
+      const fallback = agentDefault || this.globalDefault;
+
+      // Log warning for debugging
+      // console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 50)}...". Using default.`);
+
       return {
-        text: JSON.stringify(this.defaultResponse),
-        object: this.defaultResponse,
+        text: JSON.stringify(fallback),
+        object: fallback,
         usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       };
     });

@@ -108,8 +108,9 @@ describe("Integration: Chronos (Temporal Physics)", () => {
       
       // Fix: We MUST re-add the edge with the closed validity window so that T1 queries (historical) 
       // can still find it. removeEdge deletes it entirely from RAM.
-      const vf = t1.getTime() * 1000;
-      const vt = (t1.getTime() + 1000) * 1000;
+      // Native expects MILLISECONDS (f64), it will multiply to micros internally.
+      const vf = t1.getTime();
+      const vt = (t1.getTime() + 1000);
       graph.native.addEdge("anchor", "target", "LINK", vf, vt, 0);
 
       // Now request the diff in order: T1 -> T2 -> T3

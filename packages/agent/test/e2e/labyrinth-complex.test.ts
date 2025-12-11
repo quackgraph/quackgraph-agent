@@ -21,9 +21,10 @@ describe("E2E: Labyrinth (Advanced)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(scoutAgent);
-    llm.mockAgent(judgeAgent);
-    llm.mockAgent(routerAgent);
+    // Safe defaults
+    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
+    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
+    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
   });
 
   // Default Router Response
@@ -97,6 +98,9 @@ describe("E2E: Labyrinth (Advanced)", () => {
       });
 
       // @ts-expect-error
+      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
+
+      // @ts-expect-error
       const results = res.results as WorkflowResult;
       const artifact = results?.artifact;
       
@@ -125,9 +129,12 @@ describe("E2E: Labyrinth (Advanced)", () => {
       llm.addResponse(`Goal: Heat`, { isAnswer: true, answer: "Done", confidence: 1.0 });
 
       const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      await run.start({
+      const res = await run.start({
           inputData: { goal: "Heat", start: "s1" }
       });
+
+      // @ts-expect-error
+      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // Verify Heat Increase
       // Note: In a real integration test we'd check the native graph store.

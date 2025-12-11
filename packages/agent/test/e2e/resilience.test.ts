@@ -11,9 +11,10 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(scoutAgent);
-    llm.mockAgent(judgeAgent);
-    llm.mockAgent(routerAgent);
+    // Safe defaults
+    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
+    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
+    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
   });
 
   it("handles Brain Damage (Malformed JSON from Scout)", async () => {

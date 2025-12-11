@@ -257,9 +257,8 @@ const speculativeTraversal = createStep({
                 resource: state.governance?.query || 'global-query'
               },
               // Pass "Ghost Earth" context to the agent runtime
-              // @ts-expect-error - Mastra experimental context injection
-              runtimeContext: { asOf: asOfTs, domain: domain }
-            });
+              runtimeContext: new Map([['asOf', asOfTs], ['domain', domain]])
+            } as any);
           } catch (err) {
              console.warn(`Thread ${cursor.id} agent generation failed:`, err);
              deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
@@ -267,7 +266,6 @@ const speculativeTraversal = createStep({
              return;
           }
 
-          // @ts-expect-error usage tracking
           if (res.usage) tokensUsed += (res.usage.promptTokens || 0) + (res.usage.completionTokens || 0);
 
           const decision = res.object;

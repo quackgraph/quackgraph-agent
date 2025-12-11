@@ -46,18 +46,18 @@ export class Chronos {
 
     const sql = `
       WITH Anchor AS (
-        SELECT valid_from as t_anchor 
+        SELECT valid_from::TIMESTAMPTZ as t_anchor 
         FROM nodes 
         WHERE id = ?
       ),
       Targets AS (
-        SELECT id, valid_from as t_target 
+        SELECT id, valid_from::TIMESTAMPTZ as t_target 
         FROM nodes 
         WHERE list_contains(labels, ?)
       )
       SELECT count(*) as count
       FROM Targets, Anchor
-      WHERE t_target >= (t_anchor - INTERVAL ${windowMinutes} MINUTE)
+      WHERE t_target >= (t_anchor - (INTERVAL 1 MINUTE * ${Math.floor(windowMinutes)}))
         AND t_target <= t_anchor
     `;
 

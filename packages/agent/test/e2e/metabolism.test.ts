@@ -15,7 +15,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
 
   beforeAll(() => {
     llm = new SyntheticLLM();
-    llm.mockAgent(judgeAgent);
+    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
   });
 
   it("Digests raw logs into a summary node", async () => {
@@ -40,6 +40,9 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
           targetLabel: "Event" // Matching generator label
         }
       });
+
+      // @ts-expect-error
+      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // 4. Verify Success
       // @ts-expect-error

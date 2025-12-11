@@ -18,7 +18,8 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
   beforeAll(() => {
     llm = new SyntheticLLM();
     // Hijack the singleton scribe agent
-    llm.mockAgent(scribeAgent);
+    // Scribe schema requires operations array
+    llm.mockAgent(scribeAgent, { operations: [], reasoning: "Default", requiresClarification: undefined });
   });
 
   beforeEach(async () => {
@@ -54,6 +55,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
         asOf: new Date("2024-01-01").getTime()
       }
     });
+
+    // @ts-expect-error
+    if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify Result
     // @ts-expect-error - Mastra generic return type
@@ -106,6 +110,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
       }
     });
 
+    // @ts-expect-error
+    if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
+
     // 3. Verify
     // @ts-expect-error
     const rawResults = result.results;
@@ -151,6 +158,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
         userId: "admin"
       }
     });
+
+    // @ts-expect-error
+    if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify
     // @ts-expect-error
