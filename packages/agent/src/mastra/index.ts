@@ -8,6 +8,7 @@ import { scribeAgent } from './agents/scribe-agent';
 import { metabolismWorkflow } from './workflows/metabolism-workflow';
 import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
 import { mutationWorkflow } from './workflows/mutation-workflow';
+import { config } from '../lib/config';
 
 export const mastra = new Mastra({
   agents: { scoutAgent, judgeAgent, routerAgent, scribeAgent },
@@ -25,7 +26,7 @@ export const mastra = new Mastra({
     },
   },
   server: {
-    port: 4111,
+    port: config.server.port,
     cors: {
       origin: '*',
       allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

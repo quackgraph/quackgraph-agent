@@ -1,6 +1,7 @@
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
+import { config } from '../../lib/config';
 
 export const routerAgent = new Agent({
   name: 'Router Agent',
@@ -19,7 +20,7 @@ export const routerAgent = new Agent({
   `;
   },
   model: {
-    id: 'groq/llama-3.3-70b-versatile',
+    id: config.agents.router.model.id,
   },
   memory: new Memory({
     storage: new LibSQLStore({

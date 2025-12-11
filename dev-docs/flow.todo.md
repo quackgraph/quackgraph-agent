@@ -25,7 +25,7 @@ judge agent and router agent has no tools?
 
 ===
 
-I want highly configurable mastra .env also with super granular model
+I want highly configurable mastra .env also with super granular model also at root should be there script to run mastra dev
 
 ===
 

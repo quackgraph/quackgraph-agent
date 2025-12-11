@@ -16,7 +16,6 @@ const analyzeIntent = createStep({
   id: 'analyze-intent',
   inputSchema: MutationInputSchema,
   outputSchema: z.object({
-    // biome-ignore lint/suspicious/noExplicitAny: Raw JSON ops from Scribe
     operations: z.array(z.any()),
     reasoning: z.string(),
     requiresClarification: z.string().optional()
@@ -56,7 +55,6 @@ const analyzeIntent = createStep({
 const applyMutations = createStep({
   id: 'apply-mutations',
   inputSchema: z.object({
-    // biome-ignore lint/suspicious/noExplicitAny: Raw JSON ops
     operations: z.array(z.any()),
     reasoning: z.string(),
     requiresClarification: z.string().optional()

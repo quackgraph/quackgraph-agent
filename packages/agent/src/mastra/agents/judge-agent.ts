@@ -1,6 +1,7 @@
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
+import { config } from '../../lib/config';
 
 export const judgeAgent = new Agent({
   name: 'Judge Agent',
@@ -21,7 +22,7 @@ export const judgeAgent = new Agent({
   `;
   },
   model: {
-    id: 'groq/llama-3.3-70b-versatile',
+    id: config.agents.judge.model.id,
   },
   memory: new Memory({
     storage: new LibSQLStore({

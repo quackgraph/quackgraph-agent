@@ -2,6 +2,7 @@ import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
 import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
+import { config } from '../../lib/config';
 
 export const scribeAgent = new Agent({
   name: 'Scribe Agent',
@@ -35,7 +36,7 @@ export const scribeAgent = new Agent({
   `;
   },
   model: {
-    id: 'groq/llama-3.3-70b-versatile',
+    id: config.agents.scribe.model.id,
   },
   memory: new Memory({
     storage: new LibSQLStore({
