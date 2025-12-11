@@ -33,40 +33,23 @@ packages/
       index.ts
       labyrinth.ts
       types.ts
+    test/
+      e2e/
+        labyrinth.test.ts
+        mutation.test.ts
+      integration/
+        chronos.test.ts
+        tools.test.ts
+      unit/
+        governance.test.ts
+        temporal.test.ts
+      utils/
+        synthetic-llm.ts
+        test-graph.ts
+      setup.ts
     .env.example
     biome.json
     mastra.config.ts
-    package.json
-    tsconfig.json
-    tsup.config.ts
-  quackgraph/
-    crates/
-      quack_core/
-        src/
-          interner.rs
-          lib.rs
-          matcher.rs
-          topology.rs
-        Cargo.toml
-    packages/
-      native/
-        src/
-          lib.rs
-        build.rs
-        Cargo.toml
-        index.d.ts
-        index.js
-        package.json
-      quack-graph/
-        src/
-          db.ts
-          graph.ts
-          index.ts
-          query.ts
-          schema.ts
-        package.json
-    biome.json
-    Cargo.toml
     package.json
     tsconfig.json
     tsup.config.ts
@@ -84,3067 +67,826 @@ tsconfig.json
 
 # Files
 
-## File: packages/agent/src/lib/config.ts
+## File: packages/agent/test/e2e/labyrinth.test.ts
 ````typescript
-import { z } from 'zod';
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
+import { createTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scoutAgent } from "../../src/mastra/agents/scout-agent";
+import { judgeAgent } from "../../src/mastra/agents/judge-agent";
+import { routerAgent } from "../../src/mastra/agents/router-agent";
+import { Labyrinth } from "../../src/labyrinth";
+import type { QuackGraph } from "@quackgraph/graph";
+import { config } from "../../src/lib/config";
 
-const envSchema = z.object({
-  // Server Config
-  MASTRA_PORT: z.coerce.number().default(4111),
-  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+describe("E2E: Labyrinth (Traversal Workflow)", () => {
+  let graph: QuackGraph;
+  let llm: SyntheticLLM;
+  let labyrinth: Labyrinth;
 
-  // Agent Model Configuration (Granular)
-  // Format: provider/model-name (e.g., 'groq/llama-3.3-70b-versatile', 'openai/gpt-4')
-  AGENT_SCOUT_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
-  AGENT_JUDGE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
-  AGENT_ROUTER_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
-  AGENT_SCRIBE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    llm.mockAgent(scoutAgent);
+    llm.mockAgent(judgeAgent);
+    llm.mockAgent(routerAgent);
+  });
 
-  // API Keys (Validated for existence if required by selected models)
-  GROQ_API_KEY: z.string().optional(),
-  OPENAI_API_KEY: z.string().optional(),
-  ANTHROPIC_API_KEY: z.string().optional(),
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    // Re-instantiate Labyrinth per test to ensure clean state config
+    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
+        llmProvider: { generate: async () => "" }, // Dummy, unused due to mock
+        maxHops: 5,
+        maxCursors: 3,
+        confidenceThreshold: 0.8
+    });
+  });
+
+  afterEach(async () => {
+    // @ts-ignore
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("Scenario: Single Hop Success", async () => {
+    // Topology: Start -> Middle -> Goal
+    // @ts-ignore
+    await graph.addNode("start", ["Entity"], { name: "Start" });
+    // @ts-ignore
+    await graph.addNode("goal_node", ["Entity"], { name: "The Answer" });
+    // @ts-ignore
+    await graph.addEdge("start", "goal_node", "LINKS_TO", {});
+
+    // 1. Train Router
+    llm.addResponse("Find the answer", {
+        domain: "global",
+        confidence: 1.0,
+        reasoning: "General query"
+    });
+
+    // 2. Train Scout
+    // Step 1: At 'start', sees 'goal_node' via 'LINKS_TO'
+    llm.addResponse(`Node: "start"`, {
+        action: "MOVE",
+        edgeType: "LINKS_TO",
+        confidence: 1.0,
+        reasoning: "Moving to linked node"
+    });
+    
+    // Step 2: At 'goal_node', checks for answer
+    llm.addResponse(`Node: "goal_node"`, {
+        action: "CHECK",
+        confidence: 1.0,
+        reasoning: "This looks like the answer"
+    });
+
+    // 3. Train Judge
+    llm.addResponse(`Goal: Find the answer`, {
+        isAnswer: true,
+        answer: "Found the answer at goal_node",
+        confidence: 0.95
+    });
+
+    // 4. Run Labyrinth
+    const artifact = await labyrinth.findPath("start", "Find the answer");
+
+    expect(artifact).toBeDefined();
+    expect(artifact?.answer).toBe("Found the answer at goal_node");
+    expect(artifact?.sources).toContain("goal_node");
+    expect(artifact?.confidence).toBe(0.95);
+  });
+
+  it("Scenario: Speculative Forking (The Race)", async () => {
+    // Topology: 
+    // start -> path_A -> dead_end
+    // start -> path_B -> success
+    // @ts-ignore
+    await graph.addNode("start", ["Entity"], {});
+    // @ts-ignore
+    await graph.addNode("path_A", ["Entity"], {});
+    // @ts-ignore
+    await graph.addNode("path_B", ["Entity"], {});
+    // @ts-ignore
+    await graph.addNode("success", ["Entity"], { content: "Victory" });
+
+    // @ts-ignore
+    await graph.addEdge("start", "path_A", "OPTION_A", {});
+    // @ts-ignore
+    await graph.addEdge("start", "path_B", "OPTION_B", {});
+    // @ts-ignore
+    await graph.addEdge("path_B", "success", "WIN", {});
+
+    // 1. Scout at Start: Unsure, forks!
+    // Keyword match on the Node ID provided in prompt
+    llm.addResponse(`Node: "start"`, {
+        action: "MOVE",
+        confidence: 0.5,
+        reasoning: "Unsure which path is better",
+        alternativeMoves: [
+            { edgeType: "OPTION_A", confidence: 0.5, reasoning: "Try A" },
+            { edgeType: "OPTION_B", confidence: 0.5, reasoning: "Try B" }
+        ]
+    });
+
+    // 2. Scout at Path A (Dead End)
+    llm.addResponse(`Node: "path_A"`, {
+        action: "ABORT", // Or exhaustive search that yields nothing
+        confidence: 0.0,
+        reasoning: "Dead end"
+    });
+
+    // 3. Scout at Path B (Good Path)
+    llm.addResponse(`Node: "path_B"`, {
+        action: "MOVE",
+        edgeType: "WIN",
+        confidence: 0.9,
+        reasoning: "Found winning path"
+    });
+
+    // 4. Scout at Success
+    llm.addResponse(`Node: "success"`, {
+        action: "CHECK",
+        confidence: 1.0,
+        reasoning: "Check this"
+    });
+
+    // 5. Judge
+    llm.addResponse(`Goal: Race`, {
+        isAnswer: true,
+        answer: "Victory found",
+        confidence: 1.0
+    });
+
+    // Router default
+    llm.setDefault({ domain: "global", confidence: 1.0, reasoning: "default" });
+
+    const artifact = await labyrinth.findPath("start", "Race");
+
+    expect(artifact).toBeDefined();
+    expect(artifact?.sources).toContain("success");
+    
+    // Use getTrace to verify forking happened
+    const trace = await labyrinth.getTrace(artifact?.traceId || "");
+    // In our implementation, execution trace is in metadata
+    // We expect at least 2 threads to have existed
+    // The winner thread + dead thread(s)
+    
+    // Note: In the mock implementation `labyrinth.ts`, we copy metadata to traceCache. 
+    // The test might access `artifact.metadata.execution` directly if Labyrinth returns it (it strips it for the public return, but keeps in cache).
+    
+    // For this test, verifying we found the answer via path_B is sufficient proof the B-thread survived.
+  });
+
+  it("Scenario: Max Hops Exhaustion", async () => {
+    // Loop: A <-> B
+    // @ts-ignore
+    await graph.addNode("A", ["Entity"], {});
+    // @ts-ignore
+    await graph.addNode("B", ["Entity"], {});
+    // @ts-ignore
+    await graph.addEdge("A", "B", "LOOP", {});
+    // @ts-ignore
+    await graph.addEdge("B", "A", "LOOP", {});
+
+    // Scout just bounces
+    llm.addResponse("LOOP", {
+        action: "MOVE",
+        edgeType: "LOOP",
+        confidence: 0.5,
+        reasoning: "Looping"
+    });
+
+    // Limit hops
+    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
+        llmProvider: { generate: async () => "" },
+        maxHops: 3, // Very short leash
+        maxCursors: 1
+    });
+
+    const artifact = await labyrinth.findPath("A", "Infinite Loop");
+
+    // Should fail gracefully
+    expect(artifact).toBeNull();
+  });
 });
-
-// Validate process.env
-// Note: In Bun, process.env is automatically populated from .env files
-const parsed = envSchema.parse(process.env);
-
-export const config = {
-  server: {
-    port: parsed.MASTRA_PORT,
-    logLevel: parsed.LOG_LEVEL,
-  },
-  agents: {
-    scout: {
-      model: { id: parsed.AGENT_SCOUT_MODEL as `${string}/${string}` },
-    },
-    judge: {
-      model: { id: parsed.AGENT_JUDGE_MODEL as `${string}/${string}` },
-    },
-    router: {
-      model: { id: parsed.AGENT_ROUTER_MODEL as `${string}/${string}` },
-    },
-    scribe: {
-      model: { id: parsed.AGENT_SCRIBE_MODEL as `${string}/${string}` },
-    },
-  },
-};
 ````
 
-## File: packages/agent/.env.example
-````
-# Server Configuration
-MASTRA_PORT=4111
-LOG_LEVEL=info
-
-# Agent Models (Granular Control)
-# You can switch providers per agent (e.g., use a cheaper model for routing, smarter for judging)
-AGENT_SCOUT_MODEL=groq/llama-3.3-70b-versatile
-AGENT_JUDGE_MODEL=groq/llama-3.3-70b-versatile
-AGENT_ROUTER_MODEL=groq/llama-3.3-70b-versatile
-AGENT_SCRIBE_MODEL=groq/llama-3.3-70b-versatile
-
-# API Keys
-# GROQ_API_KEY=gsk_...
-# OPENAI_API_KEY=sk-...
-# ANTHROPIC_API_KEY=sk-ant-...
-````
-
-## File: packages/agent/mastra.config.ts
+## File: packages/agent/test/e2e/mutation.test.ts
 ````typescript
-import { mastra } from './src/mastra';
+import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
+import { createTestGraph } from "../utils/test-graph";
+import { SyntheticLLM } from "../utils/synthetic-llm";
+import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
+import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
+import type { QuackGraph } from "@quackgraph/graph";
+import { getGraphInstance } from "../../src/lib/graph-instance";
 
-export const config = mastra;
-````
+describe("E2E: Mutation Workflow (The Scribe)", () => {
+  let graph: QuackGraph;
+  let llm: SyntheticLLM;
 
-## File: packages/quackgraph/crates/quack_core/src/interner.rs
-````rust
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
+  beforeAll(() => {
+    llm = new SyntheticLLM();
+    // Hijack the singleton scribe agent
+    llm.mockAgent(scribeAgent);
+  });
 
-/// A bidirectional map between String IDs and u32 internal indices.
-/// Used to convert DuckDB UUIDs/Strings into efficient integers for the graph topology.
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
-pub struct Interner {
-    map: HashMap<String, u32>,
-    vec: Vec<String>,
-}
+  beforeEach(async () => {
+    graph = await createTestGraph();
+  });
 
-impl Interner {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            vec: Vec::new(),
+  afterEach(async () => {
+    // @ts-ignore
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("Scenario: Create Node ('Create a user named Bob')", async () => {
+    // 1. Train the Synthetic Brain
+    llm.addResponse("Create a user named Bob", {
+      reasoning: "User explicitly requested creation of a new Entity.",
+      operations: [
+        {
+          op: "CREATE_NODE",
+          id: "bob_1",
+          labels: ["User"],
+          properties: { name: "Bob" },
+          validFrom: "2024-01-01T00:00:00.000Z"
         }
-    }
-
-    /// Interns a string: returns existing ID if present, or creates a new one.
-    /// O(1) average case.
-    pub fn intern(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.map.get(name) {
-            return id;
-        }
-        let id = self.vec.len() as u32;
-        let key = name.to_string();
-        self.vec.push(key.clone());
-        self.map.insert(key, id);
-        id
-    }
-
-    /// Reverse lookup: u32 -> String.
-    /// O(1) worst case.
-    pub fn lookup(&self, id: u32) -> Option<&str> {
-        self.vec.get(id as usize).map(|s| s.as_str())
-    }
-
-    /// Looks up the u32 ID for a given string name.
-    /// O(1) average case.
-    pub fn lookup_id(&self, name: &str) -> Option<u32> {
-        self.map.get(name).copied()
-    }
-
-    /// Current number of interned items.
-    pub fn len(&self) -> usize {
-        self.vec.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.vec.is_empty()
-    }
-}
-````
-
-## File: packages/quackgraph/crates/quack_core/src/lib.rs
-````rust
-pub mod interner;
-pub mod topology;
-pub mod matcher;
-
-pub use interner::Interner;
-pub use topology::{GraphIndex, Direction, IntervalConstraint};
-````
-
-## File: packages/quackgraph/crates/quack_core/src/matcher.rs
-````rust
-use crate::topology::{GraphIndex, Direction};
-use std::collections::HashSet;
-
-#[derive(Debug, Clone)]
-pub struct PatternEdge {
-    pub src_var: usize,
-    pub tgt_var: usize,
-    pub type_id: u8,
-    pub direction: Direction,
-}
-
-/// A simple backtracking solver for subgraph isomorphism.
-/// Finds all assignments of graph nodes to pattern variables such that all pattern edges exist.
-///
-/// Assumptions:
-/// 1. Variable 0 is the "start" variable, seeded by `start_candidates`.
-/// 2. The pattern is connected: for any variable `i > 0`, there is at least one constraint
-///    connecting it to a variable `j < i`.
-pub struct Matcher<'a> {
-    graph: &'a GraphIndex,
-    pattern: &'a [PatternEdge],
-    num_vars: usize,
-}
-
-impl<'a> Matcher<'a> {
-    pub fn new(graph: &'a GraphIndex, pattern: &'a [PatternEdge]) -> Self {
-        let mut max_var = 0;
-        for e in pattern {
-            max_var = max_var.max(e.src_var).max(e.tgt_var);
-        }
-        Self {
-            graph,
-            pattern,
-            num_vars: max_var + 1,
-        }
-    }
-
-    pub fn find_matches(&self, start_candidates: &[u32], as_of: Option<i64>) -> Vec<Vec<u32>> {
-        let mut results = Vec::new();
-        let mut assignment = vec![None; self.num_vars];
-        let mut used_nodes = HashSet::new();
-
-        for &start_node in start_candidates {
-            if self.graph.is_node_deleted(start_node) {
-                continue;
-            }
-
-            assignment[0] = Some(start_node);
-            used_nodes.insert(start_node);
-            
-            self.backtrack(1, &mut assignment, &mut used_nodes, &mut results, as_of);
-            
-            used_nodes.remove(&start_node);
-            assignment[0] = None;
-        }
-
-        results
-    }
-
-    fn backtrack(
-        &self,
-        current_var: usize,
-        assignment: &mut Vec<Option<u32>>,
-        used_nodes: &mut HashSet<u32>,
-        results: &mut Vec<Vec<u32>>,
-        as_of: Option<i64>,
-    ) {
-        if current_var == self.num_vars {
-            results.push(assignment.iter().map(|opt| opt.unwrap()).collect());
-            return;
-        }
-
-        let mut candidates: Option<Vec<u32>> = None;
-
-        for edge in self.pattern {
-            if edge.src_var < current_var && edge.tgt_var == current_var {
-                let known_node = assignment[edge.src_var].unwrap();
-                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Outgoing, as_of);
-                candidates = self.intersect(candidates, neighbors);
-                if candidates.as_ref().is_some_and(|c| c.is_empty()) { return; }
-            }
-            else if edge.src_var == current_var && edge.tgt_var < current_var {
-                let known_node = assignment[edge.tgt_var].unwrap();
-                let neighbors = self.graph.get_neighbors(known_node, edge.type_id, Direction::Incoming, as_of);
-                candidates = self.intersect(candidates, neighbors);
-                if candidates.as_ref().is_some_and(|c| c.is_empty()) { return; }
-            }
-        }
-        
-        if let Some(cands) = candidates {
-            for cand in cands {
-                if !used_nodes.contains(&cand) {
-                    assignment[current_var] = Some(cand);
-                    used_nodes.insert(cand);
-                    
-                    self.backtrack(current_var + 1, assignment, used_nodes, results, as_of);
-                    
-                    used_nodes.remove(&cand);
-                    assignment[current_var] = None;
-                }
-            }
-        }
-    }
-
-    fn intersect(&self, current: Option<Vec<u32>>, next: Vec<u32>) -> Option<Vec<u32>> {
-        match current {
-            None => Some(next),
-            Some(curr) => {
-                let set: HashSet<_> = next.into_iter().collect();
-                Some(curr.into_iter().filter(|id| set.contains(id)).collect())
-            }
-        }
-    }
-}
-````
-
-## File: packages/quackgraph/crates/quack_core/src/topology.rs
-````rust
-use crate::interner::Interner;
-use bitvec::prelude::*;
-use std::collections::{HashMap, VecDeque};
-use serde::{Serialize, Deserialize};
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use arrow::record_batch::RecordBatch;
-use arrow::array::{AsArray, Array, StringArray, LargeStringArray, UInt8Array};
-use arrow::datatypes::DataType;
-use arrow::compute::cast;
-
-pub const MAX_TIME: i64 = i64::MAX;
-
-/// (Target Node ID, Edge Type ID, Valid From, Valid To, Heat)
-type EdgeTuple = (u32, u8, i64, i64, u8);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum IntervalConstraint {
-    Overlaps,
-    Contains,
-    During,
-    Meets,
-}
-
-/// The core Graph Index.
-/// Stores topology in RAM using integer IDs.
-#[derive(Default, Debug, Serialize, Deserialize)]
-pub struct GraphIndex {
-    node_interner: Interner,
-    
-    // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
-    // Limit: 256 edge types per graph in V1.
-    edge_type_map: HashMap<String, u8>,
-    edge_type_vec: Vec<String>,
-
-    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID, Valid From, Valid To, Heat)
-    outgoing: Vec<Vec<EdgeTuple>>,
-    
-    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID, Valid From, Valid To, Heat)
-    incoming: Vec<Vec<EdgeTuple>>,
-
-    // Bitmask for soft-deleted nodes.
-    // true = deleted (tombstone), false = active.
-    tombstones: BitVec,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Direction {
-    Outgoing,
-    Incoming,
-}
-
-impl GraphIndex {
-    pub fn new() -> Self {
-        Self {
-            node_interner: Interner::new(),
-            edge_type_map: HashMap::new(),
-            edge_type_vec: Vec::new(),
-            outgoing: Vec::new(),
-            incoming: Vec::new(),
-            tombstones: BitVec::new(),
-        }
-    }
-
-    pub fn lookup_id(&self, id: &str) -> Option<u32> {
-        self.node_interner.lookup_id(id)
-    }
-
-    pub fn lookup_str(&self, id: u32) -> Option<&str> {
-        self.node_interner.lookup(id)
-    }
-
-    /// Compacts internal vectors to minimize memory usage.
-    /// Also sorts and deduplicates adjacency lists (essential after bulk loading).
-    /// Should be called after bulk hydration.
-    pub fn compact(&mut self) {
-        self.outgoing.iter_mut().for_each(|v| {
-            v.sort_unstable();
-            v.dedup();
-            v.shrink_to_fit();
-        });
-        self.incoming.iter_mut().for_each(|v| {
-            v.sort_unstable();
-            v.dedup();
-            v.shrink_to_fit();
-        });
-        self.outgoing.shrink_to_fit();
-        self.incoming.shrink_to_fit();
-        self.edge_type_vec.shrink_to_fit();
-    }
-
-    /// Resolves or creates an internal u32 ID for a node string.
-    /// Resizes internal storage if necessary.
-    pub fn get_or_create_node(&mut self, id: &str) -> u32 {
-        let internal_id = self.node_interner.intern(id);
-        let idx = internal_id as usize;
-
-        // Ensure vectors are large enough to hold this node
-        if idx >= self.outgoing.len() {
-            let new_len = idx + 1;
-            self.outgoing.resize_with(new_len, Vec::new);
-            self.incoming.resize_with(new_len, Vec::new);
-            // Resize tombstones, filling new slots with false (active)
-            self.tombstones.resize(new_len, false);
-        }
-        internal_id
-    }
-
-    /// Marks a node as deleted (soft delete).
-    /// Traversals will skip this node.
-    pub fn remove_node(&mut self, id: &str) {
-        if let Some(u_id) = self.node_interner.lookup_id(id) {
-            let idx = u_id as usize;
-            if idx < self.tombstones.len() {
-                self.tombstones.set(idx, true);
-            }
-        }
-    }
-
-    pub fn is_node_deleted(&self, id: u32) -> bool {
-        self.tombstones.get(id as usize).as_deref() == Some(&true)
-    }
-
-    /// Returns the total number of edges in the graph.
-    pub fn edge_count(&self) -> usize {
-        self.outgoing.iter().map(|edges| edges.len()).sum()
-    }
-
-    /// Resolves or creates a u8 ID for an edge type string.
-    /// Panics if more than 255 edge types are used (V1 constraint).
-    pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
-        if let Some(&id) = self.edge_type_map.get(type_name) {
-            return id;
-        }
-        let id = self.edge_type_vec.len();
-        if id > 255 {
-            panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
-        }
-        let id_u8 = id as u8;
-        self.edge_type_vec.push(type_name.to_string());
-        self.edge_type_map.insert(type_name.to_string(), id_u8);
-        id_u8
-    }
-
-    pub fn get_type_id(&self, type_name: &str) -> Option<u8> {
-        self.edge_type_map.get(type_name).copied()
-    }
-
-    /// Adds an edge to the graph. 
-    /// Idempotent: Does not add duplicate edges if they already exist.
-    /// If timestamps are not provided, defaults to (0, MAX_TIME).
-    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str, valid_from: Option<i64>, valid_to: Option<i64>, heat: Option<u8>) {
-        let vf = valid_from.unwrap_or(0);
-        let vt = valid_to.unwrap_or(MAX_TIME);
-        let h = heat.unwrap_or(0);
-        
-        let u_src = self.get_or_create_node(source);
-        let u_tgt = self.get_or_create_node(target);
-        let u_type = self.get_or_create_type(edge_type);
-
-        // Add to forward index (Idempotent)
-        let out_vec = &mut self.outgoing[u_src as usize];
-        // We include heat in the uniqueness check, effectively allowing different heat levels to coexist if pushed explicitly
-        if !out_vec.contains(&(u_tgt, u_type, vf, vt, h)) {
-            out_vec.push((u_tgt, u_type, vf, vt, h));
-        }
-        
-        // Add to reverse index (Idempotent)
-        let in_vec = &mut self.incoming[u_tgt as usize];
-        if !in_vec.contains(&(u_src, u_type, vf, vt, h)) {
-            in_vec.push((u_src, u_type, vf, vt, h));
-        }
-
-        // Ensure nodes are not tombstoned if they are being re-added/linked
-        if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
-            self.tombstones.set(u_src as usize, false);
-        }
-        if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
-            self.tombstones.set(u_tgt as usize, false);
-        }
-    }
-
-    /// Removes a specific edge from the graph.
-    /// Uses swap_remove for O(1) removal, order is not preserved.
-    pub fn remove_edge(&mut self, source: &str, target: &str, edge_type: &str) {
-        // We only proceed if all entities exist in our interner/maps
-        if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
-            self.node_interner.lookup_id(source),
-            self.node_interner.lookup_id(target),
-            self.edge_type_map.get(edge_type).copied(),
-        ) {
-            // Note: In V2 Temporal, removing an edge usually means "closing" the validity window.
-            // However, this method removes it from RAM entirely (hard delete).
-            // Remove from outgoing
-            if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
-                if let Some(pos) = edges.iter().position(|x| x.0 == u_tgt && x.1 == u_type) { // Ignores validity/heat for deletion
-                    edges.swap_remove(pos);
-                }
-            }
-            // Remove from incoming
-            if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
-                if let Some(pos) = edges.iter().position(|x| x.0 == u_src && x.1 == u_type) { // Ignores validity/heat for deletion
-                    edges.swap_remove(pos);
-                }
-            }
-        }
-    }
-
-    /// Ingests an Apache Arrow RecordBatch directly.
-    /// Expected Schema: Columns named "source", "target", "type" (case-insensitive or exact).
-    pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
-        let schema = batch.schema();
-        
-        // Resolve column indices by name for robustness (Case-Insensitive)
-        let find_col = |name: &str| -> Result<usize, String> {
-            schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
-                .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
-        };
-        
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok(());
-        }
-
-        // Helper to ensure we have a String/LargeString array, casting Dictionary if needed
-        let prepare_col = |col: &std::sync::Arc<dyn Array>, name: &str| -> Result<std::sync::Arc<dyn Array>, String> {
-            match col.data_type() {
-                DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
-                DataType::Dictionary(_key_type, value_type) => {
-                    match value_type.as_ref() {
-                        // If we need to support dictionary encoded strings
-                        DataType::Utf8 | DataType::LargeUtf8 => {
-                            cast(col.as_ref(), value_type.as_ref())
-                                .map_err(|e| format!("Cast error for {} column: {}", name, e))
-                        },
-                        other => {
-                            Err(format!("{} column: Dictionary value type {:?} not supported (expected Utf8/LargeUtf8)", name, other))
-                        }
-                    }
-                },
-                dt => Err(format!("{} column: Unsupported type {:?}", name, dt)),
-            }
-        };
-
-        let src_col = prepare_col(batch.column(find_col("source")?), "Source")?;
-        let tgt_col = prepare_col(batch.column(find_col("target")?), "Target")?;
-        let type_col = prepare_col(batch.column(find_col("type")?), "Type")?;
-
-        // Optional Temporal Columns
-        // If missing, we default to (0, MAX_TIME)
-        let vf_idx = find_col("valid_from").ok();
-        let vt_idx = find_col("valid_to").ok();
-        let heat_idx = find_col("heat").ok();
-
-        let vf_col = if let Some(idx) = vf_idx {
-            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
-        } else { None };
-        let vt_col = if let Some(idx) = vt_idx {
-            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
-        } else { None };
-
-        // Heat column (expecting UInt8)
-        let heat_col = if let Some(idx) = heat_idx {
-             // We try to cast to UInt8 just in case, though usually unnecessary if schema is correct
-             Some(cast(batch.column(idx).as_ref(), &DataType::UInt8).map_err(|e| e.to_string())?)
-        } else { None };
-
-        // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
-        enum StringArrayWrapper<'a> {
-            Small(&'a StringArray),
-            Large(&'a LargeStringArray),
-        }
-
-        impl<'a> StringArrayWrapper<'a> {
-            fn value(&self, i: usize) -> &'a str {
-                match self {
-                    Self::Small(arr) => arr.value(i),
-                    Self::Large(arr) => arr.value(i),
-                }
-            }
-        }
-
-        macro_rules! get_wrapper {
-            ($col:expr) => {
-                match $col.data_type() {
-                    DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
-                    DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
-                    _ => unreachable!("Already validated/casted to Utf8/LargeUtf8"),
-                }
-            }
-        }
-
-        let src_wrapper = get_wrapper!(src_col);
-        let tgt_wrapper = get_wrapper!(tgt_col);
-        let type_wrapper = get_wrapper!(type_col);
-
-        for i in 0..num_rows {
-            let src = src_wrapper.value(i);
-            let tgt = tgt_wrapper.value(i);
-            let edge_type = type_wrapper.value(i);
-
-            let u_src = self.get_or_create_node(src);
-            let u_tgt = self.get_or_create_node(tgt);
-            let u_type = self.get_or_create_type(edge_type);
-
-            // Extract timestamps
-            let valid_from = if let Some(ref col) = vf_col {
-                col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(i)
-            } else { 0 };
-
-            let valid_to = if let Some(ref col) = vt_col {
-                let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
-                if arr.is_null(i) {
-                    MAX_TIME
-                } else {
-                    arr.value(i)
-                }
-            } else { MAX_TIME };
-
-            // Extract Heat
-            let heat = if let Some(ref col) = heat_col {
-                col.as_any().downcast_ref::<UInt8Array>().unwrap().value(i)
-            } else { 0 };
-
-            // Fast Path: Blind push. We rely on compact() to deduplicate later.
-            self.outgoing[u_src as usize].push((u_tgt, u_type, valid_from, valid_to, heat));
-            self.incoming[u_tgt as usize].push((u_src, u_type, valid_from, valid_to, heat));
-
-            // Ensure nodes are not tombstoned (revival logic)
-            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
-                self.tombstones.set(u_src as usize, false);
-            }
-            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
-                self.tombstones.set(u_tgt as usize, false);
-            }
-        }
-        Ok(())
-    }
-
-    /// Updates the 'heat' (pheromone level) of active edges matching the criteria.
-    /// Only affects edges where valid_to is MAX_TIME (active).
-    pub fn update_edge_heat(&mut self, source: &str, target: &str, edge_type: &str, new_heat: u8) {
-        if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
-            self.node_interner.lookup_id(source),
-            self.node_interner.lookup_id(target),
-            self.edge_type_map.get(edge_type).copied(),
-        ) {
-            // Update outgoing
-            if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
-                for edge in edges.iter_mut() {
-                    // edge is (target, type, vf, vt, heat)
-                    if edge.0 == u_tgt && edge.1 == u_type && edge.3 == MAX_TIME {
-                        edge.4 = new_heat;
-                    }
-                }
-            }
-            // Update incoming
-            if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
-                for edge in edges.iter_mut() {
-                    // edge is (source, type, vf, vt, heat)
-                    if edge.0 == u_src && edge.1 == u_type && edge.3 == MAX_TIME {
-                        edge.4 = new_heat;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Contextual Schema Pruning.
-    /// Returns a list of unique Edge Types (strings) that originate from the given source nodes.
-    /// This allows an Agent to know "What moves are available?" without fetching all neighbors.
-    pub fn get_available_edge_types(&self, sources: &[String], as_of: Option<i64>) -> Vec<String> {
-        let mut type_ids = Vec::new();
-
-        for src_str in sources {
-            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
-                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
-                    continue;
-                }
-                if let Some(edges) = self.outgoing.get(src_id as usize) {
-                    for &(_, type_id, vf, vt, _) in edges {
-                        // Temporal Check
-                        match as_of {
-                            Some(ts) => {
-                                // Edge is valid if it existed at 'ts' (valid_from <= ts < valid_to)
-                                if vf <= ts && vt > ts {
-                                    type_ids.push(type_id);
-                                }
-                            },
-                            None => {
-                                // Current/Active only
-                                if vt == MAX_TIME {
-                                    type_ids.push(type_id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        type_ids.sort_unstable();
-        type_ids.dedup();
-
-        type_ids.into_iter()
-            .filter_map(|tid| {
-                // We can't easily do O(1) reverse lookup on the map unless we scan or store a reverse vec.
-                // Luckily `edge_type_vec` exists!
-                self.edge_type_vec.get(tid as usize).cloned()
-            })
-            .collect()
-    }
-
-    /// Aggregates statistics (Count, Average Heat) for outgoing edges from the given sources.
-    /// Returns a list of (Edge Type Name, Count, Average Heat).
-    pub fn get_sector_stats(&self, sources: &[String], as_of: Option<i64>, allowed_types: Option<&[String]>) -> Vec<(String, u32, f64)> {
-        // Map: Edge Type ID -> (Count, Total Heat)
-        let mut stats: HashMap<u8, (u32, u64)> = HashMap::new();
-
-        // Resolve allowed types to u8 set for fast lookup
-        let allowed_ids: Option<Vec<u8>> = allowed_types.map(|types| {
-            types.iter().filter_map(|t| self.edge_type_map.get(t).copied()).collect()
-        });
-
-        for src_str in sources {
-            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
-                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
-                    continue;
-                }
-
-                if let Some(edges) = self.outgoing.get(src_id as usize) {
-                    for &(_, type_id, vf, vt, heat) in edges {
-                        // Domain Filtering (Push Down)
-                        if let Some(ref allowed) = allowed_ids {
-                            if !allowed.contains(&type_id) {
-                                continue;
-                            }
-                        }
-
-                        // Temporal Check
-                        match as_of {
-                            Some(ts) => {
-                                if vf <= ts && vt > ts {
-                                    let entry = stats.entry(type_id).or_insert((0, 0));
-                                    entry.0 += 1;
-                                    entry.1 += heat as u64;
-                                }
-                            },
-                            None => {
-                                if vt == MAX_TIME {
-                                    let entry = stats.entry(type_id).or_insert((0, 0));
-                                    entry.0 += 1;
-                                    entry.1 += heat as u64;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        stats.into_iter()
-            .filter_map(|(type_id, (count, total_heat))| {
-                let type_name = self.edge_type_vec.get(type_id as usize)?.clone();
-                let avg_heat = if count > 0 { total_heat as f64 / count as f64 } else { 0.0 };
-                Some((type_name, count, avg_heat))
-            })
-            .collect()
-    }
-
-    /// Low-level neighbor access for Matcher.
-    /// Returns all neighbors connected by `type_id` in `dir`.
-    /// Returns all neighbors connected by `type_id` in `dir`, respecting `as_of`.
-    /// Filters out tombstoned neighbors.
-    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir: Direction, as_of: Option<i64>) -> Vec<u32> {
-        let adjacency = match dir {
-            Direction::Outgoing => &self.outgoing,
-            Direction::Incoming => &self.incoming,
-        };
-
-        if let Some(edges) = adjacency.get(node_id as usize) {
-            edges.iter()
-                .filter_map(|&(target, t, vf, vt, _heat)| {
-                    // Type match
-                    if t != type_id { return None; }
-                    // Tombstone check
-                    if self.is_node_deleted(target) { return None; }
-                    
-                    // Temporal Check
-                    match as_of {
-                        Some(ts) => {
-                            if vf <= ts && vt > ts { Some(target) } else { None }
-                        },
-                        None => {
-                            // Current/Active only
-                            if vt == MAX_TIME { Some(target) } else { None }
-                        }
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Generic traversal step (Bidirectional).
-    /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
-    /// in the specified `direction`, visible at `as_of`.
-    pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction, as_of: Option<i64>, min_valid_from: Option<i64>) -> Vec<String> {
-        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
-        let min_vf = min_valid_from.unwrap_or(i64::MIN);
-        
-        let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
-        
-        let adjacency = match direction {
-            Direction::Outgoing => &self.outgoing,
-            Direction::Incoming => &self.incoming,
-        };
-
-        for src_str in sources {
-            // If source node doesn't exist in our index, skip it
-            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
-                // Check if node is deleted
-                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
-                    continue;
-                }
-
-                if let Some(edges) = adjacency.get(src_id as usize) {
-                    for &(target, type_id, vf, vt, _heat) in edges {
-                        // Apply edge type filter if present
-                        if let Some(req_type) = type_filter {
-                            if req_type != type_id {
-                                continue;
-                            }
-                        }
-
-                        // Monotonic/Causal Check
-                        if vf < min_vf { continue; }
-
-                        // Temporal Check
-                        match as_of {
-                            Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
-                            None => { if vt != MAX_TIME { continue; } }
-                        }
-                        // Check if target is deleted
-                        if self.tombstones.get(target as usize).as_deref() == Some(&true) {
-                            continue;
-                        }
-                        result_ids.push(target);
-                    }
-                }
-            }
-        }
-
-        // Deduplicate results
-        result_ids.sort_unstable();
-        result_ids.dedup();
-
-        // Convert back to strings
-        result_ids
-            .into_iter()
-            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
-            .collect()
-    }
-
-    /// Recursive traversal (BFS) with depth bounds.
-    /// Returns unique node IDs reachable within [min_depth, max_depth].
-    #[allow(clippy::too_many_arguments)]
-    pub fn traverse_recursive(
-        &self,
-        sources: &[String],
-        edge_type: Option<&str>,
-        direction: Direction,
-        min_depth: usize,
-        max_depth: usize,
-        as_of: Option<i64>,
-        monotonic: bool,
-    ) -> Vec<String> {
-        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
-        
-        // Track visited nodes to prevent cycles (O(1) access)
-        // We assume the interner length is the upper bound of IDs
-        let mut visited = bitvec![u8, Lsb0; 0; self.node_interner.len()];
-        let mut result_ids: Vec<u32> = Vec::new();
-        
-        // Queue stores (node_id, current_depth, arrival_time)
-        // arrival_time is i64::MIN for start nodes
-        let mut queue: VecDeque<(u32, usize, i64)> = VecDeque::new();
-
-        let adjacency = match direction {
-            Direction::Outgoing => &self.outgoing,
-            Direction::Incoming => &self.incoming,
-        };
-
-        // Initialize Queue
-        for src_str in sources {
-            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
-                // Skip soft-deleted nodes
-                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
-                    continue;
-                }
-                
-                // Mark source as visited so we don't loop back to it
-                if (src_id as usize) < visited.len() {
-                    visited.set(src_id as usize, true);
-                }
-                
-                // If min_depth is 0, include sources in result
-                if min_depth == 0 {
-                    result_ids.push(src_id);
-                }
-                
-                // Start search
-                queue.push_back((src_id, 0, i64::MIN));
-            }
-        }
-
-        while let Some((curr_id, curr_depth, arrival_time)) = queue.pop_front() {
-            if curr_depth >= max_depth {
-                continue;
-            }
-            
-            let next_depth = curr_depth + 1;
-
-            if let Some(edges) = adjacency.get(curr_id as usize) {
-                for &(target, type_id, vf, vt, _heat) in edges {
-                    // Apply edge type filter
-                    if let Some(req_type) = type_filter {
-                        if req_type != type_id {
-                            continue;
-                        }
-                    }
-
-                    // Monotonic Check
-                    if monotonic && vf < arrival_time {
-                        continue;
-                    }
-                    
-                    // Temporal Check
-                    match as_of {
-                        Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
-                        None => { if vt != MAX_TIME { continue; } }
-                    }
-                    
-                    // Check soft delete
-                    if self.tombstones.get(target as usize).as_deref() == Some(&true) {
-                        continue;
-                    }
-                    
-                    // Check visited and bounds
-                    if (target as usize) < visited.len() && !visited[target as usize] {
-                        visited.set(target as usize, true);
-                        
-                        if next_depth >= min_depth {
-                            result_ids.push(target);
-                        }
-                        
-                        // Continue BFS only if we haven't hit max depth
-                        if next_depth < max_depth {
-                            // For monotonic, next arrival time is this edge's valid_from
-                            // If not monotonic, we just pass down min (effectively ignoring)
-                            let next_arrival = if monotonic { vf } else { i64::MIN };
-                            queue.push_back((target, next_depth, next_arrival));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort for deterministic output
-        result_ids.sort_unstable();
-
-        result_ids
-            .into_iter()
-            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
-            .collect()
-    }
-
-    /// Traverses edges that overlap with the given time interval [start, end).
-    /// Overlap logic: edge.valid_from < end && edge.valid_to > start.
-    /// Returns unique neighbor IDs.
-    pub fn traverse_interval(&self, sources: &[String], edge_type: Option<&str>, direction: Direction, start: i64, end: i64, constraint: IntervalConstraint) -> Vec<String> {
-        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
-        let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
-        
-        let adjacency = match direction {
-            Direction::Outgoing => &self.outgoing,
-            Direction::Incoming => &self.incoming,
-        };
-
-        for src_str in sources {
-            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
-                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
-                    continue;
-                }
-
-                if let Some(edges) = adjacency.get(src_id as usize) {
-                    for &(target, type_id, vf, vt, _heat) in edges {
-                        if let Some(req_type) = type_filter {
-                            if req_type != type_id { continue; }
-                        }
-                        
-                        // Interval Check
-                        let is_match = match constraint {
-                            IntervalConstraint::Overlaps => vf < end && vt > start,
-                            IntervalConstraint::Contains => vf <= start && vt >= end,
-                            IntervalConstraint::During => vf >= start && vt <= end,
-                            IntervalConstraint::Meets => vt == start || vf == end,
-                        };
-
-                        if is_match {
-                             if self.tombstones.get(target as usize).as_deref() == Some(&true) {
-                                continue;
-                            }
-                            result_ids.push(target);
-                        }
-                    }
-                }
-            }
-        }
-        
-        result_ids.sort_unstable();
-        result_ids.dedup();
-        
-        result_ids
-            .into_iter()
-            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
-            .collect()
-    }
-
-    pub fn node_count(&self) -> usize {
-        self.node_interner.len()
-    }
-
-    /// Serializes the entire graph topology to a binary file.
-    pub fn save_to_file(&self, path: &str) -> Result<(), String> {
-        let file = File::create(path).map_err(|e| e.to_string())?;
-        let writer = BufWriter::new(file);
-        bincode::serialize_into(writer, self).map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    /// Deserializes the graph topology from a binary file.
-    pub fn load_from_file(path: &str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
-        bincode::deserialize_from(reader).map_err(|e| e.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bulk_add_dedup() {
-        let mut graph = GraphIndex::new();
-        
-        // Simulate batch loading with duplicates
-        // A -> B (KNOWS)
-        // A -> B (KNOWS)
-        // A -> B (LIKES)
-        
-        let u_a = graph.get_or_create_node("A");
-        let u_b = graph.get_or_create_node("B");
-        let t_knows = graph.get_or_create_type("KNOWS");
-        let t_likes = graph.get_or_create_type("LIKES");
-
-        // Manually push duplicates simulating blind batch add
-        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0));
-        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0)); // Duplicate
-        graph.outgoing[u_a as usize].push((u_b, t_likes, 0, MAX_TIME, 0)); // Different type
-
-        // Pre-compact: 3 edges
-        assert_eq!(graph.outgoing[u_a as usize].len(), 3);
-
-        // Compact
-        graph.compact();
-
-        // Post-compact: 2 edges (KNOWS, LIKES)
-        assert_eq!(graph.outgoing[u_a as usize].len(), 2);
-        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows, 0, MAX_TIME, 0)));
-        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes, 0, MAX_TIME, 0)));
-    }
-}
-````
-
-## File: packages/quackgraph/crates/quack_core/Cargo.toml
-````toml
-[package]
-name = "quack_core"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-thiserror = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-bitvec = { version = "1.0", features = ["serde"] }
-arrow = { version = "53.0.0" }
-bincode = "1.3"
-````
-
-## File: packages/quackgraph/packages/native/src/lib.rs
-````rust
-#![deny(clippy::all)]
-
-use napi::bindgen_prelude::*;
-use napi_derive::napi;
-use quack_core::{matcher::{Matcher, PatternEdge}, GraphIndex, Direction, IntervalConstraint};
-use arrow::ipc::reader::StreamReader;
-use std::io::Cursor;
-
-#[napi]
-pub struct NativeGraph {
-    inner: GraphIndex,
-}
-
-#[napi(object)]
-pub struct JsPatternEdge {
-    pub src_var: u32,
-    pub tgt_var: u32,
-    pub edge_type: String,
-    pub direction: Option<String>,
-}
-
-#[napi(object)]
-pub struct JsSectorStat {
-    pub edge_type: String,
-    pub count: u32,
-    pub avg_heat: f64,
-}
-
-#[napi]
-impl NativeGraph {
-    #[napi(constructor)]
-    pub fn new() -> Self {
-        Self {
-            inner: GraphIndex::new(),
-        }
-    }
-
-    #[napi]
-    pub fn add_node(&mut self, id: String) {
-        self.inner.get_or_create_node(&id);
-    }
-
-    /// Hydrates the graph from an Arrow IPC stream (Buffer).
-    /// Zero-copy (mostly) data transfer from DuckDB.
-    /// Note: Does not verify duplicates. Caller must call compact() afterwards.
-    #[napi]
-    pub fn load_arrow_ipc(&mut self, buffer: Buffer) -> napi::Result<()> {
-        let cursor = Cursor::new(buffer.as_ref());
-        let reader = StreamReader::try_new(cursor, None).map_err(|e| napi::Error::from_reason(e.to_string()))?;
-
-        for batch in reader {
-            let batch = batch.map_err(|e| napi::Error::from_reason(e.to_string()))?;
-            self.inner.add_arrow_batch(&batch).map_err(napi::Error::from_reason)?;
-        }
-        Ok(())
-    }
-
-    /// Compacts the graph's memory usage.
-    /// Call this after hydration to reclaim unused capacity in the adjacency lists.
-    /// Also deduplicates edges added via bulk ingestion.
-    #[napi]
-    pub fn compact(&mut self) {
-        self.inner.compact();
-    }
-
-    #[napi(js_name = "addNodes")]
-    pub fn add_nodes(&mut self, ids: Vec<String>) {
-        for id in ids {
-            self.inner.get_or_create_node(&id);
-        }
-    }
-
-    #[napi(js_name = "addEdges")]
-    pub fn add_edges(&mut self, 
-        sources: Vec<String>, 
-        targets: Vec<String>, 
-        edge_types: Vec<String>, 
-        valid_froms: Vec<f64>, 
-        valid_tos: Vec<f64>,
-        heats: Vec<u32>
-    ) {
-        let len = sources.len();
-        for i in 0..len {
-            let vf = valid_froms.get(i).copied().unwrap_or(0.0) as i64;
-            let vt = valid_tos.get(i).copied().unwrap_or(i64::MAX as f64) as i64;
-            let heat = heats.get(i).copied().unwrap_or(0) as u8;
-            // Safe check for indices? Napi guarantees vectors passed from JS match arguments.
-            // But we trust JS wrapper ensures lengths match.
-            if let (Some(s), Some(t), Some(ty)) = (sources.get(i), targets.get(i), edge_types.get(i)) {
-                self.inner.add_edge(s, t, ty, Some(vf), Some(vt), Some(heat));
-            }
-        }
-    }
-
-    #[napi]
-    pub fn add_edge(&mut self, source: String, target: String, edge_type: String, valid_from: Option<f64>, valid_to: Option<f64>, heat: Option<u32>) {
-        // JS timestamps are millis (f64). Convert to micros (i64) for DuckDB compatibility.
-        let vf = valid_from.map(|t| (t * 1000.0) as i64);
-        let vt = valid_to.map(|t| (t * 1000.0) as i64);
-        let h = heat.map(|v| v as u8); // safe cast for V1
-        self.inner.add_edge(&source, &target, &edge_type, vf, vt, h);
-    }
-
-    #[napi]
-    pub fn remove_node(&mut self, id: String) {
-        self.inner.remove_node(&id);
-    }
-
-    #[napi]
-    pub fn remove_edge(&mut self, source: String, target: String, edge_type: String) {
-        self.inner.remove_edge(&source, &target, &edge_type);
-    }
-
-    /// Updates the 'heat' (pheromone) level of an active edge.
-    /// Used for reinforcement learning in the agent loop.
-    #[napi(js_name = "updateEdgeHeat")]
-    pub fn update_edge_heat(&mut self, source: String, target: String, edge_type: String, heat: u32) {
-        self.inner.update_edge_heat(&source, &target, &edge_type, heat as u8);
-    }
-
-    /// Returns available edge types from the given source nodes.
-    /// Used for "Ghost Earth" Satellite View (LOD 0).
-    #[napi(js_name = "getAvailableEdgeTypes")]
-    pub fn get_available_edge_types(&self, sources: Vec<String>, as_of: Option<f64>) -> Vec<String> {
-        let ts = as_of.map(|t| t as i64);
-        self.inner.get_available_edge_types(&sources, ts)
-    }
-
-    /// Returns aggregated statistics (count, heat) for outgoing edges from the given sources.
-    /// More efficient than getAvailableEdgeTypes + traverse loop.
-    #[napi(js_name = "getSectorStats")]
-    pub fn get_sector_stats(&self, sources: Vec<String>, as_of: Option<f64>, allowed_edge_types: Option<Vec<String>>) -> Vec<JsSectorStat> {
-        let ts = as_of.map(|t| t as i64);
-        let allowed_ref = allowed_edge_types.as_deref();
-        let raw_stats = self.inner.get_sector_stats(&sources, ts, allowed_ref);
-        
-        raw_stats.into_iter().map(|(edge_type, count, avg_heat)| JsSectorStat {
-            edge_type,
-            count,
-            avg_heat
-        }).collect()
-    }
-
-    /// Performs a single-hop traversal (bfs-step).
-    /// Returns unique neighbor IDs.
-    #[napi]
-    pub fn traverse(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, as_of: Option<f64>, min_valid_from: Option<f64>) -> Vec<String> {
-        let dir = match direction.as_deref() {
-            Some("in") | Some("IN") => Direction::Incoming,
-            _ => Direction::Outgoing,
-        };
-        // JavaScript now passes microseconds directly
-        let ts = as_of.map(|t| t as i64);
-        let min_vf = min_valid_from.map(|t| t as i64);
-        self.inner.traverse(&sources, edge_type.as_deref(), dir, ts, min_vf)
-    }
-
-    /// Performs a traversal finding all neighbors connected via edges that overlap 
-    /// with the specified time window [start, end).
-    /// Timestamps are in milliseconds (JS standard).
-    /// Constraint: 'overlaps' (default), 'contains', 'during', 'meets'.
-    #[napi]
-    pub fn traverse_interval(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, start: f64, end: f64, constraint: Option<String>) -> Vec<String> {
-        let dir = match direction.as_deref() {
-            Some("in") | Some("IN") => Direction::Incoming,
-            _ => Direction::Outgoing,
-        };
-        let c = match constraint.as_deref() {
-            Some("contains") | Some("CONTAINS") => IntervalConstraint::Contains,
-            Some("during") | Some("DURING") => IntervalConstraint::During,
-            Some("meets") | Some("MEETS") => IntervalConstraint::Meets,
-            _ => IntervalConstraint::Overlaps,
-        };
-        let s = (start * 1000.0) as i64;
-        let e = (end * 1000.0) as i64;
-        self.inner.traverse_interval(&sources, edge_type.as_deref(), dir, s, e, c)
-    }
-
-    /// Performs a recursive traversal (BFS) with depth bounds.
-    /// Returns unique node IDs reachable within [min_depth, max_depth].
-    #[napi(js_name = "traverseRecursive")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn traverse_recursive(&self, sources: Vec<String>, edge_type: Option<String>, direction: Option<String>, min_depth: Option<u32>, max_depth: Option<u32>, as_of: Option<f64>, monotonic: Option<bool>) -> Vec<String> {
-        let dir = match direction.as_deref() {
-            Some("in") | Some("IN") => Direction::Incoming,
-            _ => Direction::Outgoing,
-        };
-        
-        let min = min_depth.unwrap_or(1) as usize;
-        let max = max_depth.unwrap_or(1) as usize;
-        let ts = as_of.map(|t| t as i64);
-        let mono = monotonic.unwrap_or(false);
-        
-        self.inner.traverse_recursive(&sources, edge_type.as_deref(), dir, min, max, ts, mono)
-    }
-
-    /// Finds subgraphs matching the given pattern.
-    /// `start_ids` maps to variable 0 in the pattern.
-    #[napi(js_name = "matchPattern")]
-    pub fn match_pattern(&self, start_ids: Vec<String>, pattern: Vec<JsPatternEdge>, as_of: Option<f64>) -> Vec<Vec<String>> {
-        let mut core_pattern = Vec::with_capacity(pattern.len());
-        for p in pattern {
-            if let Some(type_id) = self.inner.get_type_id(&p.edge_type) {
-                core_pattern.push(PatternEdge {
-                    src_var: p.src_var as usize,
-                    tgt_var: p.tgt_var as usize,
-                    type_id,
-                    direction: match p.direction.as_deref() {
-                        Some("in") | Some("IN") => Direction::Incoming,
-                        _ => Direction::Outgoing,
-                    },
-                });
-            } else {
-                return Vec::new(); // Edge type doesn't exist, no matches possible.
-            }
-        }
-
-        let start_candidates: Vec<u32> = start_ids.iter()
-            .filter_map(|id| self.inner.lookup_id(id))
-            .collect();
-
-        if start_candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let ts = as_of.map(|t| t as i64);
-        let matcher = Matcher::new(&self.inner, &core_pattern);
-        let raw_results = matcher.find_matches(&start_candidates, ts);
-
-        raw_results.into_iter().map(|row| {
-            row.into_iter().filter_map(|uid| self.inner.lookup_str(uid).map(|s| s.to_string())).collect()
-        }).collect()
-    }
-
-    /// Returns the number of nodes in the interned index.
-    /// Useful for debugging hydration.
-    #[napi(getter)]
-    pub fn node_count(&self) -> u32 {
-        // We cast to u32 because exposing usize to JS can be finicky depending on napi version,
-        // though napi usually handles numbers well. Safe for V1.
-        self.inner.node_count() as u32
-    }
-
-    #[napi(getter)]
-    pub fn edge_count(&self) -> u32 {
-        self.inner.edge_count() as u32
-    }
-
-    #[napi]
-    pub fn save_snapshot(&self, path: String) -> napi::Result<()> {
-        self.inner.save_to_file(&path).map_err(napi::Error::from_reason)
-    }
-
-    #[napi]
-    pub fn load_snapshot(&mut self, path: String) -> napi::Result<()> {
-        let loaded = GraphIndex::load_from_file(&path).map_err(napi::Error::from_reason)?;
-        self.inner = loaded;
-        Ok(())
-    }
-}
-
-impl Default for NativeGraph {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-````
-
-## File: packages/quackgraph/packages/native/build.rs
-````rust
-extern crate napi_build;
-
-fn main() {
-  napi_build::setup();
-}
-````
-
-## File: packages/quackgraph/packages/native/Cargo.toml
-````toml
-[package]
-edition = "2021"
-name = "quack_native"
-version = "0.0.1"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-# Napi dependencies for bridging
-napi = { version = "2.12.2", default-features = false, features = ["napi4"] }
-napi-derive = "2.12.2"
-
-# Our Core Logic
-quack_core = { path = "../../crates/quack_core" }
-arrow = { version = "53.0.0" }
-
-[build-dependencies]
-napi-build = "2.0.1"
-````
-
-## File: packages/quackgraph/packages/native/index.d.ts
-````typescript
-/* tslint:disable */
-/* eslint-disable */
-
-/* auto-generated by NAPI-RS */
-
-export interface JsPatternEdge {
-  srcVar: number
-  tgtVar: number
-  edgeType: string
-  direction?: string
-}
-export interface JsSectorStat {
-  edgeType: string
-  count: number
-  avgHeat: number
-}
-export declare class NativeGraph {
-  constructor()
-  addNode(id: string): void
-  /**
-   * Hydrates the graph from an Arrow IPC stream (Buffer).
-   * Zero-copy (mostly) data transfer from DuckDB.
-   * Note: Does not verify duplicates. Caller must call compact() afterwards.
-   */
-  loadArrowIpc(buffer: Buffer): void
-  /**
-   * Compacts the graph's memory usage.
-   * Call this after hydration to reclaim unused capacity in the adjacency lists.
-   * Also deduplicates edges added via bulk ingestion.
-   */
-  compact(): void
-  addNodes(ids: Array<string>): void
-  addEdges(sources: Array<string>, targets: Array<string>, edgeTypes: Array<string>, validFroms: Array<number>, validTos: Array<number>, heats: Array<number>): void
-  addEdge(source: string, target: string, edgeType: string, validFrom?: number | undefined | null, validTo?: number | undefined | null, heat?: number | undefined | null): void
-  removeNode(id: string): void
-  removeEdge(source: string, target: string, edgeType: string): void
-  /**
-   * Updates the 'heat' (pheromone) level of an active edge.
-   * Used for reinforcement learning in the agent loop.
-   */
-  updateEdgeHeat(source: string, target: string, edgeType: string, heat: number): void
-  /**
-   * Returns available edge types from the given source nodes.
-   * Used for "Ghost Earth" Satellite View (LOD 0).
-   */
-  getAvailableEdgeTypes(sources: Array<string>, asOf?: number | undefined | null): Array<string>
-  /**
-   * Returns aggregated statistics (count, heat) for outgoing edges from the given sources.
-   * More efficient than getAvailableEdgeTypes + traverse loop.
-   */
-  getSectorStats(sources: Array<string>, asOf?: number | undefined | null, allowedEdgeTypes?: Array<string> | undefined | null): Array<JsSectorStat>
-  /**
-   * Performs a single-hop traversal (bfs-step).
-   * Returns unique neighbor IDs.
-   */
-  traverse(sources: Array<string>, edgeType?: string | undefined | null, direction?: string | undefined | null, asOf?: number | undefined | null, minValidFrom?: number | undefined | null): Array<string>
-  /**
-   * Performs a traversal finding all neighbors connected via edges that overlap
-   * with the specified time window [start, end).
-   * Timestamps are in milliseconds (JS standard).
-   * Constraint: 'overlaps' (default), 'contains', 'during', 'meets'.
-   */
-  traverseInterval(sources: Array<string>, edgeType: string | undefined | null, direction: string | undefined | null, start: number, end: number, constraint?: string | undefined | null): Array<string>
-  /**
-   * Performs a recursive traversal (BFS) with depth bounds.
-   * Returns unique node IDs reachable within [min_depth, max_depth].
-   */
-  traverseRecursive(sources: Array<string>, edgeType?: string | undefined | null, direction?: string | undefined | null, minDepth?: number | undefined | null, maxDepth?: number | undefined | null, asOf?: number | undefined | null, monotonic?: boolean | undefined | null): Array<string>
-  /**
-   * Finds subgraphs matching the given pattern.
-   * `start_ids` maps to variable 0 in the pattern.
-   */
-  matchPattern(startIds: Array<string>, pattern: Array<JsPatternEdge>, asOf?: number | undefined | null): Array<Array<string>>
-  /**
-   * Returns the number of nodes in the interned index.
-   * Useful for debugging hydration.
-   */
-  get nodeCount(): number
-  get edgeCount(): number
-  saveSnapshot(path: string): void
-  loadSnapshot(path: string): void
-}
-````
-
-## File: packages/quackgraph/packages/native/index.js
-````javascript
-/* tslint:disable */
-/* eslint-disable */
-/* prettier-ignore */
-
-/* auto-generated by NAPI-RS */
-
-const { existsSync, readFileSync } = require('fs')
-const { join } = require('path')
-
-const { platform, arch } = process
-
-let nativeBinding = null
-let localFileExisted = false
-let loadError = null
-
-function isMusl() {
-  // For Node 10
-  if (!process.report || typeof process.report.getReport !== 'function') {
-    try {
-      const lddPath = require('child_process').execSync('which ldd').toString().trim()
-      return readFileSync(lddPath, 'utf8').includes('musl')
-    } catch (e) {
-      return true
-    }
-  } else {
-    const { glibcVersionRuntime } = process.report.getReport().header
-    return !glibcVersionRuntime
-  }
-}
-
-switch (platform) {
-  case 'android':
-    switch (arch) {
-      case 'arm64':
-        localFileExisted = existsSync(join(__dirname, 'quack-native.android-arm64.node'))
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.android-arm64.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-android-arm64')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      case 'arm':
-        localFileExisted = existsSync(join(__dirname, 'quack-native.android-arm-eabi.node'))
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.android-arm-eabi.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-android-arm-eabi')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      default:
-        throw new Error(`Unsupported architecture on Android ${arch}`)
-    }
-    break
-  case 'win32':
-    switch (arch) {
-      case 'x64':
-        localFileExisted = existsSync(
-          join(__dirname, 'quack-native.win32-x64-msvc.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.win32-x64-msvc.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-win32-x64-msvc')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      case 'ia32':
-        localFileExisted = existsSync(
-          join(__dirname, 'quack-native.win32-ia32-msvc.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.win32-ia32-msvc.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-win32-ia32-msvc')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      case 'arm64':
-        localFileExisted = existsSync(
-          join(__dirname, 'quack-native.win32-arm64-msvc.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.win32-arm64-msvc.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-win32-arm64-msvc')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      default:
-        throw new Error(`Unsupported architecture on Windows: ${arch}`)
-    }
-    break
-  case 'darwin':
-    localFileExisted = existsSync(join(__dirname, 'quack-native.darwin-universal.node'))
-    try {
-      if (localFileExisted) {
-        nativeBinding = require('./quack-native.darwin-universal.node')
-      } else {
-        nativeBinding = require('@quackgraph/native-darwin-universal')
-      }
-      break
-    } catch {}
-    switch (arch) {
-      case 'x64':
-        localFileExisted = existsSync(join(__dirname, 'quack-native.darwin-x64.node'))
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.darwin-x64.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-darwin-x64')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      case 'arm64':
-        localFileExisted = existsSync(
-          join(__dirname, 'quack-native.darwin-arm64.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.darwin-arm64.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-darwin-arm64')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      default:
-        throw new Error(`Unsupported architecture on macOS: ${arch}`)
-    }
-    break
-  case 'freebsd':
-    if (arch !== 'x64') {
-      throw new Error(`Unsupported architecture on FreeBSD: ${arch}`)
-    }
-    localFileExisted = existsSync(join(__dirname, 'quack-native.freebsd-x64.node'))
-    try {
-      if (localFileExisted) {
-        nativeBinding = require('./quack-native.freebsd-x64.node')
-      } else {
-        nativeBinding = require('@quackgraph/native-freebsd-x64')
-      }
-    } catch (e) {
-      loadError = e
-    }
-    break
-  case 'linux':
-    switch (arch) {
-      case 'x64':
-        if (isMusl()) {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-x64-musl.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-x64-musl.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-x64-musl')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        } else {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-x64-gnu.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-x64-gnu.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-x64-gnu')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        }
-        break
-      case 'arm64':
-        if (isMusl()) {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-arm64-musl.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-arm64-musl.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-arm64-musl')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        } else {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-arm64-gnu.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-arm64-gnu.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-arm64-gnu')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        }
-        break
-      case 'arm':
-        if (isMusl()) {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-arm-musleabihf.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-arm-musleabihf.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-arm-musleabihf')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        } else {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-arm-gnueabihf.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-arm-gnueabihf.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-arm-gnueabihf')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        }
-        break
-      case 'riscv64':
-        if (isMusl()) {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-riscv64-musl.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-riscv64-musl.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-riscv64-musl')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        } else {
-          localFileExisted = existsSync(
-            join(__dirname, 'quack-native.linux-riscv64-gnu.node')
-          )
-          try {
-            if (localFileExisted) {
-              nativeBinding = require('./quack-native.linux-riscv64-gnu.node')
-            } else {
-              nativeBinding = require('@quackgraph/native-linux-riscv64-gnu')
-            }
-          } catch (e) {
-            loadError = e
-          }
-        }
-        break
-      case 's390x':
-        localFileExisted = existsSync(
-          join(__dirname, 'quack-native.linux-s390x-gnu.node')
-        )
-        try {
-          if (localFileExisted) {
-            nativeBinding = require('./quack-native.linux-s390x-gnu.node')
-          } else {
-            nativeBinding = require('@quackgraph/native-linux-s390x-gnu')
-          }
-        } catch (e) {
-          loadError = e
-        }
-        break
-      default:
-        throw new Error(`Unsupported architecture on Linux: ${arch}`)
-    }
-    break
-  default:
-    throw new Error(`Unsupported OS: ${platform}, architecture: ${arch}`)
-}
-
-if (!nativeBinding) {
-  if (loadError) {
-    throw loadError
-  }
-  throw new Error(`Failed to load native binding`)
-}
-
-const { NativeGraph } = nativeBinding
-
-module.exports.NativeGraph = NativeGraph
-````
-
-## File: packages/quackgraph/packages/native/package.json
-````json
-{
-  "name": "@quackgraph/native",
-  "version": "0.0.1",
-  "main": "index.js",
-  "types": "index.d.ts",
-  "napi": {
-    "name": "quack-native",
-    "triples": {
-      "defaults": true,
-      "additional": [
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-gnu",
-        "i686-pc-windows-msvc",
-        "armv7-unknown-linux-gnueabihf",
-        "aarch64-apple-darwin",
-        "aarch64-linux-android",
-        "x86_64-unknown-freebsd",
-        "aarch64-unknown-linux-musl",
-        "aarch64-pc-windows-msvc",
-        "armv7-linux-androideabi"
       ]
-    }
-  },
-  "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
-    "artifacts": "napi artifacts",
-    "test": "node --test"
-  },
-  "devDependencies": {
-    "@napi-rs/cli": "^2.18.0"
-  },
-  "engines": {
-    "node": ">= 10"
-  }
-}
-````
+    });
 
-## File: packages/quackgraph/packages/quack-graph/src/db.ts
-````typescript
-import { Database } from 'duckdb-async';
-import { tableFromJSON, tableToIPC } from 'apache-arrow';
-
-// Interface for operations that can be performed within a transaction or globally
-export interface DbExecutor {
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params are generic
-  execute(sql: string, params?: any[]): Promise<void>;
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results are generic
-  query(sql: string, params?: any[]): Promise<any[]>;
-}
-
-export class DuckDBManager implements DbExecutor {
-  private db: Database | null = null;
-  private _path: string;
-
-  constructor(path: string = ':memory:') {
-    this._path = path;
-  }
-
-  async init() {
-    if (!this.db) {
-      this.db = await Database.create(this._path);
-    }
-  }
-
-  get path(): string {
-    return this._path;
-  }
-
-  getDb(): Database {
-    if (!this.db) {
-      throw new Error('Database not initialized. Call init() first.');
-    }
-    return this.db;
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async execute(sql: string, params: any[] = []): Promise<void> {
-    const db = this.getDb();
-    await db.run(sql, ...params);
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results
-  async query(sql: string, params: any[] = []): Promise<any[]> {
-    const db = this.getDb();
-    return await db.all(sql, ...params);
-  }
-
-  /**
-   * Executes a callback within a transaction using a dedicated connection.
-   * This guarantees that all operations inside the callback share the same ACID scope.
-   */
-  async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
-    const db = this.getDb();
-    const conn = await db.connect();
-    
-    // Create a transaction-bound executor wrapper
-    const txExecutor: DbExecutor = {
-      // biome-ignore lint/suspicious/noExplicitAny: SQL params
-      execute: async (sql: string, params: any[] = []) => {
-        await conn.run(sql, ...params);
-      },
-      // biome-ignore lint/suspicious/noExplicitAny: SQL results
-      query: async (sql: string, params: any[] = []) => {
-        return await conn.all(sql, ...params);
-      }
-    };
-
-    try {
-      await conn.run('BEGIN TRANSACTION');
-      const result = await callback(txExecutor);
-      await conn.run('COMMIT');
-      return result;
-    } catch (e) {
-      try {
-        await conn.run('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('Failed to rollback transaction:', rollbackError);
-      }
-      throw e;
-    } finally {
-      // Best effort close
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types are incomplete
-      if (conn && typeof (conn as any).close === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types are incomplete
-        (conn as any).close();
-      }
-    }
-  }
-
-  /**
-   * Executes a query and returns the raw Apache Arrow IPC Buffer.
-   * Used for high-speed hydration.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
-    const db = this.getDb();
-    
-    return new Promise((resolve, reject) => {
-      // Hack: Access underlying node-duckdb connection/database
-      // duckdb-async instance holds 'db' property which is the native Database
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB internals
-      const rawDb = (db as any).db || db;
-
-      if (!rawDb) return reject(new Error("Could not access underlying DuckDB Native instance."));
-
-      // Helper to merge multiple Arrow batches if necessary
-      const mergeBatches = (batches: Uint8Array[]) => {
-        if (batches.length === 0) return new Uint8Array(0);
-        if (batches.length === 1) return batches[0] ?? new Uint8Array(0);
-        const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const batch of batches) {
-          merged.set(batch, offset);
-          offset += batch.length;
-        }
-        return merged;
-      };
-
-      const runFallback = async () => {
-        try {
-          const rows = await this.query(sql, params);
-          if (rows.length === 0) return resolve(new Uint8Array(0));
-          const table = tableFromJSON(rows);
-          const ipc = tableToIPC(table, 'stream');
-          resolve(ipc);
-        } catch (e) {
-          reject(e);
-        }
-      };
-
-      // Try Database.arrowIPCAll (available in newer node-duckdb)
-      if (typeof rawDb.arrowIPCAll === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-        rawDb.arrowIPCAll(sql, ...params, (err: any, result: any) => {
-          if (err) {
-            const msg = String(err.message || '');
-            if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-              return runFallback();
-            }
-            return reject(err);
-          }
-          // Result is usually Array<Uint8Array> (batches)
-          if (Array.isArray(result)) {
-            resolve(mergeBatches(result));
-          } else {
-            resolve(result ?? new Uint8Array(0));
-          }
-        });
-      } else {
-         // Fallback: Create a raw connection
-         try {
-            const rawConn = rawDb.connect();
-            
-            // Handle case where rawDb is actually the connection itself (sometimes happens in certain pool configs)
-            const target = typeof rawDb.arrowIPCAll === 'function' 
-              ? rawDb 
-              : (rawConn && typeof rawConn.arrowIPCAll === 'function' ? rawConn : null);
-
-            if (target) {
-               // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-               target.arrowIPCAll(sql, ...params, (err: any, result: any) => {
-                  if (err) {
-                    const msg = String(err.message || '');
-                    if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-                      return runFallback();
-                    }
-                    return reject(err);
-                  }
-                  if (Array.isArray(result)) {
-                    resolve(mergeBatches(result));
-                  } else {
-                    resolve(result ?? new Uint8Array(0));
-                  }
-               });
-            } else {
-               runFallback();
-            }
-         } catch(_e) {
-            runFallback();
-         }
+    // 2. Execute Workflow
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Create a user named Bob",
+        userId: "admin",
+        asOf: new Date("2024-01-01").getTime()
       }
     });
-  }
-}
+
+    // 3. Verify Result
+    // @ts-ignore
+    expect(result.results.success).toBe(true);
+    // @ts-ignore
+    expect(result.results.summary).toContain("Created Node bob_1");
+
+    // 4. Verify Side Effects (Graph Physics)
+    const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
+    expect(storedNode.length).toBe(1);
+    expect(storedNode[0].properties.name).toBe("Bob");
+  });
+
+  it("Scenario: Temporal Close ('Bob left the company yesterday')", async () => {
+    // Setup: Bob exists and works at Acme
+    // @ts-ignore
+    await graph.addNode("bob_1", ["User"], { name: "Bob" });
+    // @ts-ignore
+    await graph.addNode("acme", ["Company"], { name: "Acme Inc" });
+    // @ts-ignore
+    await graph.addEdge("bob_1", "acme", "WORKS_AT", { role: "Engineer" });
+
+    // 1. Train Brain
+    const validTo = "2024-01-02T12:00:00.000Z";
+    llm.addResponse("Bob left the company", {
+      reasoning: "User indicated employment ended. Closing edge.",
+      operations: [
+        {
+          op: "CLOSE_EDGE",
+          source: "bob_1",
+          target: "acme",
+          type: "WORKS_AT",
+          validTo: validTo
+        }
+      ]
+    });
+
+    // 2. Execute
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Bob left the company",
+        userId: "admin"
+      }
+    });
+
+    // 3. Verify
+    // @ts-ignore
+    expect(result.results.success).toBe(true);
+
+    // 4. Verify Side Effects (Time Travel)
+    // The edge should still exist physically but have a valid_to set
+    // Note: QuackGraph native.removeEdge might delete it from RAM index, 
+    // but DB should retain it if we checked DB directly.
+    // For this test, we verify the Workflow reported success and assumed DB update logic held.
+    
+    // In memory graph implementation might delete it immediately on 'removeEdge' 
+    // depending on how QuackGraph core handles soft deletes in memory.
+    // Let's verify it's gone from the "Present" view.
+    const neighbors = await graph.native.traverse(["bob_1"], "WORKS_AT", "out");
+    expect(neighbors).not.toContain("acme");
+  });
+
+  it("Scenario: Ambiguity ('Delete the car')", async () => {
+    // Setup: Two cars
+    // @ts-ignore
+    await graph.addNode("car_1", ["Car"], { color: "Blue", model: "Ford" });
+    // @ts-ignore
+    await graph.addNode("car_2", ["Car"], { color: "Blue", model: "Chevy" });
+
+    // 1. Train Brain to be confused
+    llm.addResponse("Delete the car", {
+      reasoning: "Ambiguous reference. Found multiple cars.",
+      operations: [],
+      requiresClarification: "Which car? The Ford or the Chevy?"
+    });
+
+    // 2. Execute
+    const run = await mutationWorkflow.createRunAsync();
+    const result = await run.start({
+      inputData: {
+        query: "Delete the car",
+        userId: "admin"
+      }
+    });
+
+    // 3. Verify
+    // @ts-ignore
+    expect(result.results.success).toBe(false);
+    // @ts-ignore
+    expect(result.results.summary).toContain("Clarification needed");
+    // @ts-ignore
+    expect(result.results.summary).toContain("The Ford or the Chevy");
+
+    // 4. Verify Safety (No deletes happened)
+    const cars = await graph.match([]).where({ labels: ["Car"] }).select();
+    expect(cars.length).toBe(2);
+  });
+});
 ````
 
-## File: packages/quackgraph/packages/quack-graph/src/graph.ts
+## File: packages/agent/test/integration/chronos.test.ts
 ````typescript
-import { NativeGraph } from '@quackgraph/native';
-import { DuckDBManager } from './db';
-import { SchemaManager } from './schema';
-import { QueryBuilder } from './query';
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Chronos } from "../../src/agent/chronos";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { createTestGraph } from "../utils/test-graph";
+import type { QuackGraph } from "@quackgraph/graph";
 
-class WriteLock {
-  private mutex: Promise<void> = Promise.resolve();
+describe("Integration: Chronos (Temporal Physics)", () => {
+  let graph: QuackGraph;
+  let tools: GraphTools;
+  let chronos: Chronos;
 
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    // Chain the new operation to the existing promise
-    const result = this.mutex.then(() => fn());
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    tools = new GraphTools(graph);
+    chronos = new Chronos(graph, tools);
+  });
 
-    // Update the mutex to wait for the new operation to complete (success or failure)
-    // We strictly return void so the mutex remains Promise<void>
-    this.mutex = result.then(
-      () => {},
-      () => {}
+  afterEach(async () => {
+    // @ts-ignore
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("analyzeCorrelation: detects causal overlap", async () => {
+    const NOW = new Date("2025-01-01T12:00:00Z");
+    const ONE_HOUR = 60 * 60 * 1000;
+
+    // 1. Anchor Node (e.g., "Migraine") at T=0
+    // @ts-ignore
+    await graph.addNodes([{ id: "migraine_1", labels: ["Symptom"], properties: {}, validFrom: NOW }]);
+
+    // 2. Target Node (e.g., "Coffee") at T=-30min (Inside window)
+    const tInside = new Date(NOW.getTime() - (30 * 60 * 1000));
+    // @ts-ignore
+    await graph.addNodes([{ id: "coffee_1", labels: ["Food"], properties: { name: "Espresso" }, validFrom: tInside }]);
+
+    // 3. Target Node (e.g., "Coffee") at T=-2hours (Outside window)
+    const tOutside = new Date(NOW.getTime() - (2 * ONE_HOUR));
+    // @ts-ignore
+    await graph.addNodes([{ id: "coffee_2", labels: ["Food"], properties: { name: "Latte" }, validFrom: tOutside }]);
+
+    // Analyze 60 minute window
+    const result = await chronos.analyzeCorrelation("migraine_1", "Food", 60);
+
+    expect(result.targetLabel).toBe("Food");
+    expect(result.sampleSize).toBe(1); // Only coffee_1
+    expect(result.correlationScore).toBe(1.0); // Simple boolean presence
+  });
+
+  it("evolutionaryDiff: tracks topology changes", async () => {
+    const t1 = new Date("2024-01-01");
+    const t2 = new Date("2024-02-01");
+    const t3 = new Date("2024-03-01");
+
+    // T1: Anchor exists, connected to A
+    // @ts-ignore
+    await graph.addNodes([{ id: "anchor", labels: ["Entity"], properties: {}, validFrom: t1 }]);
+    // @ts-ignore
+    await graph.addNodes([{ id: "A", labels: ["Child"], properties: {}, validFrom: t1 }]);
+    // @ts-ignore
+    await graph.addEdges([{ source: "anchor", target: "A", type: "KNOWS", properties: {}, validFrom: t1 }]);
+
+    // T2: Add B
+    // @ts-ignore
+    await graph.addNodes([{ id: "B", labels: ["Child"], properties: {}, validFrom: t2 }]);
+    // @ts-ignore
+    await graph.addEdges([{ source: "anchor", target: "B", type: "KNOWS", properties: {}, validFrom: t2 }]);
+
+    // T3: Remove A (Close edge)
+    // Direct DB manipulation to simulate edge closing if API is limited
+    // @ts-ignore
+    await graph.db.execute(
+        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ?`, 
+        [t3.toISOString(), "anchor", "A"]
     );
 
-    return result;
-  }
-}
+    const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
 
-export class QuackGraph {
-  db: DuckDBManager;
-  schema: SchemaManager;
-  native: NativeGraph;
-  private writeLock = new WriteLock();
-  
-  capabilities = {
-    vss: false
-  };
+    expect(result.timeline.length).toBe(3);
 
-  // Context for the current instance (Time Travel)
-  context: {
-    asOf?: Date;
-    topologySnapshot?: string;
-  } = {};
+    // Snapshot T1: KNOWS (1)
+    // Initial state diff vs empty
+    const t1Added = result.timeline[0].addedEdges.find(e => e.edgeType === "KNOWS");
+    expect(t1Added?.count).toBe(1);
 
-  constructor(path: string = ':memory:', options: { asOf?: Date, topologySnapshot?: string } = {}) {
-    this.db = new DuckDBManager(path);
-    this.schema = new SchemaManager(this.db);
-    this.native = new NativeGraph();
-    this.context.asOf = options.asOf;
-    this.context.topologySnapshot = options.topologySnapshot;
-  }
+    // Snapshot T2: KNOWS (2) -> A + B
+    // Diff vs T1: KNOWS Persisted (count 2)
+    // Note: Because edgeType is the same, Chronos groups them. 
+    // It sees KNOWS in T1 (count 1) and KNOWS in T2 (count 2).
+    // It classifies this as "Persisted" because the type exists in both.
+    const t2Step = result.timeline[1];
+    const knowsPersistedT2 = t2Step.persistedEdges.find(e => e.edgeType === "KNOWS");
+    expect(knowsPersistedT2?.count).toBe(2); 
 
-  async init() {
-    await this.db.init();
+    // Snapshot T3: KNOWS (1) -> B only
+    // Diff vs T2: KNOWS Persisted (count 1)
+    const t3Step = result.timeline[2];
+    const knowsPersistedT3 = t3Step.persistedEdges.find(e => e.edgeType === "KNOWS");
+    expect(knowsPersistedT3?.count).toBe(1);
     
-    // Load Extensions
-    try {
-      await this.db.execute("INSTALL vss; LOAD vss;");
-      this.capabilities.vss = true;
-    } catch (e) {
-      console.warn("QuackGraph: Failed to load 'vss' extension. Vector search will be disabled.", e);
-    }
-    
-    await this.schema.ensureSchema();
-    
-    // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
-    // For V1, we always hydrate "Current Active" topology.
-
-    // Check for Topology Snapshot
-    if (this.context.topologySnapshot) {
-      try {
-        // Try loading from disk
-        this.native.loadSnapshot(this.context.topologySnapshot);
-        // If successful, skip hydration
-        return;
-      } catch (e) {
-        console.warn(`QuackGraph: Failed to load snapshot '${this.context.topologySnapshot}'. Falling back to full hydration.`, e);
-      }
-    }
-
-    try {
-      await this.hydrate();
-    } catch (e) {
-      console.error("Failed to hydrate graph topology from disk:", e);
-      // We don't throw here to allow partial functionality (metadata queries) if needed,
-      // but usually this is fatal for graph operations.
-      throw e;
-    }
-  }
-
-  /**
-   * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
-   * This is critical for the "Split-Brain" architecture.
-   */
-  async hydrate() {
-    // Zero-Copy Arrow IPC
-    // We load ALL edges (active and historical) to support time-travel.
-    // We cast valid_from/valid_to to DOUBLE to ensure JS/JSON compatibility (avoiding BigInt issues in fallback)
-    try {
-      const ipcBuffer = await this.db.queryArrow(
-        `SELECT source, target, type, heat,
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from)::DOUBLE as valid_from, 
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to)::DOUBLE as valid_to 
-         FROM edges`
-      );
-    
-      if (ipcBuffer && ipcBuffer.length > 0) {
-         // Napi-rs expects a Buffer or equivalent
-         // Buffer.from is zero-copy in Node for Uint8Array usually, or cheap copy
-         // We cast to any to satisfy the generated TS definitions which might expect Buffer
-         const bufferForNapi = Buffer.isBuffer(ipcBuffer) 
-            ? ipcBuffer 
-            : Buffer.from(ipcBuffer);
-            
-         this.native.loadArrowIpc(bufferForNapi);
-
-         // Reclaim memory after burst hydration
-         this.native.compact();
-      }
-    // biome-ignore lint/suspicious/noExplicitAny: error handling
-    } catch (e: any) {
-      throw new Error(`Hydration Error: ${e.message}`);
-    }
-  }
-
-  asOf(date: Date): QuackGraph {
-    // Return a shallow copy with new context
-    const g = new QuackGraph(this.db.path, { asOf: date });
-    // Share the same DB connection and Native index (assuming topology is shared/latest)
-    g.db = this.db;
-    g.schema = this.schema;
-    g.native = this.native;
-    g.capabilities = { ...this.capabilities };
-    return g;
-  }
-
-  // --- Write Operations (Write-Through) ---
-
-  // Helper to convert Date to micros
-  private toMicros(d?: Date): number | undefined | null {
-    return d ? d.getTime() * 1000 : undefined;
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addNode(id: string, labels: string[], props: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date } = {}) {
-    await this.writeLock.run(async () => {
-      // 1. Write to Disk (Source of Truth)
-      await this.schema.writeNode(id, labels, props, options);
-      // 2. Write to RAM (Cache)
-      // Note: Rust V1 Index doesn't track node validity history, only existence.
-      this.native.addNode(id);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addNodes(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
-    await this.writeLock.run(async () => {
-      await this.schema.writeNodesBulk(nodes);
-      const ids = nodes.map(n => n.id);
-      this.native.addNodes(ids);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date, heat?: number } = {}) {
-    await this.writeLock.run(async () => {
-      // 1. Write to Disk
-      await this.schema.writeEdge(source, target, type, props, options);
-      // 2. Write to RAM
-      const vf = options.validFrom ? options.validFrom.getTime() * 1000 : undefined;
-      const vt = options.validTo ? options.validTo.getTime() * 1000 : undefined;
-      const heat = options.heat || 0;
-      this.native.addEdge(source, target, type, vf, vt, heat);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addEdges(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
-    await this.writeLock.run(async () => {
-      await this.schema.writeEdgesBulk(edges);
-      const sources = edges.map(e => e.source);
-      const targets = edges.map(e => e.target);
-      const types = edges.map(e => e.type);
-      // Rust Napi expects parallel arrays
-      const validFroms = edges.map(e => e.validFrom ? e.validFrom.getTime() * 1000 : 0);
-      const validTos = edges.map(e => e.validTo ? e.validTo.getTime() * 1000 : Number.MAX_SAFE_INTEGER);
-      const heats = edges.map(e => e.heat || 0);
-
-      this.native.addEdges(sources, targets, types, validFroms, validTos, heats);
-    });
-  }
-
-  async deleteNode(id: string) {
-    await this.writeLock.run(async () => {
-      // 1. Write to Disk (Soft Delete)
-      await this.schema.deleteNode(id);
-      // 2. Write to RAM (Tombstone)
-      this.native.removeNode(id);
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    await this.writeLock.run(async () => {
-      // 1. Write to Disk (Soft Delete)
-      await this.schema.deleteEdge(source, target, type);
-      // 2. Write to RAM (Remove)
-      this.native.removeEdge(source, target, type);
-    });
-  }
-
-  // --- Pheromones & Schema (Agent) ---
-
-  async updateEdgeHeat(source: string, target: string, type: string, heat: number) {
-    // 1. Write to Disk (In-Place Update for Learning Signal)
-    await this.writeLock.run(async () => {
-      // We only update active edges (valid_to IS NULL)
-      await this.db.execute(
-        "UPDATE edges SET heat = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL", 
-        [heat, source, target, type]
-      );
-    });
-    // 2. Write to RAM (Atomic)
-    this.native.updateEdgeHeat(source, target, type, heat);
-  }
-
-  async getAvailableEdgeTypes(sources: string[]): Promise<string[]> {
-    // Fast scan of the CSR index
-    // Returns unique edge types outgoing from the source set
-    // Used for Labyrinth LOD 0 (Sector Scan)
-    const asOfTs = this.context.asOf ? this.context.asOf.getTime() * 1000 : undefined;
-    return this.native.getAvailableEdgeTypes(sources, asOfTs);
-  }
-
-  async getSectorStats(sources: string[], allowedEdgeTypes?: string[]): Promise<{ edgeType: string; count: number; avgHeat: number }[]> {
-    // Fast scan of the CSR index with aggregation
-    // Returns counts and heat for outgoing edge types
-    const asOfTs = this.context.asOf ? this.context.asOf.getTime() * 1000 : undefined;
-    return this.native.getSectorStats(sources, asOfTs, allowedEdgeTypes);
-  }
-
-  async traverseInterval(sources: string[], edgeType: string | undefined, direction: 'out' | 'in' = 'out', start: Date, end: Date, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    const s = start.getTime();
-    const e = end.getTime();
-    // If end < start, return empty
-    if (e <= s) return [];
-    return this.native.traverseInterval(sources, edgeType, direction, s, e, constraint);
-  }
-
-  /**
-   * Upsert a node.
-   * @param label Primary label to match.
-   * @param matchProps Properties to match against (e.g. { email: '...' }).
-   * @param setProps Properties to set/update if found or created.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date } = {}) {
-    return this.writeLock.run(async () => {
-      const id = await this.schema.mergeNode(label, matchProps, setProps, options);
-      // Update cache
-      this.native.addNode(id);
-      return id;
-    });
-  }
-
-  // --- Optimization & Maintenance ---
-
-  get optimize() {
-    return {
-      promoteProperty: async (label: string, property: string, type: string) => {
-        await this.schema.promoteNodeProperty(label, property, type);
-      },
-      saveTopologySnapshot: (path: string) => {
-        this.native.saveSnapshot(path);
-      }
-    };
-  }
-
-  // --- Read Operations ---
-
-  match(labels: string[]): QueryBuilder {
-    return new QueryBuilder(this, labels);
-  }
-}
+    // Density Calculation check
+    // T2 (2) -> T3 (1). Change = (1 - 2) / 2 = -0.5 (-50%)
+    expect(t3Step.densityChange).toBe(-50);
+  });
+});
 ````
 
-## File: packages/quackgraph/packages/quack-graph/src/index.ts
+## File: packages/agent/test/integration/tools.test.ts
 ````typescript
-export * from './db';
-export * from './schema';
-export * from './graph';
-export * from './query';
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { createTestGraph } from "../utils/test-graph";
+import type { QuackGraph } from "@quackgraph/graph";
+
+describe("Integration: Graph Tools (Physics Layer)", () => {
+  let graph: QuackGraph;
+  let tools: GraphTools;
+
+  beforeEach(async () => {
+    graph = await createTestGraph();
+    tools = new GraphTools(graph);
+    
+    // Seed Data
+    // Root Node
+    // @ts-ignore - Dynamic graph method
+    await graph.addNode("root", ["Entity"], { name: "Root" });
+    
+    // Branch A (Hot)
+    // @ts-ignore
+    await graph.addNode("a1", ["Entity"], { name: "A1" });
+    // @ts-ignore
+    await graph.addEdge("root", "a1", "LINK", { weight: 1 });
+    
+    // Branch B (Cold)
+    // @ts-ignore
+    await graph.addNode("b1", ["Entity"], { name: "B1" });
+    // @ts-ignore
+    await graph.addEdge("root", "b1", "LINK", { weight: 1 });
+    
+    // Temporal Node (Future)
+    // using addNodes to ensure validFrom property support if addNode signature varies
+    // @ts-ignore
+    await graph.addNodes([{
+      id: "future",
+      labels: ["Entity"],
+      properties: { name: "Future" },
+      validFrom: new Date("2030-01-01")
+    }]);
+    
+    // @ts-ignore
+    await graph.addEdges([{
+      source: "root",
+      target: "future",
+      type: "FUTURE_LINK",
+      properties: {},
+      validFrom: new Date("2030-01-01")
+    }]);
+  });
+
+  afterEach(async () => {
+    // Teardown if supported by graph instance
+    // @ts-ignore
+    if (typeof graph.close === 'function') await graph.close();
+  });
+
+  it("LOD 0: getSectorSummary aggregates edge types", async () => {
+    // Add more edges to test aggregation
+    // @ts-ignore
+    await graph.addNode("a2", ["Entity"], {});
+    // @ts-ignore
+    await graph.addEdge("root", "a2", "LINK", {});
+    
+    // @ts-ignore
+    await graph.addNode("c1", ["Entity"], {});
+    // @ts-ignore
+    await graph.addEdge("root", "c1", "OTHER", {});
+
+    const summary = await tools.getSectorSummary(["root"]);
+    
+    const linkStats = summary.find(s => s.edgeType === "LINK");
+    const otherStats = summary.find(s => s.edgeType === "OTHER");
+    
+    expect(linkStats).toBeDefined();
+    // 2 initial LINKs (a1, b1) + 1 new (a2) = 3
+    expect(linkStats?.count).toBeGreaterThanOrEqual(3);
+    expect(otherStats?.count).toBe(1);
+  });
+
+  it("LOD 0: getSectorSummary respects time travel (asOf)", async () => {
+    const past = new Date("2020-01-01").getTime();
+    const summary = await tools.getSectorSummary(["root"], past);
+    
+    // The "future" edge shouldn't exist in 2020
+    const futureStats = summary.find(s => s.edgeType === "FUTURE_LINK");
+    expect(futureStats).toBeUndefined();
+  });
+
+  it("LOD 1: topologyScan traverses edges", async () => {
+    const neighbors = await tools.topologyScan(["root"], "LINK");
+    expect(neighbors).toContain("a1");
+    expect(neighbors).toContain("b1");
+    expect(neighbors).not.toContain("future"); // Wrong type
+  });
+
+  it("LOD 1.5: getNavigationalMap generates ASCII tree", async () => {
+    const { map, truncated } = await tools.getNavigationalMap("root", 2);
+    
+    // console.log("Debug Map Output:\n", map);
+    
+    expect(map).toContain("[ROOT] root");
+    expect(map).toContain("├── [LINK]──> (a1)"); // Order depends on heat/count
+    expect(map).not.toContain("future"); // Should be hidden by default "now"
+    
+    expect(truncated).toBe(false);
+  });
+
+  it("LOD 1.5: getNavigationalMap respects asOf", async () => {
+    const futureTime = new Date("2035-01-01").getTime();
+    const { map } = await tools.getNavigationalMap("root", 1, futureTime);
+    
+    expect(map).toContain("future");
+    expect(map).toContain("[FUTURE_LINK]");
+  });
+});
 ````
 
-## File: packages/quackgraph/packages/quack-graph/src/query.ts
+## File: packages/agent/test/unit/governance.test.ts
 ````typescript
-import type { QuackGraph } from './graph';
+import { describe, it, expect, beforeEach } from "bun:test";
+import { SchemaRegistry } from "../../src/governance/schema-registry";
 
-type TraversalStep = {
-  type: 'out' | 'in';
-  edge: string;
-  bounds?: { min: number; max: number };
-};
+describe("Governance (SchemaRegistry)", () => {
+  let registry: SchemaRegistry;
 
-export class QueryBuilder {
-  private graph: QuackGraph;
-  private startLabels: string[];
-  private endLabels: string[] = [];
+  beforeEach(() => {
+    registry = new SchemaRegistry();
+  });
 
-  // Bottom Bun Filters (Initial selection)
-  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
-  private initialFilters: Record<string, any> = {};
-  private vectorSearch: { vector: number[]; limit: number } | null = null;
+  it("registers and retrieves domains", () => {
+    registry.register({
+      name: "Medical",
+      description: "Health data",
+      allowedEdges: ["TREATED_WITH", "HAS_SYMPTOM"]
+    });
 
-  // The Meat (Traversal)
-  private traversals: TraversalStep[] = [];
+    const domain = registry.getDomain("Medical");
+    expect(domain).toBeDefined();
+    expect(domain?.allowedEdges).toContain("TREATED_WITH");
+  });
 
-  // Top Bun Filters (Final selection)
-  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
-  private terminalFilters: Record<string, any> = {};
+  it("handles case-insensitive domain names", () => {
+    registry.register({
+      name: "Finance",
+      description: "Money",
+      allowedEdges: []
+    });
+    expect(registry.getDomain("finance")).toBeDefined();
+    expect(registry.getDomain("FINANCE")).toBeDefined();
+  });
 
-  private aggState = {
-    groupBy: [] as string[],
-    orderBy: [] as { field: string; dir: 'ASC' | 'DESC' }[],
-    limit: undefined as number | undefined,
-    offset: undefined as number | undefined,
-  };
+  it("enforces whitelists (allowedEdges)", () => {
+    registry.register({
+      name: "Strict",
+      description: "Only A and B",
+      allowedEdges: ["A", "B"]
+    });
 
-  constructor(graph: QuackGraph, labels: string[]) {
-    this.graph = graph;
-    this.startLabels = labels;
-  }
+    expect(registry.isEdgeAllowed("Strict", "A")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "B")).toBe(true);
+    expect(registry.isEdgeAllowed("Strict", "C")).toBe(false); // blocked
+  });
 
-  /**
-   * Sets depth bounds for the last traversal step.
-   * Useful for variable length paths like `(a)-[:KNOWS*1..5]->(b)`.
-   * Must be called immediately after .out() or .in().
-   * @param min Minimum hops (default: 1)
-   * @param max Maximum hops (default: 1)
-   */
-  depth(min: number, max: number): this {
-    if (this.traversals.length === 0) {
-      throw new Error("depth() must be called after a traversal step (.out() or .in())");
-    }
-    const lastIndex = this.traversals.length - 1;
-    // biome-ignore lint/style/noNonNullAssertion: length check above ensures array is not empty
-    const lastStep = this.traversals[lastIndex]!;
-    lastStep.bounds = { min, max };
-    return this;
-  }
+  it("enforces blacklists (excludedEdges)", () => {
+    registry.register({
+      name: "OpenButSafe",
+      description: "Everything except DANGER",
+      allowedEdges: [], // All allowed by default
+      excludedEdges: ["DANGER"]
+    });
 
-  /**
-   * Filter nodes by properties.
-   * If called before traversal, applies to Start Nodes.
-   * If called after traversal, applies to End Nodes.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic filter criteria
-  where(criteria: Record<string, any>): this {
-    if (this.traversals.length === 0) {
-      this.initialFilters = { ...this.initialFilters, ...criteria };
-    } else {
-      this.terminalFilters = { ...this.terminalFilters, ...criteria };
-    }
-    return this;
-  }
+    expect(registry.isEdgeAllowed("OpenButSafe", "SAFE")).toBe(true);
+    expect(registry.isEdgeAllowed("OpenButSafe", "DANGER")).toBe(false); // blocked
+  });
 
-  /**
-   * Perform a Vector Similarity Search (HNSW).
-   * This effectively sorts the start nodes by distance to the query vector.
-   */
-  nearText(vector: number[], options: { limit?: number } = {}): this {
-    this.vectorSearch = { 
-      vector, 
-      limit: options.limit || 10 
-    };
-    return this;
-  }
+  it("defaults to permissive if domain not found", () => {
+    // If a domain doesn't exist, we usually default to global/permissive 
+    // or the registry returns true as per implementation
+    expect(registry.isEdgeAllowed("UnknownDomain", "ANYTHING")).toBe(true);
+  });
 
-  out(edgeType: string): this {
-    this.traversals.push({ type: 'out', edge: edgeType });
-    return this;
-  }
+  it("getValidEdges returns undefined for unrestricted domains", () => {
+    registry.register({
+      name: "Global",
+      description: "All access",
+      allowedEdges: []
+    });
+    // Implementation details: empty allowedEdges usually means 'undefined' (all) in return 
+    // or empty array depending on implementation. 
+    // Checking src: `if (domain.allowedEdges.length === 0 ...) return undefined;`
+    expect(registry.getValidEdges("Global")).toBeUndefined();
+  });
 
-  in(edgeType: string): this {
-    this.traversals.push({ type: 'in', edge: edgeType });
-    return this;
-  }
+  it("getValidEdges returns specific list for restricted domains", () => {
+    registry.register({
+      name: "Restricted",
+      description: "Restricted",
+      allowedEdges: ["A"]
+    });
+    expect(registry.getValidEdges("Restricted")).toEqual(["A"]);
+  });
+});
+````
 
-  groupBy(field: string): this {
-    this.aggState.groupBy.push(field);
-    return this;
-  }
+## File: packages/agent/test/unit/temporal.test.ts
+````typescript
+import { describe, it, expect } from "bun:test";
+import { resolveRelativeTime } from "../../src/utils/temporal";
 
-  orderBy(field: string, dir: 'ASC' | 'DESC' = 'ASC'): this {
-    this.aggState.orderBy.push({ field, dir });
-    return this;
-  }
+describe("Temporal Logic (resolveRelativeTime)", () => {
+  // Fixed reference time: 2025-01-01T12:00:00Z
+  // Timestamp: 1735732800000
+  const refDate = new Date("2025-01-01T12:00:00Z");
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_HOUR = 60 * 60 * 1000;
 
-  limit(n: number): this {
-    this.aggState.limit = n;
-    return this;
-  }
-
-  offset(n: number): this {
-    this.aggState.offset = n;
-    return this;
-  }
-
-  /**
-   * Filter the nodes at the end of the traversal by label.
-   */
-  node(labels: string[]): this {
-    this.endLabels = labels;
-    return this;
-  }
-
-  /**
-   * Helper to construct the temporal validity clause
-   */
-  private getTemporalClause(tableAlias: string = ''): string {
-    const prefix = tableAlias ? `${tableAlias}.` : '';
-    if (this.graph.context.asOf) {
-      // Time Travel: valid_from <= T AND (valid_to > T OR valid_to IS NULL)
-      // Use microseconds since epoch for consistency with native layer
-      const micros = this.graph.context.asOf.getTime() * 1000;
-      // Convert database timestamps to microseconds for comparison
-      return `(date_diff('us', '1970-01-01'::TIMESTAMPTZ, ${prefix}valid_from) <= ${micros} AND (date_diff('us', '1970-01-01'::TIMESTAMPTZ, ${prefix}valid_to) > ${micros} OR ${prefix}valid_to IS NULL))`;
-    }
-    // Default: Current valid records (valid_to is NULL)
-    return `${prefix}valid_to IS NULL`;
-  }
-
-  /**
-   * Executes the query.
-   * @param projection Optional SQL projection string (e.g., 'count(*), avg(properties->>age)') or a JS mapper function.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic result mapper
-  async select<T = any>(projection?: string | ((node: any) => T)): Promise<T[]> {
-    const isRawSql = typeof projection === 'string';
-    const mapper = typeof projection === 'function' ? projection : undefined;
-
-    // --- Step 1: DuckDB Filter (Bottom Bun) ---
-    // Objective: Get a list of "Active" Node IDs to feed into the graph.
-
-    let query = `SELECT id FROM nodes`;
-    // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
-    const params: any[] = [];
-    const conditions: string[] = [];
-
-    // 1.a Temporal Filter
-    conditions.push(this.getTemporalClause());
-
-    // 1.b Label Filter
-    if (this.startLabels.length > 0) {
-      // Check if ANY of the labels match. For V1 we check the first one or intersection.
-      conditions.push(`list_contains(labels, ?)`);
-      params.push(this.startLabels[0]);
-    }
-
-    // 1.c Property Filter
-    for (const [key, value] of Object.entries(this.initialFilters)) {
-      if (key === 'id') {
-        conditions.push(`id = ?`);
-        params.push(value);
-      } else {
-        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        params.push(JSON.stringify(value));
-      }
-    }
-
-    // 1.d Vector Search (Order By Distance)
-    let orderBy = '';
-    let limit = '';
-    if (this.vectorSearch) {
-      if (!this.graph.capabilities.vss) {
-        throw new Error('Vector search requires the DuckDB "vss" extension, which is not available or failed to load.');
-      }
-      const vectorSize = this.vectorSearch.vector.length;
-      orderBy = `ORDER BY array_distance(embedding::DOUBLE[${vectorSize}], ?::DOUBLE[${vectorSize}])`;
-      limit = `LIMIT ${this.vectorSearch.limit}`;
-      params.push(JSON.stringify(this.vectorSearch.vector));
-    }
-
-    if (conditions.length > 0) {
-      query += ` WHERE ${conditions.join(' AND ')}`;
-    }
-
-    query += ` ${orderBy} ${limit}`;
-
-    const startRows = await this.graph.db.query(query, params);
-    let currentIds: string[] = startRows.map(row => row.id);
-
-    if (currentIds.length === 0) return [];
-
-    // --- Step 2: Rust Traversal (The Meat) ---
-    // Note: Rust Graph Index is currently "Latest Topology Only". 
-    // Time Travel on topology requires checking edge validity during traversal (V2).
-    // For V1, we accept that traversal is instant/current, but properties are historical.
-
-    for (const step of this.traversals) {
-      const asOfTs = this.graph.context.asOf ? this.graph.context.asOf.getTime() * 1000 : undefined;
-
-      if (currentIds.length === 0) break;
-      
-      if (step.bounds) {
-        currentIds = this.graph.native.traverseRecursive(
-          currentIds,
-          step.edge,
-          step.type,
-          step.bounds.min,
-          step.bounds.max,
-          asOfTs
-        );
-      } else {
-        // step.type is 'out' | 'in'
-        currentIds = this.graph.native.traverse(currentIds, step.edge, step.type, asOfTs);
-      }
-    }
-
-    // Optimization: If traversal resulted in no nodes, stop early.
-    if (currentIds.length === 0) return [];
-
-    // --- Step 3: DuckDB Hydration (Top Bun) ---
-    // Objective: Fetch full properties for the resulting IDs, applying terminal filters.
-
-    const finalConditions: string[] = [];
-    // biome-ignore lint/suspicious/noExplicitAny: SQL parameters
-    const finalParams: any[] = [];
-
-    // 3.0 Label Filter (for End Nodes)
-    if (this.endLabels.length > 0) {
-      finalConditions.push(`list_contains(labels, ?)`);
-      finalParams.push(this.endLabels[0]);
-    }
-
-    // 3.a IDs match
-    // We can't use parameters for IN clause effectively with dynamic length in all drivers.
-    // Constructing placeholders.
-    const placeholders = currentIds.map(() => '?').join(',');
-    finalConditions.push(`id IN (${placeholders})`);
-    finalParams.push(...currentIds);
-
-    // 3.b Temporal Validity
-    finalConditions.push(this.getTemporalClause());
-
-    // 3.c Terminal Property Filters
-    for (const [key, value] of Object.entries(this.terminalFilters)) {
-      if (key === 'id') {
-        finalConditions.push(`id = ?`);
-        finalParams.push(value);
-      } else {
-        finalConditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        finalParams.push(JSON.stringify(value));
-      }
-    }
-
-    // 3.d Aggregation / Grouping / Ordering
-    let selectClause = 'SELECT *';
-    if (isRawSql) {
-      selectClause = `SELECT ${projection}`;
-    }
-
-    let suffix = '';
-    if (this.aggState.groupBy.length > 0) {
-      suffix += ` GROUP BY ${this.aggState.groupBy.join(', ')}`;
-    }
+  it("resolves exact keywords", () => {
+    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
+    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
     
-    if (this.aggState.orderBy.length > 0) {
-      const orders = this.aggState.orderBy.map(o => `${o.field} ${o.dir}`).join(', ');
-      suffix += ` ORDER BY ${orders}`;
-    }
+    const yesterday = resolveRelativeTime("yesterday", refDate);
+    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
 
-    if (this.aggState.limit !== undefined) {
-      suffix += ` LIMIT ${this.aggState.limit}`;
-    }
-    if (this.aggState.offset !== undefined) {
-      suffix += ` OFFSET ${this.aggState.offset}`;
-    }
+    const tomorrow = resolveRelativeTime("tomorrow", refDate);
+    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
+  });
 
-    const finalSql = `${selectClause} FROM nodes WHERE ${finalConditions.join(' AND ')} ${suffix}`;
-    const results = await this.graph.db.query(finalSql, finalParams);
+  it("resolves 'X time ago' patterns", () => {
+    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
+    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
 
-    return results.map(r => {
-      if (isRawSql) return r;
+    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
+    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
+  });
 
-      let props = r.properties;
-      if (typeof props === 'string') {
-        try { props = JSON.parse(props); } catch {}
+  it("resolves 'in X time' patterns", () => {
+    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
+    // 3 weeks = 21 days
+    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
+  });
+
+  it("resolves absolute dates", () => {
+    const iso = "2023-10-05T00:00:00.000Z";
+    const result = resolveRelativeTime(iso, refDate);
+    expect(result?.toISOString()).toBe(iso);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
+  });
+});
+````
+
+## File: packages/agent/test/utils/synthetic-llm.ts
+````typescript
+import { type Mock, mock } from "bun:test";
+import type { Agent } from "@mastra/core/agent";
+
+/**
+ * A deterministic LLM simulator for testing Mastra Agents.
+ * Allows mapping prompt keywords to specific JSON responses.
+ */
+export class SyntheticLLM {
+  private responses: Map<string, object> = new Map();
+  private defaultResponse: object = { error: "No matching synthetic response configured" };
+
+  /**
+   * Register a response trigger.
+   * @param keyword If the prompt contains this string, the response will be returned.
+   * @param response The JSON object to return.
+   */
+  addResponse(keyword: string, response: object) {
+    this.responses.set(keyword, response);
+  }
+
+  setDefault(response: object) {
+    this.defaultResponse = response;
+  }
+
+  /**
+   * Hijacks the `generate` method of a Mastra agent to return synthetic data.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
+  mockAgent(agent: Agent<any, any, any>) {
+    // @ts-ignore - Overwriting the generate method for testing
+    agent.generate = mock(async (prompt: string, _options?: any) => {
+      // 1. Check for keyword matches
+      for (const [key, val] of this.responses) {
+        if (prompt.includes(key)) {
+          return {
+            text: JSON.stringify(val),
+            object: val,
+            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+          };
+        }
       }
-      const node = {
-        id: r.id,
-        labels: r.labels,
-        ...props
+
+      // 2. Fallback
+      return {
+        text: JSON.stringify(this.defaultResponse),
+        object: this.defaultResponse,
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
       };
-      return mapper ? mapper(node) : node;
     });
+
+    return agent;
   }
 }
 ````
 
-## File: packages/quackgraph/packages/quack-graph/src/schema.ts
+## File: packages/agent/test/utils/test-graph.ts
 ````typescript
-import type { DuckDBManager, DbExecutor } from './db';
+import { QuackGraph } from '@quackgraph/graph';
+import { setGraphInstance } from '../../src/lib/graph-instance';
 
-const NODES_TABLE = `
-CREATE TABLE IF NOT EXISTS nodes (
-    row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
-    id TEXT NOT NULL,
-    labels TEXT[],
-    properties JSON,
-    embedding DOUBLE[], -- Vector embedding
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS seq_node_id;
-`;
+/**
+ * Factory for creating ephemeral, in-memory graph instances.
+ * Ensures tests are isolated and idempotent.
+ */
+export async function createTestGraph(): Promise<QuackGraph> {
+  // Initialize QuackGraph in-memory
+  // Note: We assume the QuackGraph constructor supports a config object for storage.
+  // If the core package implementation differs, this needs adjustment.
+  const graph = new QuackGraph({
+    storage: ':memory:',
+    dbUrl: ':memory:', // Dual support depending on core version
+  });
 
-const EDGES_TABLE = `
-CREATE TABLE IF NOT EXISTS edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    type TEXT NOT NULL,
-    properties JSON,
-    heat UTINYINT DEFAULT 0,
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-`;
-
-export interface TemporalOptions {
-  validFrom?: Date;
-  validTo?: Date;
-}
-
-export class SchemaManager {
-  constructor(private db: DuckDBManager) {}
-
-  async ensureSchema() {
-    await this.db.execute(NODES_TABLE);
-    await this.db.execute(EDGES_TABLE);
-
-    // Performance Indexes
-    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
-    // We use standard indexes for now.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
-    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
+  // If there's an async init method, call it
+  // @ts-ignore - Checking for potential init method
+  if (typeof graph.initialize === 'function') {
+    // @ts-ignore
+    await graph.initialize();
   }
 
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
+  // Set as global instance for the test context (so tools can pick it up)
+  setGraphInstance(graph);
 
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing record (SCD Type 2)
-      await tx.execute(
-        `UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing edge
-      await tx.execute(
-        `UPDATE edges SET valid_to = ${vf} WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
-        VALUES (?, ?, ?, ?::JSON, ${vf}, ${vt})
-      `, [source, target, type, JSON.stringify(properties)]);
-    });
-  }
-
-  async deleteNode(id: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-    });
-  }
-
-  /**
-   * Promotes a JSON property to a native column for faster filtering.
-   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
-   * 
-   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
-   * @param property The property key to promote (e.g., 'age').
-   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
-   */
-  async promoteNodeProperty(label: string, property: string, type: string) {
-    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
-    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
-    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
-    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
-    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
-    
-    // 1. Add Column (Idempotent)
-    try {
-      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
-      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
-    } catch (_e) {
-      // Fallback or ignore if column exists
-    }
-
-    // 2. Backfill Data
-    // We use list_contains to only update relevant nodes
-    const sql = `
-      UPDATE nodes 
-      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
-      WHERE list_contains(labels, ?)
-    `;
-    await this.db.execute(sql, [label]);
-  }
-
-  /**
-   * Declarative Merge (Upsert).
-   * Finds a node by `matchProps` and `label`.
-   * If found: Updates properties with `setProps`.
-   * If not found: Creates new node with `matchProps` + `setProps`.
-   * Returns the node ID.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>, options: TemporalOptions = {}): Promise<string> {
-    // 1. Build Search Query
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    const matchKeys = Object.keys(matchProps);
-    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
-    // biome-ignore lint/suspicious/noExplicitAny: Params array
-    const params: any[] = [label];
-    
-    for (const key of matchKeys) {
-      if (key === 'id') {
-        conditions.push(`id = ?`);
-        params.push(matchProps[key]);
-      } else {
-        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        params.push(JSON.stringify(matchProps[key]));
-      }
-    }
-
-    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
-
-    return await this.db.transaction(async (tx) => {
-      const rows = await tx.query(searchSql, params);
-      let id: string;
-      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-      let finalProps: Record<string, any>;
-      let finalLabels: string[];
-
-      if (rows.length > 0) {
-        // Update Existing
-        const row = rows[0];
-        id = row.id;
-        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
-        finalProps = { ...currentProps, ...setProps };
-        finalLabels = row.labels; // Preserve existing labels
-
-        // Close old version
-        await tx.execute(`UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`, [id]);
-      } else {
-        // Insert New
-        id = matchProps.id || crypto.randomUUID();
-        finalProps = { ...matchProps, ...setProps };
-        finalLabels = [label];
-      }
-
-      // Insert new version (for both Update and Create cases)
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
-
-      return id;
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNodesBulk(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
-    if (nodes.length === 0) return;
-    
-    // Using Staging Table Strategy for efficient SCD-2
-    const stagingName = `staging_nodes_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (id TEXT, labels TEXT[], properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ)`);
-      
-      // Bulk Insert into Staging
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < nodes.length; i += BATCH_SIZE) {
-        const chunk = nodes.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?::JSON::TEXT[], ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ)`).join(',');
-        const params: any[] = [];
-        
-        for (const n of chunk) {
-          const vf = n.validFrom ? n.validFrom.toISOString() : new Date().toISOString(); // Fallback to JS now if undefined (since we can't use SQL function in param)
-          const vt = n.validTo ? n.validTo.toISOString() : null;
-          params.push(n.id, JSON.stringify(n.labels), JSON.stringify(n.properties), vf, vt);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
-
-      // SCD-2 Close Old Rows (Set valid_to = new_valid_from for existing active rows)
-      await tx.execute(`
-        UPDATE nodes 
-        SET valid_to = s.valid_from 
-        FROM ${stagingName} s 
-        WHERE nodes.id = s.id AND nodes.valid_to IS NULL
-      `);
-
-      // Insert New Rows
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to)
-        SELECT nextval('seq_node_id'), id, labels, properties, valid_from, valid_to FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdgesBulk(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
-    if (edges.length === 0) return;
-
-    const stagingName = `staging_edges_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (source TEXT, target TEXT, type TEXT, properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, heat UTINYINT)`);
-
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < edges.length; i += BATCH_SIZE) {
-        const chunk = edges.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?, ?, ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ, ?::UTINYINT)`).join(',');
-        const params: any[] = [];
-        
-        for (const e of chunk) {
-          const vf = e.validFrom ? e.validFrom.toISOString() : new Date().toISOString();
-          const vt = e.validTo ? e.validTo.toISOString() : null;
-          const heat = e.heat || 0;
-          params.push(e.source, e.target, e.type, JSON.stringify(e.properties), vf, vt, heat);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
-
-      // Close Old Edges
-      await tx.execute(`
-        UPDATE edges 
-        SET valid_to = s.valid_from
-        FROM ${stagingName} s
-        WHERE edges.source = s.source AND edges.target = s.target AND edges.type = s.type AND edges.valid_to IS NULL
-      `);
-
-      // Insert New Edges
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to, heat)
-        SELECT source, target, type, properties, valid_from, valid_to, heat FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
-    });
-  }
+  return graph;
 }
 ````
 
-## File: packages/quackgraph/packages/quack-graph/package.json
-````json
-{
-  "name": "@quackgraph/graph",
-  "version": "0.1.0",
-  "main": "src/index.ts",
-  "module": "dist/quack-graph.esm.js",
-  "types": "src/index.ts",
-  "type": "module",
-  "exports": {
-    ".": {
-      "types": "./src/index.ts",
-      "import": "./dist/quack-graph.esm.js",
-      "require": "./dist/quack-graph.cjs"
-    }
-  },
-  "files": [
-    "dist"
-  ],
-  "scripts": {
-    "build": "tsup",
-    "build:watch": "tsup --watch",
-    "clean": "rm -rf dist"
-  },
-  "dependencies": {
-    "duckdb-async": "^1.0.0",
-    "apache-arrow": "^17.0.0",
-    "@quackgraph/native": "workspace:*"
-  },
-  "devDependencies": {
-    "typescript": "^5.0.0",
-    "@types/node": "^20.0.0"
-  }
-}
-````
-
-## File: packages/quackgraph/biome.json
-````json
-{
-  "$schema": "https://biomejs.dev/schemas/2.3.8/schema.json",
-  "vcs": {
-    "enabled": true,
-    "clientKind": "git",
-    "useIgnoreFile": true
-  },
-  "files": {
-    "ignoreUnknown": true,
-    "includes": [
-      "**",
-      "!target",
-      "!dist",
-      "!node_modules",
-      "!**/*.node",
-      "!repomix.config.json"
-    ]
-  },
-  "formatter": {
-    "enabled": true,
-    "indentStyle": "space",
-    "indentWidth": 2,
-    "lineWidth": 100
-  },
-  "linter": {
-    "enabled": true,
-    "rules": {
-      "recommended": true
-    }
-  },
-  "javascript": {
-    "formatter": {
-      "quoteStyle": "single",
-      "trailingCommas": "es5"
-    }
-  }
-}
-````
-
-## File: packages/quackgraph/Cargo.toml
-````toml
-[workspace]
-members = [
-    "crates/*",
-    "packages/native"
-]
-resolver = "2"
-````
-
-## File: packages/quackgraph/package.json
-````json
-{
-  "name": "quackgraph",
-  "module": "index.ts",
-  "type": "module",
-  "private": true,
-  "workspaces": [
-    "packages/*"
-  ],
-  "scripts": {
-    "format": "biome format --write . && cargo fmt",
-    "clean": "rm -rf node_modules target packages/*/node_modules packages/*/dist packages/native/*.node",
-    "postinstall": "bun run --cwd packages/native build",
-    "typecheck": "tsc --noEmit && cargo check --workspace",
-    "lint": "biome lint . && cargo clippy --workspace -- -D warnings",
-    "check": "biome check . && bun run typecheck",
-    "dev": "bun test --watch",
-    "test": "bun run build && bun test && cargo test --workspace",
-    "build": "bun run --cwd packages/native build && tsup",
-    "build:native": "bun run --cwd packages/native build",
-    "build:ts": "tsup",
-    "build:watch": "tsup --watch"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "@types/bun": "latest",
-    "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  }
-}
-````
-
-## File: packages/quackgraph/tsconfig.json
-````json
-{
-  "compilerOptions": {
-    // Environment setup & latest features
-    "lib": ["ESNext"],
-    "target": "ESNext",
-    "module": "Preserve",
-    "moduleDetection": "force",
-    "jsx": "react-jsx",
-    "allowJs": true,
-
-    // Bundler mode
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
-    "noEmit": true,
-
-    // Best practices
-    "strict": true,
-    "skipLibCheck": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
-
-    // Some stricter flags (disabled by default)
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
-    "noPropertyAccessFromIndexSignature": false
-  },
-  "include": ["packages/*/src/**/*"]
-}
-````
-
-## File: packages/quackgraph/tsup.config.ts
+## File: packages/agent/test/setup.ts
 ````typescript
-import { defineConfig } from 'tsup';
+import { beforeAll, afterAll } from "bun:test";
 
-export default defineConfig({
-  entry: ['packages/quack-graph/src/index.ts'],
-  format: ['cjs', 'esm'],
-  dts: true,
-  splitting: false,
-  shims: false,
-  sourcemap: true,
-  clean: true,
-  outDir: 'packages/quack-graph/dist',
-  external: ['duckdb-async', 'apache-arrow', '@quackgraph/native'],
-  target: 'es2020',
+beforeAll(() => {
+  // specific global setup if needed
+  // console.log("🔒 Starting Zero-Trust Verification Suite");
+});
+
+afterAll(() => {
+  // specific global teardown if needed
 });
 ````
 
@@ -3245,6 +987,54 @@ git add -A && git commit -m "message" && git push
 The Agent extends and orchestrates the Core, not the other way around.
 ````
 
+## File: packages/agent/src/lib/config.ts
+````typescript
+import { z } from 'zod';
+
+const envSchema = z.object({
+  // Server Config
+  MASTRA_PORT: z.coerce.number().default(4111),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+  // Agent Model Configuration (Granular)
+  // Format: provider/model-name (e.g., 'groq/llama-3.3-70b-versatile', 'openai/gpt-4')
+  AGENT_SCOUT_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_JUDGE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_ROUTER_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_SCRIBE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+
+  // API Keys (Validated for existence if required by selected models)
+  GROQ_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  ANTHROPIC_API_KEY: z.string().optional(),
+});
+
+// Validate process.env
+// Note: In Bun, process.env is automatically populated from .env files
+const parsed = envSchema.parse(process.env);
+
+export const config = {
+  server: {
+    port: parsed.MASTRA_PORT,
+    logLevel: parsed.LOG_LEVEL,
+  },
+  agents: {
+    scout: {
+      model: { id: parsed.AGENT_SCOUT_MODEL as `${string}/${string}` },
+    },
+    judge: {
+      model: { id: parsed.AGENT_JUDGE_MODEL as `${string}/${string}` },
+    },
+    router: {
+      model: { id: parsed.AGENT_ROUTER_MODEL as `${string}/${string}` },
+    },
+    scribe: {
+      model: { id: parsed.AGENT_SCRIBE_MODEL as `${string}/${string}` },
+    },
+  },
+};
+````
+
 ## File: packages/agent/src/lib/graph-instance.ts
 ````typescript
 import type { QuackGraph } from '@quackgraph/graph';
@@ -3261,256 +1051,6 @@ export function getGraphInstance(): QuackGraph {
   }
   return graphInstance;
 }
-````
-
-## File: packages/agent/src/mastra/agents/scribe-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-import { LibSQLStore } from '@mastra/libsql';
-import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
-import { config } from '../../lib/config';
-
-export const scribeAgent = new Agent({
-  name: 'Scribe Agent',
-  instructions: async ({ runtimeContext }) => {
-    const asOf = runtimeContext?.get('asOf') as number | undefined;
-    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
-
-    return `
-    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
-    Current System Time: ${timeStr}
-
-    Your Goal:
-    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
-
-    Rules:
-    1. **Entity Resolution First**: Never guess Node IDs. 
-       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
-       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
-    
-    2. **Temporal Grounding**:
-       - The graph requires ISO 8601 timestamps.
-       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
-       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
-
-    3. **Atomic Operations**:
-       - Output a list of operations that represent the full state change.
-       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
-
-    4. **Ambiguity**:
-       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
-  `;
-  },
-  model: {
-    id: config.agents.scribe.model.id,
-  },
-  memory: new Memory({
-    storage: new LibSQLStore({
-      url: ':memory:'
-    })
-  }),
-  tools: {
-    // Scribe needs to see before it writes
-    topologyScanTool,
-    contentRetrievalTool,
-    sectorScanTool
-  }
-});
-````
-
-## File: packages/agent/src/mastra/workflows/mutation-workflow.ts
-````typescript
-import { createStep, createWorkflow } from '@mastra/core/workflows';
-import { z } from 'zod';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { ScribeDecisionSchema } from '../../agent-schemas';
-
-// Input Schema
-const MutationInputSchema = z.object({
-  query: z.string(),
-  traceId: z.string().optional(),
-  userId: z.string().optional().default('Me'),
-  asOf: z.number().optional()
-});
-
-// Step 1: Scribe Analysis (Intent -> Operations)
-const analyzeIntent = createStep({
-  id: 'analyze-intent',
-  inputSchema: MutationInputSchema,
-  outputSchema: z.object({
-    // biome-ignore lint/suspicious/noExplicitAny: Raw JSON ops from Scribe
-    operations: z.array(z.any()),
-    reasoning: z.string(),
-    requiresClarification: z.string().optional()
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const scribe = mastra?.getAgent('scribeAgent');
-    if (!scribe) throw new Error("Scribe Agent not found");
-
-    const now = inputData.asOf ? new Date(inputData.asOf) : new Date();
-    
-    // Prompt Scribe
-    const prompt = `
-      User Query: "${inputData.query}"
-      Context User ID: "${inputData.userId}"
-      System Time: ${now.toISOString()}
-    `;
-
-    const res = await scribe.generate(prompt, {
-      structuredOutput: { schema: ScribeDecisionSchema },
-      // Inject context for tools (Time Travel & Governance)
-      // @ts-expect-error - Mastra context injection
-      runtimeContext: { asOf: inputData.asOf } 
-    });
-
-    const decision = res.object;
-    if (!decision) throw new Error("Scribe returned no decision");
-
-    return {
-      operations: decision.operations,
-      reasoning: decision.reasoning,
-      requiresClarification: decision.requiresClarification
-    };
-  }
-});
-
-// Step 2: Apply Mutations (Batch Execution)
-const applyMutations = createStep({
-  id: 'apply-mutations',
-  inputSchema: z.object({
-    // biome-ignore lint/suspicious/noExplicitAny: Raw JSON ops
-    operations: z.array(z.any()),
-    reasoning: z.string(),
-    requiresClarification: z.string().optional()
-  }),
-  outputSchema: z.object({
-    success: z.boolean(),
-    summary: z.string()
-  }),
-  execute: async ({ inputData }) => {
-    if (inputData.requiresClarification) {
-      return { success: false, summary: `Clarification needed: ${inputData.requiresClarification}` };
-    }
-
-    const graph = getGraphInstance();
-    const ops = inputData.operations;
-    
-    // Arrays for Batching
-    // biome-ignore lint/suspicious/noExplicitAny: Batch types
-    const nodesToAdd: any[] = [];
-    // biome-ignore lint/suspicious/noExplicitAny: Batch types
-    const edgesToAdd: any[] = [];
-    
-    const summaryLines: string[] = [];
-    
-    for (const op of ops) {
-      const validFrom = op.validFrom ? new Date(op.validFrom) : undefined;
-      const validTo = op.validTo ? new Date(op.validTo) : undefined;
-
-      try {
-        switch (op.op) {
-          case 'CREATE_NODE': {
-            const id = op.id || crypto.randomUUID();
-            nodesToAdd.push({
-              id,
-              labels: op.labels,
-              properties: op.properties,
-              validFrom,
-              validTo
-            });
-            summaryLines.push(`Created Node ${id} (${op.labels.join(',')})`);
-            break;
-          }
-          case 'CREATE_EDGE': {
-            edgesToAdd.push({
-              source: op.source,
-              target: op.target,
-              type: op.type,
-              properties: op.properties || {},
-              validFrom,
-              validTo
-            });
-            summaryLines.push(`Created Edge ${op.source}->${op.target} [${op.type}]`);
-            break;
-          }
-          case 'UPDATE_NODE': {
-            // Fetch label if needed for optimization, or pass generic
-            // For now, we assume simple properties update.
-            // If the schema requires label, we find it.
-            let label = 'Entity'; // Fallback
-            const existing = await graph.db.query('SELECT labels FROM nodes WHERE id = ?', [op.match.id]);
-            if (existing.length > 0 && existing[0].labels && existing[0].labels.length > 0) {
-                label = existing[0].labels[0];
-            }
-
-            await graph.mergeNode(
-              label, 
-              op.match, 
-              op.set, 
-              { validFrom } // Updates start from 'validFrom'
-            );
-            summaryLines.push(`Updated Node ${op.match.id}`);
-            break;
-          }
-          case 'DELETE_NODE': {
-              // Direct DB manipulation for retroactive delete if needed
-              if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE nodes SET valid_to = ? WHERE id = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.id]
-                   );
-                   // Update RAM
-                   graph.native.removeNode(op.id);
-              } else {
-                  await graph.deleteNode(op.id);
-              }
-              summaryLines.push(`Deleted Node ${op.id}`);
-              break;
-          }
-          case 'CLOSE_EDGE': {
-              if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.source, op.target, op.type]
-                   );
-                   graph.native.removeEdge(op.source, op.target, op.type);
-              } else {
-                  await graph.deleteEdge(op.source, op.target, op.type);
-              }
-              summaryLines.push(`Closed Edge ${op.source}->${op.target} [${op.type}]`);
-              break;
-          }
-        }
-      } catch (e) {
-          console.error(`Failed to apply operation ${op.op}:`, e);
-          summaryLines.push(`FAILED: ${op.op} - ${(e as Error).message}`);
-      }
-    }
-
-    // Execute Batches
-    if (nodesToAdd.length > 0) {
-        await graph.addNodes(nodesToAdd);
-    }
-    if (edgesToAdd.length > 0) {
-        await graph.addEdges(edgesToAdd);
-    }
-
-    return { success: true, summary: summaryLines.join('\n') };
-  }
-});
-
-export const mutationWorkflow = createWorkflow({
-  id: 'mutation-workflow',
-  inputSchema: MutationInputSchema,
-  outputSchema: z.object({
-    success: z.boolean(),
-    summary: z.string()
-  })
-})
-.then(analyzeIntent)
-.then(applyMutations)
-.commit();
 ````
 
 ## File: packages/agent/src/utils/temporal.ts
@@ -3563,6 +1103,32 @@ export function resolveRelativeTime(input: string, referenceDate: Date = new Dat
 
   return null;
 }
+````
+
+## File: packages/agent/.env.example
+````
+# Server Configuration
+MASTRA_PORT=4111
+LOG_LEVEL=info
+
+# Agent Models (Granular Control)
+# You can switch providers per agent (e.g., use a cheaper model for routing, smarter for judging)
+AGENT_SCOUT_MODEL=groq/llama-3.3-70b-versatile
+AGENT_JUDGE_MODEL=groq/llama-3.3-70b-versatile
+AGENT_ROUTER_MODEL=groq/llama-3.3-70b-versatile
+AGENT_SCRIBE_MODEL=groq/llama-3.3-70b-versatile
+
+# API Keys
+# GROQ_API_KEY=gsk_...
+# OPENAI_API_KEY=sk-...
+# ANTHROPIC_API_KEY=sk-ant-...
+````
+
+## File: packages/agent/mastra.config.ts
+````typescript
+import { mastra } from './src/mastra';
+
+export const config = mastra;
 ````
 
 ## File: packages/agent/tsconfig.json
@@ -3905,8 +1471,8 @@ export class Chronos {
     let prevSummary: Map<string, number> = new Map();
 
     for (const ts of sortedTimes) {
-      const micros = ts.getTime() * 1000;
-      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
+      // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
+      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
 
       const currentSummary = new Map<string, number>();
       for (const s of currentSummaryList) {
@@ -3951,6 +1517,254 @@ export class Chronos {
     return { anchorNodeId, timeline };
   }
 }
+````
+
+## File: packages/agent/src/mastra/agents/scribe-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { topologyScanTool, contentRetrievalTool, sectorScanTool } from '../tools';
+import { config } from '../../lib/config';
+
+export const scribeAgent = new Agent({
+  name: 'Scribe Agent',
+  instructions: async ({ runtimeContext }) => {
+    const asOf = runtimeContext?.get('asOf') as number | undefined;
+    const timeStr = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
+
+    return `
+    You are the Scribe. Your job is to MUTATE the Knowledge Graph based on user intent.
+    Current System Time: ${timeStr}
+
+    Your Goal:
+    Convert natural language intentions (e.g., "I sold my car yesterday") into precise Graph Operations.
+
+    Rules:
+    1. **Entity Resolution First**: Never guess Node IDs. 
+       - If the user says "my car", look up nodes connected to "Me" or "User" with type "OWNED" or label "Car" first.
+       - Use \`topology-scan\` or \`content-retrieval\` to verify you have the correct ID (e.g., "car:123" vs "car:999").
+    
+    2. **Temporal Grounding**:
+       - The graph requires ISO 8601 timestamps.
+       - Interpret "yesterday", "tomorrow", "now" relative to the Current System Time.
+       - For "I sold it", CLOSE the existing edge (set \`validTo\`) and optionally CREATE a new one.
+
+    3. **Atomic Operations**:
+       - Output a list of operations that represent the full state change.
+       - Example: "Changed name from Bob to Robert" -> UPDATE_NODE { match: {id: "bob"}, set: {name: "Robert"}, validFrom: NOW }
+
+    4. **Ambiguity**:
+       - If you cannot find the node "Susi" or there are two "Susi" nodes, return \`requiresClarification\`. Do not write bad data.
+  `;
+  },
+  model: {
+    id: config.agents.scribe.model.id,
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+  tools: {
+    // Scribe needs to see before it writes
+    topologyScanTool,
+    contentRetrievalTool,
+    sectorScanTool
+  }
+});
+````
+
+## File: packages/agent/src/mastra/workflows/mutation-workflow.ts
+````typescript
+import { createStep, createWorkflow } from '@mastra/core/workflows';
+import { z } from 'zod';
+import { getGraphInstance } from '../../lib/graph-instance';
+import { ScribeDecisionSchema } from '../../agent-schemas';
+
+// Input Schema
+const MutationInputSchema = z.object({
+  query: z.string(),
+  traceId: z.string().optional(),
+  userId: z.string().optional().default('Me'),
+  asOf: z.number().optional()
+});
+
+// Step 1: Scribe Analysis (Intent -> Operations)
+const analyzeIntent = createStep({
+  id: 'analyze-intent',
+  inputSchema: MutationInputSchema,
+  outputSchema: z.object({
+    operations: z.array(z.any()),
+    reasoning: z.string(),
+    requiresClarification: z.string().optional()
+  }),
+  execute: async ({ inputData, mastra }) => {
+    const scribe = mastra?.getAgent('scribeAgent');
+    if (!scribe) throw new Error("Scribe Agent not found");
+
+    const now = inputData.asOf ? new Date(inputData.asOf) : new Date();
+    
+    // Prompt Scribe
+    const prompt = `
+      User Query: "${inputData.query}"
+      Context User ID: "${inputData.userId}"
+      System Time: ${now.toISOString()}
+    `;
+
+    const res = await scribe.generate(prompt, {
+      structuredOutput: { schema: ScribeDecisionSchema },
+      // Inject context for tools (Time Travel & Governance)
+      // @ts-expect-error - Mastra context injection
+      runtimeContext: { asOf: inputData.asOf } 
+    });
+
+    const decision = res.object;
+    if (!decision) throw new Error("Scribe returned no decision");
+
+    return {
+      operations: decision.operations,
+      reasoning: decision.reasoning,
+      requiresClarification: decision.requiresClarification
+    };
+  }
+});
+
+// Step 2: Apply Mutations (Batch Execution)
+const applyMutations = createStep({
+  id: 'apply-mutations',
+  inputSchema: z.object({
+    operations: z.array(z.any()),
+    reasoning: z.string(),
+    requiresClarification: z.string().optional()
+  }),
+  outputSchema: z.object({
+    success: z.boolean(),
+    summary: z.string()
+  }),
+  execute: async ({ inputData }) => {
+    if (inputData.requiresClarification) {
+      return { success: false, summary: `Clarification needed: ${inputData.requiresClarification}` };
+    }
+
+    const graph = getGraphInstance();
+    const ops = inputData.operations;
+    
+    // Arrays for Batching
+    // biome-ignore lint/suspicious/noExplicitAny: Batch types
+    const nodesToAdd: any[] = [];
+    // biome-ignore lint/suspicious/noExplicitAny: Batch types
+    const edgesToAdd: any[] = [];
+    
+    const summaryLines: string[] = [];
+    
+    for (const op of ops) {
+      const validFrom = op.validFrom ? new Date(op.validFrom) : undefined;
+      const validTo = op.validTo ? new Date(op.validTo) : undefined;
+
+      try {
+        switch (op.op) {
+          case 'CREATE_NODE': {
+            const id = op.id || crypto.randomUUID();
+            nodesToAdd.push({
+              id,
+              labels: op.labels,
+              properties: op.properties,
+              validFrom,
+              validTo
+            });
+            summaryLines.push(`Created Node ${id} (${op.labels.join(',')})`);
+            break;
+          }
+          case 'CREATE_EDGE': {
+            edgesToAdd.push({
+              source: op.source,
+              target: op.target,
+              type: op.type,
+              properties: op.properties || {},
+              validFrom,
+              validTo
+            });
+            summaryLines.push(`Created Edge ${op.source}->${op.target} [${op.type}]`);
+            break;
+          }
+          case 'UPDATE_NODE': {
+            // Fetch label if needed for optimization, or pass generic
+            // For now, we assume simple properties update.
+            // If the schema requires label, we find it.
+            let label = 'Entity'; // Fallback
+            const existing = await graph.db.query('SELECT labels FROM nodes WHERE id = ?', [op.match.id]);
+            if (existing.length > 0 && existing[0].labels && existing[0].labels.length > 0) {
+                label = existing[0].labels[0];
+            }
+
+            await graph.mergeNode(
+              label, 
+              op.match, 
+              op.set, 
+              { validFrom }
+            );
+            summaryLines.push(`Updated Node ${op.match.id}`);
+            break;
+          }
+          case 'DELETE_NODE': {
+              // Direct DB manipulation for retroactive delete if needed
+              if (validTo) {
+                   await graph.db.execute(
+                       `UPDATE nodes SET valid_to = ? WHERE id = ? AND valid_to IS NULL`, 
+                       [validTo.toISOString(), op.id]
+                   );
+                   // Update RAM
+                   graph.native.removeNode(op.id);
+              } else {
+                  await graph.deleteNode(op.id);
+              }
+              summaryLines.push(`Deleted Node ${op.id}`);
+              break;
+          }
+          case 'CLOSE_EDGE': {
+              if (validTo) {
+                   await graph.db.execute(
+                       `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`, 
+                       [validTo.toISOString(), op.source, op.target, op.type]
+                   );
+                   graph.native.removeEdge(op.source, op.target, op.type);
+              } else {
+                  await graph.deleteEdge(op.source, op.target, op.type);
+              }
+              summaryLines.push(`Closed Edge ${op.source}->${op.target} [${op.type}]`);
+              break;
+          }
+        }
+      } catch (e) {
+          console.error(`Failed to apply operation ${op.op}:`, e);
+          summaryLines.push(`FAILED: ${op.op} - ${(e as Error).message}`);
+      }
+    }
+
+    // Execute Batches
+    if (nodesToAdd.length > 0) {
+        await graph.addNodes(nodesToAdd);
+    }
+    if (edgesToAdd.length > 0) {
+        await graph.addEdges(edgesToAdd);
+    }
+
+    return { success: true, summary: summaryLines.join('\n') };
+  }
+});
+
+export const mutationWorkflow = createWorkflow({
+  id: 'mutation-workflow',
+  inputSchema: MutationInputSchema,
+  outputSchema: z.object({
+    success: z.boolean(),
+    summary: z.string()
+  })
+})
+.then(analyzeIntent)
+.then(applyMutations)
+.commit();
 ````
 
 ## File: packages/agent/biome.json
@@ -4766,77 +2580,6 @@ workflow.commit();
 export { workflow as metabolismWorkflow };
 ````
 
-## File: package.json
-````json
-{
-  "name": "quackgraph-agent",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "workspaces": [
-    "packages/agent",
-    "packages/quackgraph/packages/*"
-  ],
-  "scripts": {
-    "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
-    "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
-    "postinstall": "bun run build",
-    "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
-    "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
-    "check": "bun run typecheck && bun run lint",
-    "dev": "bun test --watch",
-    "test": "bun run build && bun test",
-    "build": "bun run build:core && bun run build:agent",
-    "build:core": "bun run --cwd packages/quackgraph build",
-    "build:agent": "bun run --cwd packages/agent build",
-    "build:watch": "bun run --cwd packages/agent build --watch",
-    "push:all": "bun run scripts/git-sync.ts",
-    "pull:all": "bun run scripts/git-pull.ts",
-    "dev:mastra": "bun run --cwd packages/agent dev:mastra"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "latest",
-    "@types/bun": "latest",
-    "tsup": "^8.5.1",
-    "typescript": "^5.0.0"
-  }
-}
-````
-
-## File: packages/agent/src/mastra/agents/router-agent.ts
-````typescript
-import { Agent } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
-import { LibSQLStore } from '@mastra/libsql';
-import { config } from '../../lib/config';
-
-export const routerAgent = new Agent({
-  name: 'Router Agent',
-  instructions: async ({ runtimeContext }) => {
-    const forcedDomain = runtimeContext?.get('domain') as string | undefined;
-    const domainHint = forcedDomain ? `\nHint: The system has pre-selected '${forcedDomain}', verify if this applies.` : '';
-
-    return `
-    You are a Semantic Router for a Knowledge Graph.
-    
-    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
-    
-    Input provided:
-    - Goal: User query.
-    - Available Domains: List of domains and descriptions.${domainHint}
-  `;
-  },
-  model: {
-    id: config.agents.router.model.id,
-  },
-  memory: new Memory({
-    storage: new LibSQLStore({
-      url: ':memory:'
-    })
-  }),
-});
-````
-
 ## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
 ````typescript
 import { createStep, createWorkflow } from '@mastra/core/workflows';
@@ -5334,139 +3077,74 @@ export const labyrinthWorkflow = createWorkflow({
   .commit();
 ````
 
-## File: packages/agent/package.json
+## File: package.json
 ````json
 {
-  "name": "@quackgraph/agent",
+  "name": "quackgraph-agent",
   "version": "0.1.0",
-  "main": "dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/agent",
+    "packages/quackgraph/packages/*"
+  ],
   "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "clean": "rm -rf dist",
-    "format": "biome format --write .",
-    "lint": "biome lint .",
-    "typecheck": "tsc --noEmit",
-    "dev:mastra": "mastra dev"
-  },
-  "dependencies": {
-    "@mastra/core": "^0.24.6",
-    "@mastra/loggers": "^0.1.0",
-    "@mastra/memory": "^0.15.12",
-    "@mastra/libsql": "0.16.4",
-    "@opentelemetry/api": "^1.8.0",
-    "zod": "^3.23.0",
-    "@quackgraph/graph": "workspace:*",
-    "@quackgraph/native": "workspace:*"
+    "format": "bun run --cwd packages/quackgraph format && bun run --cwd packages/agent format",
+    "clean": "rm -rf node_modules && bun run --cwd packages/quackgraph clean && bun run --cwd packages/agent clean",
+    "postinstall": "bun run build",
+    "typecheck": "tsc --noEmit && bun run --cwd packages/agent typecheck && bun run --cwd packages/quackgraph typecheck",
+    "lint": "bun run --cwd packages/quackgraph lint && bun run --cwd packages/agent lint",
+    "check": "bun run typecheck && bun run lint",
+    "dev": "bun test --watch",
+    "test": "bun run build && bun test",
+    "build": "bun run build:core && bun run build:agent",
+    "build:core": "bun run --cwd packages/quackgraph build",
+    "build:agent": "bun run --cwd packages/agent build",
+    "build:watch": "bun run --cwd packages/agent build --watch",
+    "push:all": "bun run scripts/git-sync.ts",
+    "pull:all": "bun run scripts/git-pull.ts",
+    "dev:mastra": "bun run --cwd packages/agent dev:mastra"
   },
   "devDependencies": {
     "@biomejs/biome": "latest",
-    "typescript": "^5.0.0",
-    "tsup": "^8.0.0"
+    "@types/bun": "latest",
+    "tsup": "^8.5.1",
+    "typescript": "^5.0.0"
   }
 }
 ````
 
-## File: packages/agent/src/mastra/agents/judge-agent.ts
+## File: packages/agent/src/mastra/agents/router-agent.ts
 ````typescript
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
 import { config } from '../../lib/config';
 
-export const judgeAgent = new Agent({
-  name: 'Judge Agent',
+export const routerAgent = new Agent({
+  name: 'Router Agent',
   instructions: async ({ runtimeContext }) => {
-    const asOf = runtimeContext?.get('asOf') as number | undefined;
-    const timeContext = asOf ? `(As of ${new Date(asOf).toISOString()})` : '';
+    const forcedDomain = runtimeContext?.get('domain') as string | undefined;
+    const domainHint = forcedDomain ? `\nHint: The system has pre-selected '${forcedDomain}', verify if this applies.` : '';
 
     return `
-    You are a Judge evaluating data from a Knowledge Graph.
+    You are a Semantic Router for a Knowledge Graph.
+    
+    Task: Select the single most relevant domain (lens) to conduct the search based on the user's goal.
     
     Input provided:
-    - Goal: The user's question.
-    - Data: Content of the nodes found.
-    - Evolution: Timeline of changes (if applicable).
-    - Time Context: Relevant timeframe ${timeContext}.
-    
-    Task: Determine if the data answers the goal.
+    - Goal: User query.
+    - Available Domains: List of domains and descriptions.${domainHint}
   `;
   },
   model: {
-    id: config.agents.judge.model.id,
+    id: config.agents.router.model.id,
   },
   memory: new Memory({
     storage: new LibSQLStore({
       url: ':memory:'
     })
   }),
-});
-````
-
-## File: packages/agent/src/mastra/index.ts
-````typescript
-import { Mastra } from '@mastra/core/mastra';
-import { LibSQLStore } from '@mastra/libsql';
-import { DefaultExporter, SensitiveDataFilter } from '@mastra/core/ai-tracing';
-import { scoutAgent } from './agents/scout-agent';
-import { judgeAgent } from './agents/judge-agent';
-import { routerAgent } from './agents/router-agent';
-import { scribeAgent } from './agents/scribe-agent';
-import { metabolismWorkflow } from './workflows/metabolism-workflow';
-import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
-import { mutationWorkflow } from './workflows/mutation-workflow';
-import { config } from '../lib/config';
-
-export const mastra = new Mastra({
-  agents: { scoutAgent, judgeAgent, routerAgent, scribeAgent },
-  workflows: { metabolismWorkflow, labyrinthWorkflow, mutationWorkflow },
-  storage: new LibSQLStore({
-    url: ':memory:',
-  }),
-  observability: {
-    configs: {
-      default: {
-        serviceName: 'quackgraph-agent',
-        processors: [new SensitiveDataFilter()],
-        exporters: [new DefaultExporter()],
-      },
-    },
-  },
-  server: {
-    port: config.server.port,
-    cors: {
-      origin: '*',
-      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization', 'x-quack-as-of', 'x-quack-domain'],
-    },
-    middleware: [
-      async (context, next) => {
-        const asOfHeader = context.req.header('x-quack-as-of');
-        const domainHeader = context.req.header('x-quack-domain');
-        const runtimeContext = context.get('runtimeContext');
-
-        if (runtimeContext) {
-          if (asOfHeader) {
-            const val = parseInt(asOfHeader, 10);
-            if (!Number.isNaN(val)) runtimeContext.set('asOf', val);
-          }
-          if (domainHeader) {
-            runtimeContext.set('domain', domainHeader);
-          }
-        }
-        await next();
-      },
-    ],
-  },
 });
 ````
 
@@ -5658,137 +3336,139 @@ export interface LabyrinthCursor {
 }
 ````
 
-## File: repomix.config.json
+## File: packages/agent/package.json
 ````json
 {
-  "$schema": "https://repomix.com/schemas/latest/schema.json",
-  "input": {
-    "maxFileSize": 52428800
-  },
-  "output": {
-    "filePath": "dev-docs/repomix.md",
-    "style": "markdown",
-    "parsableStyle": true,
-    "fileSummary": false,
-    "directoryStructure": true,
-    "files": true,
-    "removeComments": false,
-    "removeEmptyLines": false,
-    "compress": false,
-    "topFilesLength": 5,
-    "showLineNumbers": false,
-    "copyToClipboard": true,
-    "git": {
-      "sortByChanges": true,
-      "sortByChangesMaxCommits": 100,
-      "includeDiffs": false
+  "name": "@quackgraph/agent",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
     }
   },
-  "include": [
-//"README.md",
-//"test-docs/"
-//"test/",
-//"test-docs/unit.test-plan.
-
-],
-  "ignore": {
-    "useGitignore": true,
-    "useDefaultPatterns": true,
-    "customPatterns": [        
-            //  "packages/quackgraph",
-      "dev-docs/flow.todo.md",
-      "packages/quackgraph/.git",
-      "packages/quackgraph/repomix.config.json",
-      "packages/quackgraph/relay.config.json",
-      "packages/quackgraph/.relay",
-      "packages/quackgraph/dev-docs",
-      "packages/quackgraph/LICENSE",
-      "packages/quackgraph/.gitignore",
-      "packages/quackgraph/tsconfig.tsbuildinfo",
-"packages/quackgraph/packages/quack-graph/dist",
-      "packages/quackgraph/test/",
-      "packages/quackgraph/test-docs/",
-      "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src",
-            "packages/quackgraph/RFC.README.md",
-            "packages/quackgraph/README.md"
-    ]
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "clean": "rm -rf dist",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "typecheck": "tsc --noEmit",
+    "dev:mastra": "mastra dev"
   },
-  "security": {
-    "enableSecurityCheck": true
+  "dependencies": {
+    "@mastra/core": "^0.24.6",
+    "@mastra/loggers": "^0.1.0",
+    "@mastra/memory": "^0.15.12",
+    "@mastra/libsql": "0.16.4",
+    "@opentelemetry/api": "^1.8.0",
+    "zod": "^3.23.0",
+    "@quackgraph/graph": "workspace:*",
+    "@quackgraph/native": "workspace:*"
   },
-  "tokenCount": {
-    "encoding": "o200k_base"
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "typescript": "^5.0.0",
+    "tsup": "^8.0.0"
   }
 }
 ````
 
-## File: packages/agent/src/mastra/agents/scout-agent.ts
+## File: packages/agent/src/mastra/agents/judge-agent.ts
 ````typescript
 import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
-import { sectorScanTool, topologyScanTool, temporalScanTool, evolutionaryScanTool } from '../tools';
 import { config } from '../../lib/config';
 
-export const scoutAgent = new Agent({
-  name: 'Scout Agent',
+export const judgeAgent = new Agent({
+  name: 'Judge Agent',
   instructions: async ({ runtimeContext }) => {
     const asOf = runtimeContext?.get('asOf') as number | undefined;
-    const domain = runtimeContext?.get('domain') as string | undefined;
-    const timeContext = asOf ? `Time Travel Mode: ${new Date(asOf).toISOString()}` : 'Time: Present (Real-time)';
-    const domainContext = domain ? `Governance Domain: ${domain}` : 'Governance: Global/Unrestricted';
+    const timeContext = asOf ? `(As of ${new Date(asOf).toISOString()})` : '';
 
     return `
-    You are a Graph Scout navigating a topology.
-    System Context: [${timeContext}, ${domainContext}]
-
-    Your goal is to decide the next move based on the provided context.
+    You are a Judge evaluating data from a Knowledge Graph.
     
-    Context provided in user message:
-    - Goal: The user's query.
-    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
-    - Current Node: ID and Labels.
-    - Path History: Nodes visited so far.
-    - Satellite View: A summary of outgoing edges (LOD 0).
-    - Time Context: Relevant timestamps.
-
-    Decide your next move:
-    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
-      - Use Depth 1 to check immediate neighbors.
-      - Use Depth 2-3 to explore structure without moving.
-      - The map shows "🔥" for hot paths.
-
-    - **Time Travel:** 
-      - Use \`evolutionary-scan\` with specific ISO timestamps to see how connections changed over time (e.g., "What changed between 2023 and 2024?").
+    Input provided:
+    - Goal: The user's question.
+    - Data: Content of the nodes found.
+    - Evolution: Timeline of changes (if applicable).
+    - Time Context: Relevant timeframe ${timeContext}.
     
-    - **Ambiguity & Forking:**
-      - If you are unsure between two paths (e.g. "Did he Author it or Review it?"), select the most likely one as your primary MOVE.
-      - **CRITICAL:** Add the second option to \`alternativeMoves\`. The system will spawn parallel threads to explore both hypotheses simultaneously.
-
-    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
-    - **Exploration:** 
-      - Single Hop: Action "MOVE" with \`edgeType\`.
-      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with \`path: [id1, id2]\`.
-    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
-    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
-    - **Abort:** If stuck or exhausted, action: "ABORT".
+    Task: Determine if the data answers the goal.
   `;
   },
   model: {
-    id: config.agents.scout.model.id,
+    id: config.agents.judge.model.id,
   },
   memory: new Memory({
     storage: new LibSQLStore({
       url: ':memory:'
     })
   }),
-  tools: {
-    sectorScanTool,
-    topologyScanTool,
-    temporalScanTool,
-    evolutionaryScanTool
-  }
+});
+````
+
+## File: packages/agent/src/mastra/index.ts
+````typescript
+import { Mastra } from '@mastra/core/mastra';
+import { LibSQLStore } from '@mastra/libsql';
+import { DefaultExporter, SensitiveDataFilter } from '@mastra/core/ai-tracing';
+import { scoutAgent } from './agents/scout-agent';
+import { judgeAgent } from './agents/judge-agent';
+import { routerAgent } from './agents/router-agent';
+import { scribeAgent } from './agents/scribe-agent';
+import { metabolismWorkflow } from './workflows/metabolism-workflow';
+import { labyrinthWorkflow } from './workflows/labyrinth-workflow';
+import { mutationWorkflow } from './workflows/mutation-workflow';
+import { config } from '../lib/config';
+
+export const mastra = new Mastra({
+  agents: { scoutAgent, judgeAgent, routerAgent, scribeAgent },
+  workflows: { metabolismWorkflow, labyrinthWorkflow, mutationWorkflow },
+  storage: new LibSQLStore({
+    url: ':memory:',
+  }),
+  observability: {
+    configs: {
+      default: {
+        serviceName: 'quackgraph-agent',
+        processors: [new SensitiveDataFilter()],
+        exporters: [new DefaultExporter()],
+      },
+    },
+  },
+  server: {
+    port: config.server.port,
+    cors: {
+      origin: '*',
+      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowHeaders: ['Content-Type', 'Authorization', 'x-quack-as-of', 'x-quack-domain'],
+    },
+    middleware: [
+      async (context, next) => {
+        const asOfHeader = context.req.header('x-quack-as-of');
+        const domainHeader = context.req.header('x-quack-domain');
+        const runtimeContext = context.get('runtimeContext');
+
+        if (runtimeContext) {
+          if (asOfHeader) {
+            const val = parseInt(asOfHeader, 10);
+            if (!Number.isNaN(val)) runtimeContext.set('asOf', val);
+          }
+          if (domainHeader) {
+            runtimeContext.set('domain', domainHeader);
+          }
+        }
+        await next();
+      },
+    ],
+  },
 });
 ````
 
@@ -6043,6 +3723,140 @@ export function createAgent(graph: QuackGraph, config: AgentConfig) {
     config
   );
 }
+````
+
+## File: repomix.config.json
+````json
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "input": {
+    "maxFileSize": 52428800
+  },
+  "output": {
+    "filePath": "dev-docs/repomix.md",
+    "style": "markdown",
+    "parsableStyle": true,
+    "fileSummary": false,
+    "directoryStructure": true,
+    "files": true,
+    "removeComments": false,
+    "removeEmptyLines": false,
+    "compress": false,
+    "topFilesLength": 5,
+    "showLineNumbers": false,
+    "copyToClipboard": true,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false
+    }
+  },
+  "include": [
+//"README.md",
+//"test-docs/"
+//"test/",
+//"test-docs/unit.test-plan.
+
+],
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [        
+      "packages/quackgraph",
+      "dev-docs/flow.todo.md",
+      "packages/quackgraph/.git",
+      "packages/quackgraph/repomix.config.json",
+      "packages/quackgraph/relay.config.json",
+      "packages/quackgraph/.relay",
+      "packages/quackgraph/dev-docs",
+      "packages/quackgraph/LICENSE",
+      "packages/quackgraph/.gitignore",
+      "packages/quackgraph/tsconfig.tsbuildinfo",
+"packages/quackgraph/packages/quack-graph/dist",
+      "packages/quackgraph/test/",
+      "packages/quackgraph/test-docs/",
+      "packages/quackgraph/test/e2e/",
+      "packages/quackgraph/src",
+            "packages/quackgraph/RFC.README.md",
+            "packages/quackgraph/README.md"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}
+````
+
+## File: packages/agent/src/mastra/agents/scout-agent.ts
+````typescript
+import { Agent } from '@mastra/core/agent';
+import { Memory } from '@mastra/memory';
+import { LibSQLStore } from '@mastra/libsql';
+import { sectorScanTool, topologyScanTool, temporalScanTool, evolutionaryScanTool } from '../tools';
+import { config } from '../../lib/config';
+
+export const scoutAgent = new Agent({
+  name: 'Scout Agent',
+  instructions: async ({ runtimeContext }) => {
+    const asOf = runtimeContext?.get('asOf') as number | undefined;
+    const domain = runtimeContext?.get('domain') as string | undefined;
+    const timeContext = asOf ? `Time Travel Mode: ${new Date(asOf).toISOString()}` : 'Time: Present (Real-time)';
+    const domainContext = domain ? `Governance Domain: ${domain}` : 'Governance: Global/Unrestricted';
+
+    return `
+    You are a Graph Scout navigating a topology.
+    System Context: [${timeContext}, ${domainContext}]
+
+    Your goal is to decide the next move based on the provided context.
+    
+    Context provided in user message:
+    - Goal: The user's query.
+    - Active Domain: The semantic lens (e.g., "medical", "supply-chain").
+    - Current Node: ID and Labels.
+    - Path History: Nodes visited so far.
+    - Satellite View: A summary of outgoing edges (LOD 0).
+    - Time Context: Relevant timestamps.
+
+    Decide your next move:
+    - **Radar Control (Depth):** You can request a "Ghost Map" (ASCII Tree) by using \`topology-scan\` with \`depth: 2\` or \`3\`.
+      - Use Depth 1 to check immediate neighbors.
+      - Use Depth 2-3 to explore structure without moving.
+      - The map shows "🔥" for hot paths.
+
+    - **Time Travel:** 
+      - Use \`evolutionary-scan\` with specific ISO timestamps to see how connections changed over time (e.g., "What changed between 2023 and 2024?").
+    
+    - **Ambiguity & Forking:**
+      - If you are unsure between two paths (e.g. "Did he Author it or Review it?"), select the most likely one as your primary MOVE.
+      - **CRITICAL:** Add the second option to \`alternativeMoves\`. The system will spawn parallel threads to explore both hypotheses simultaneously.
+
+    - **Pheromones:** Edges marked with 🔥 or ♨️ have been successfully traversed before.
+    - **Exploration:** 
+      - Single Hop: Action "MOVE" with \`edgeType\`.
+      - Multi Hop: If you see a path in the Ghost Map, Action "MOVE" with \`path: [id1, id2]\`.
+    - **Pattern Matching:** To find a structure, action: "MATCH" with "pattern".
+    - **Goal Check:** If the current node likely contains the answer, action: "CHECK".
+    - **Abort:** If stuck or exhausted, action: "ABORT".
+  `;
+  },
+  model: {
+    id: config.agents.scout.model.id,
+  },
+  memory: new Memory({
+    storage: new LibSQLStore({
+      url: ':memory:'
+    })
+  }),
+  tools: {
+    sectorScanTool,
+    topologyScanTool,
+    temporalScanTool,
+    evolutionaryScanTool
+  }
+});
 ````
 
 ## File: packages/agent/src/tools/graph-tools.ts

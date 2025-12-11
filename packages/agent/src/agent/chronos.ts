@@ -86,8 +86,8 @@ export class Chronos {
     let prevSummary: Map<string, number> = new Map();
 
     for (const ts of sortedTimes) {
-      const micros = ts.getTime() * 1000;
-      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], micros);
+      // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
+      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
 
       const currentSummary = new Map<string, number>();
       for (const s of currentSummaryList) {

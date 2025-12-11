@@ -36,13 +36,11 @@ lets add many bun test cases files in test/e2e/[domain].test.ts test/integration
 rules;
 
 1. real verify implementation
-2. no mock and no spy
+2. less mock and less spy
 3. idempotent and clean even on sigterm
 4. each cases should be isolated without noisy neighbor syndrom
 
-so the test should enforce core implementation to be finish production ready. so test is single source of truth and proof.
-
-also we need amazing queries like calculate the standard deviation of prices for 10M products
+so the test should enforce implementation to be finish production ready. so test is single source of truth and proof.
 
 
 === DONE

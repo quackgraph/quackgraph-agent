@@ -123,7 +123,7 @@ const applyMutations = createStep({
               label, 
               op.match, 
               op.set, 
-              { validFrom } // Updates start from 'validFrom'
+              { validFrom }
             );
             summaryLines.push(`Updated Node ${op.match.id}`);
             break;
