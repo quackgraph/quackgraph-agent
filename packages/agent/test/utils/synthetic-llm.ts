@@ -13,15 +13,16 @@ export class SyntheticLLM {
   private globalDefault: object = { 
     // Scout (Action Union)
     action: "ABORT",
-    alternativeMoves: [], // Satisfy MoveAction optional but good to have empty
-    
+    alternativeMoves: [], 
+    targetNodeId: "fallback_target", // Ensure targetNodeId exists for types that might check it
+
     // Router
     domain: "global",
-    
+
     // Judge
     isAnswer: false,
     answer: "Synthetic Fallback",
-    
+
     // Scribe
     operations: [],
     requiresClarification: undefined,

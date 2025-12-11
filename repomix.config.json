@@ -23,7 +23,14 @@
     }
   },
   "include": 
-[],
+[
+  "packages/agent/src/agent/chronos.ts",
+  "packages/agent/test/e2e/mutation.test.ts",
+  "packages/agent/test/utils/result-helper.ts",
+  "packages/agent/test/utils/synthetic-llm.ts",
+  "packages/quackgraph/crates/quack_core/src/topology.rs",
+  "packages/quackgraph/packages/quack-graph/src/schema.ts"
+],
   "ignore": {
     "useGitignore": true,
     "useDefaultPatterns": true,

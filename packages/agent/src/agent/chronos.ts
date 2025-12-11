@@ -80,6 +80,10 @@ export class Chronos {
    */
   async evolutionaryDiff(anchorNodeId: string, timestamps: Date[]): Promise<EvolutionResult> {
     const sortedTimes = timestamps.sort((a, b) => a.getTime() - b.getTime());
+    if (sortedTimes.length === 0) {
+      return { anchorNodeId, timeline: [] };
+    }
+
     const timeline: TimeStepDiff[] = [];
 
     // Initial state (baseline)
@@ -88,7 +92,7 @@ export class Chronos {
     for (const ts of sortedTimes || []) {
       // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
       const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
-
+      
       const currentSummary = new Map<string, number>();
       for (const s of currentSummaryList) {
         currentSummary.set(s.edgeType, s.count);

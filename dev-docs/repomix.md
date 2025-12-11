@@ -5,143 +5,1167 @@ packages/
     src/
       agent/
         chronos.ts
-      tools/
-        graph-tools.ts
-      agent-schemas.ts
     test/
       e2e/
-        labyrinth-complex.test.ts
-        labyrinth.test.ts
-        metabolism.test.ts
-        mutation-complex.test.ts
         mutation.test.ts
-        resilience.test.ts
-        time-travel.test.ts
       utils/
+        result-helper.ts
         synthetic-llm.ts
+  quackgraph/
+    crates/
+      quack_core/
+        src/
+          topology.rs
+    packages/
+      quack-graph/
+        src/
+          schema.ts
 ```
 
 # Files
 
-## File: packages/agent/src/agent-schemas.ts
+## File: packages/quackgraph/crates/quack_core/src/topology.rs
+```rust
+use crate::interner::Interner;
+use bitvec::prelude::*;
+use std::collections::{HashMap, VecDeque};
+use serde::{Serialize, Deserialize};
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use arrow::record_batch::RecordBatch;
+use arrow::array::{AsArray, Array, StringArray, LargeStringArray, UInt8Array};
+use arrow::datatypes::DataType;
+use arrow::compute::cast;
+
+pub const MAX_TIME: i64 = i64::MAX;
+
+/// (Target Node ID, Edge Type ID, Valid From, Valid To, Heat)
+type EdgeTuple = (u32, u8, i64, i64, u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntervalConstraint {
+    Overlaps,
+    Contains,
+    During,
+    Meets,
+}
+
+/// The core Graph Index.
+/// Stores topology in RAM using integer IDs.
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct GraphIndex {
+    node_interner: Interner,
+    
+    // Mapping edge type strings (e.g. "KNOWS") to u8 for compact storage.
+    // Limit: 256 edge types per graph in V1.
+    edge_type_map: HashMap<String, u8>,
+    edge_type_vec: Vec<String>,
+
+    // Forward Graph: Source Node ID -> List of (Target Node ID, Edge Type ID, Valid From, Valid To, Heat)
+    outgoing: Vec<Vec<EdgeTuple>>,
+    
+    // Reverse Graph: Target Node ID -> List of (Source Node ID, Edge Type ID, Valid From, Valid To, Heat)
+    incoming: Vec<Vec<EdgeTuple>>,
+
+    // Bitmask for soft-deleted nodes.
+    // true = deleted (tombstone), false = active.
+    tombstones: BitVec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Direction {
+    Outgoing,
+    Incoming,
+}
+
+impl GraphIndex {
+    pub fn new() -> Self {
+        Self {
+            node_interner: Interner::new(),
+            edge_type_map: HashMap::new(),
+            edge_type_vec: Vec::new(),
+            outgoing: Vec::new(),
+            incoming: Vec::new(),
+            tombstones: BitVec::new(),
+        }
+    }
+
+    pub fn lookup_id(&self, id: &str) -> Option<u32> {
+        self.node_interner.lookup_id(id)
+    }
+
+    pub fn lookup_str(&self, id: u32) -> Option<&str> {
+        self.node_interner.lookup(id)
+    }
+
+    /// Compacts internal vectors to minimize memory usage.
+    /// Also sorts and deduplicates adjacency lists (essential after bulk loading).
+    /// Should be called after bulk hydration.
+    pub fn compact(&mut self) {
+        self.outgoing.iter_mut().for_each(|v| {
+            v.sort_unstable();
+            v.dedup();
+            v.shrink_to_fit();
+        });
+        self.incoming.iter_mut().for_each(|v| {
+            v.sort_unstable();
+            v.dedup();
+            v.shrink_to_fit();
+        });
+        self.outgoing.shrink_to_fit();
+        self.incoming.shrink_to_fit();
+        self.edge_type_vec.shrink_to_fit();
+    }
+
+    /// Resolves or creates an internal u32 ID for a node string.
+    /// Resizes internal storage if necessary.
+    pub fn get_or_create_node(&mut self, id: &str) -> u32 {
+        let internal_id = self.node_interner.intern(id);
+        let idx = internal_id as usize;
+
+        // Ensure vectors are large enough to hold this node
+        if idx >= self.outgoing.len() {
+            let new_len = idx + 1;
+            self.outgoing.resize_with(new_len, Vec::new);
+            self.incoming.resize_with(new_len, Vec::new);
+            // Resize tombstones, filling new slots with false (active)
+            self.tombstones.resize(new_len, false);
+        }
+        internal_id
+    }
+
+    /// Marks a node as deleted (soft delete).
+    /// Traversals will skip this node.
+    pub fn remove_node(&mut self, id: &str) {
+        if let Some(u_id) = self.node_interner.lookup_id(id) {
+            let idx = u_id as usize;
+            if idx < self.tombstones.len() {
+                self.tombstones.set(idx, true);
+            }
+        }
+    }
+
+    pub fn is_node_deleted(&self, id: u32) -> bool {
+        self.tombstones.get(id as usize).as_deref() == Some(&true)
+    }
+
+    /// Returns the total number of edges in the graph.
+    pub fn edge_count(&self) -> usize {
+        self.outgoing.iter().map(|edges| edges.len()).sum()
+    }
+
+    /// Resolves or creates a u8 ID for an edge type string.
+    /// Panics if more than 255 edge types are used (V1 constraint).
+    pub fn get_or_create_type(&mut self, type_name: &str) -> u8 {
+        if let Some(&id) = self.edge_type_map.get(type_name) {
+            return id;
+        }
+        let id = self.edge_type_vec.len();
+        if id > 255 {
+            panic!("QuackGraph V1 Limit: Max 256 unique edge types supported.");
+        }
+        let id_u8 = id as u8;
+        self.edge_type_vec.push(type_name.to_string());
+        self.edge_type_map.insert(type_name.to_string(), id_u8);
+        id_u8
+    }
+
+    pub fn get_type_id(&self, type_name: &str) -> Option<u8> {
+        self.edge_type_map.get(type_name).copied()
+    }
+
+    /// Adds an edge to the graph. 
+    /// Idempotent: Does not add duplicate edges if they already exist.
+    /// If timestamps are not provided, defaults to (0, MAX_TIME).
+    pub fn add_edge(&mut self, source: &str, target: &str, edge_type: &str, valid_from: Option<i64>, valid_to: Option<i64>, heat: Option<u8>) {
+        let vf = valid_from.unwrap_or(0);
+        let vt = valid_to.unwrap_or(MAX_TIME);
+        let h = heat.unwrap_or(0);
+        
+        let u_src = self.get_or_create_node(source);
+        let u_tgt = self.get_or_create_node(target);
+        let u_type = self.get_or_create_type(edge_type);
+
+        // Add to forward index (Idempotent)
+        let out_vec = &mut self.outgoing[u_src as usize];
+        // We include heat in the uniqueness check, effectively allowing different heat levels to coexist if pushed explicitly
+        if !out_vec.contains(&(u_tgt, u_type, vf, vt, h)) {
+            out_vec.push((u_tgt, u_type, vf, vt, h));
+        }
+        
+        // Add to reverse index (Idempotent)
+        let in_vec = &mut self.incoming[u_tgt as usize];
+        if !in_vec.contains(&(u_src, u_type, vf, vt, h)) {
+            in_vec.push((u_src, u_type, vf, vt, h));
+        }
+
+        // Ensure nodes are not tombstoned if they are being re-added/linked
+        if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+            self.tombstones.set(u_src as usize, false);
+        }
+        if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+            self.tombstones.set(u_tgt as usize, false);
+        }
+    }
+
+    /// Removes a specific edge from the graph.
+    /// Uses swap_remove for O(1) removal, order is not preserved.
+    pub fn remove_edge(&mut self, source: &str, target: &str, edge_type: &str) {
+        // We only proceed if all entities exist in our interner/maps
+        if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+            self.node_interner.lookup_id(source),
+            self.node_interner.lookup_id(target),
+            self.edge_type_map.get(edge_type).copied(),
+        ) {
+            // Note: In V2 Temporal, removing an edge usually means "closing" the validity window.
+            // However, this method removes it from RAM entirely (hard delete).
+            // Remove from outgoing
+            if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_tgt && x.1 == u_type) { // Ignores validity/heat for deletion
+                    edges.swap_remove(pos);
+                }
+            }
+            // Remove from incoming
+            if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                if let Some(pos) = edges.iter().position(|x| x.0 == u_src && x.1 == u_type) { // Ignores validity/heat for deletion
+                    edges.swap_remove(pos);
+                }
+            }
+        }
+    }
+
+    /// Ingests an Apache Arrow RecordBatch directly.
+    /// Expected Schema: Columns named "source", "target", "type" (case-insensitive or exact).
+    pub fn add_arrow_batch(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        let schema = batch.schema();
+        
+        // Resolve column indices by name for robustness (Case-Insensitive)
+        let find_col = |name: &str| -> Result<usize, String> {
+            schema.fields().iter().position(|f| f.name().eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("Column '{}' not found in Arrow Batch. Available: {:?}", name, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()))
+        };
+        
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            return Ok(());
+        }
+
+        // Helper to ensure we have a String/LargeString array, casting Dictionary if needed
+        let prepare_col = |col: &std::sync::Arc<dyn Array>, name: &str| -> Result<std::sync::Arc<dyn Array>, String> {
+            match col.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 => Ok(col.clone()),
+                DataType::Dictionary(_key_type, value_type) => {
+                    match value_type.as_ref() {
+                        // If we need to support dictionary encoded strings
+                        DataType::Utf8 | DataType::LargeUtf8 => {
+                            cast(col.as_ref(), value_type.as_ref())
+                                .map_err(|e| format!("Cast error for {} column: {}", name, e))
+                        },
+                        other => {
+                            Err(format!("{} column: Dictionary value type {:?} not supported (expected Utf8/LargeUtf8)", name, other))
+                        }
+                    }
+                },
+                dt => Err(format!("{} column: Unsupported type {:?}", name, dt)),
+            }
+        };
+
+        let src_col = prepare_col(batch.column(find_col("source")?), "Source")?;
+        let tgt_col = prepare_col(batch.column(find_col("target")?), "Target")?;
+        let type_col = prepare_col(batch.column(find_col("type")?), "Type")?;
+
+        // Optional Temporal Columns
+        // If missing, we default to (0, MAX_TIME)
+        let vf_idx = find_col("valid_from").ok();
+        let vt_idx = find_col("valid_to").ok();
+        let heat_idx = find_col("heat").ok();
+
+        let vf_col = if let Some(idx) = vf_idx {
+            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
+        } else { None };
+        let vt_col = if let Some(idx) = vt_idx {
+            Some(cast(batch.column(idx).as_ref(), &DataType::Int64).map_err(|e| e.to_string())?)
+        } else { None };
+
+        // Heat column (expecting UInt8)
+        let heat_col = if let Some(idx) = heat_idx {
+             // We try to cast to UInt8 just in case, though usually unnecessary if schema is correct
+             Some(cast(batch.column(idx).as_ref(), &DataType::UInt8).map_err(|e| e.to_string())?)
+        } else { None };
+
+        // Wrapper to handle different string array types (Utf8 vs LargeUtf8)
+        enum StringArrayWrapper<'a> {
+            Small(&'a StringArray),
+            Large(&'a LargeStringArray),
+        }
+
+        impl<'a> StringArrayWrapper<'a> {
+            fn value(&self, i: usize) -> &'a str {
+                match self {
+                    Self::Small(arr) => arr.value(i),
+                    Self::Large(arr) => arr.value(i),
+                }
+            }
+        }
+
+        macro_rules! get_wrapper {
+            ($col:expr) => {
+                match $col.data_type() {
+                    DataType::Utf8 => StringArrayWrapper::Small($col.as_string::<i32>()),
+                    DataType::LargeUtf8 => StringArrayWrapper::Large($col.as_string::<i64>()),
+                    _ => unreachable!("Already validated/casted to Utf8/LargeUtf8"),
+                }
+            }
+        }
+
+        let src_wrapper = get_wrapper!(src_col);
+        let tgt_wrapper = get_wrapper!(tgt_col);
+        let type_wrapper = get_wrapper!(type_col);
+
+        for i in 0..num_rows {
+            let src = src_wrapper.value(i);
+            let tgt = tgt_wrapper.value(i);
+            let edge_type = type_wrapper.value(i);
+
+            let u_src = self.get_or_create_node(src);
+            let u_tgt = self.get_or_create_node(tgt);
+            let u_type = self.get_or_create_type(edge_type);
+
+            // Extract timestamps
+            let valid_from = if let Some(ref col) = vf_col {
+                col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(i)
+            } else { 0 };
+
+            let valid_to = if let Some(ref col) = vt_col {
+                let arr = col.as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+                if arr.is_null(i) {
+                    MAX_TIME
+                } else {
+                    arr.value(i)
+                }
+            } else { MAX_TIME };
+
+            // Extract Heat
+            let heat = if let Some(ref col) = heat_col {
+                let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+                if arr.is_null(i) {
+                    0
+                } else {
+                    arr.value(i)
+                }
+            } else { 0 };
+
+            // Fast Path: Blind push. We rely on compact() to deduplicate later.
+            self.outgoing[u_src as usize].push((u_tgt, u_type, valid_from, valid_to, heat));
+            self.incoming[u_tgt as usize].push((u_src, u_type, valid_from, valid_to, heat));
+
+            // Ensure nodes are not tombstoned (revival logic)
+            if self.tombstones.get(u_src as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_src as usize, false);
+            }
+            if self.tombstones.get(u_tgt as usize).as_deref() == Some(&true) {
+                self.tombstones.set(u_tgt as usize, false);
+            }
+        }
+        Ok(())
+    }
+
+    /// Updates the 'heat' (pheromone level) of active edges matching the criteria.
+    /// Only affects edges where valid_to is MAX_TIME (active).
+    pub fn update_edge_heat(&mut self, source: &str, target: &str, edge_type: &str, new_heat: u8) {
+        if let (Some(u_src), Some(u_tgt), Some(u_type)) = (
+            self.node_interner.lookup_id(source),
+            self.node_interner.lookup_id(target),
+            self.edge_type_map.get(edge_type).copied(),
+        ) {
+            // Update outgoing
+            if let Some(edges) = self.outgoing.get_mut(u_src as usize) {
+                for edge in edges.iter_mut() {
+                    // edge is (target, type, vf, vt, heat)
+                    if edge.0 == u_tgt && edge.1 == u_type && edge.3 == MAX_TIME {
+                        edge.4 = new_heat;
+                    }
+                }
+            }
+            // Update incoming
+            if let Some(edges) = self.incoming.get_mut(u_tgt as usize) {
+                for edge in edges.iter_mut() {
+                    // edge is (source, type, vf, vt, heat)
+                    if edge.0 == u_src && edge.1 == u_type && edge.3 == MAX_TIME {
+                        edge.4 = new_heat;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Contextual Schema Pruning.
+    /// Returns a list of unique Edge Types (strings) that originate from the given source nodes.
+    /// This allows an Agent to know "What moves are available?" without fetching all neighbors.
+    pub fn get_available_edge_types(&self, sources: &[String], as_of: Option<i64>) -> Vec<String> {
+        let mut type_ids = Vec::new();
+
+        for src_str in sources {
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+                if let Some(edges) = self.outgoing.get(src_id as usize) {
+                    for &(_, type_id, vf, vt, _) in edges {
+                        // Temporal Check
+                        match as_of {
+                            Some(ts) => {
+                                // Edge is valid if it existed at 'ts' (valid_from <= ts < valid_to)
+                                if vf <= ts && vt > ts {
+                                    type_ids.push(type_id);
+                                }
+                            },
+                            None => {
+                                // Current/Active only
+                                if vt == MAX_TIME {
+                                    type_ids.push(type_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        type_ids.sort_unstable();
+        type_ids.dedup();
+
+        type_ids.into_iter()
+            .filter_map(|tid| {
+                // We can't easily do O(1) reverse lookup on the map unless we scan or store a reverse vec.
+                // Luckily `edge_type_vec` exists!
+                self.edge_type_vec.get(tid as usize).cloned()
+            })
+            .collect()
+    }
+
+    /// Aggregates statistics (Count, Average Heat) for outgoing edges from the given sources.
+    /// Returns a list of (Edge Type Name, Count, Average Heat).
+    pub fn get_sector_stats(&self, sources: &[String], as_of: Option<i64>, allowed_types: Option<&[String]>) -> Vec<(String, u32, f64)> {
+        // Map: Edge Type ID -> (Count, Total Heat)
+        let mut stats: HashMap<u8, (u32, u64)> = HashMap::new();
+
+        // Resolve allowed types to u8 set for fast lookup
+        let allowed_ids: Option<Vec<u8>> = allowed_types.map(|types| {
+            types.iter().filter_map(|t| self.edge_type_map.get(t).copied()).collect()
+        });
+
+        for src_str in sources {
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+
+                if let Some(edges) = self.outgoing.get(src_id as usize) {
+                    for &(_, type_id, vf, vt, heat) in edges {
+                        // Domain Filtering (Push Down)
+                        if let Some(ref allowed) = allowed_ids {
+                            if !allowed.contains(&type_id) {
+                                continue;
+                            }
+                        }
+
+                        // Temporal Check
+                        match as_of {
+                            Some(ts) => {
+                                if vf <= ts && vt > ts {
+                                    let entry = stats.entry(type_id).or_insert((0, 0));
+                                    entry.0 += 1;
+                                    entry.1 += heat as u64;
+                                }
+                            },
+                            None => {
+                                if vt == MAX_TIME {
+                                    let entry = stats.entry(type_id).or_insert((0, 0));
+                                    entry.0 += 1;
+                                    entry.1 += heat as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stats.into_iter()
+            .filter_map(|(type_id, (count, total_heat))| {
+                let type_name = self.edge_type_vec.get(type_id as usize)?.clone();
+                let avg_heat = if count > 0 { total_heat as f64 / count as f64 } else { 0.0 };
+                Some((type_name, count, avg_heat))
+            })
+            .collect()
+    }
+
+    /// Low-level neighbor access for Matcher.
+    /// Returns all neighbors connected by `type_id` in `dir`.
+    /// Returns all neighbors connected by `type_id` in `dir`, respecting `as_of`.
+    /// Filters out tombstoned neighbors.
+    pub fn get_neighbors(&self, node_id: u32, type_id: u8, dir: Direction, as_of: Option<i64>) -> Vec<u32> {
+        let adjacency = match dir {
+            Direction::Outgoing => &self.outgoing,
+            Direction::Incoming => &self.incoming,
+        };
+
+        if let Some(edges) = adjacency.get(node_id as usize) {
+            edges.iter()
+                .filter_map(|&(target, t, vf, vt, _heat)| {
+                    // Type match
+                    if t != type_id { return None; }
+                    // Tombstone check
+                    if self.is_node_deleted(target) { return None; }
+                    
+                    // Temporal Check
+                    match as_of {
+                        Some(ts) => {
+                            if vf <= ts && vt > ts { Some(target) } else { None }
+                        },
+                        None => {
+                            // Current/Active only
+                            if vt == MAX_TIME { Some(target) } else { None }
+                        }
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Generic traversal step (Bidirectional).
+    /// Given a list of source node IDs (strings), find all neighbors connected by `edge_type`
+    /// in the specified `direction`, visible at `as_of`.
+    pub fn traverse(&self, sources: &[String], edge_type: Option<&str>, direction: Direction, as_of: Option<i64>, min_valid_from: Option<i64>) -> Vec<String> {
+        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+        let min_vf = min_valid_from.unwrap_or(i64::MIN);
+        
+        let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+        
+        let adjacency = match direction {
+            Direction::Outgoing => &self.outgoing,
+            Direction::Incoming => &self.incoming,
+        };
+
+        for src_str in sources {
+            // If source node doesn't exist in our index, skip it
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                // Check if node is deleted
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+
+                if let Some(edges) = adjacency.get(src_id as usize) {
+                    for &(target, type_id, vf, vt, _heat) in edges {
+                        // Apply edge type filter if present
+                        if let Some(req_type) = type_filter {
+                            if req_type != type_id {
+                                continue;
+                            }
+                        }
+
+                        // Monotonic/Causal Check
+                        if vf < min_vf { continue; }
+
+                        // Temporal Check
+                        match as_of {
+                            Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
+                            None => { if vt != MAX_TIME { continue; } }
+                        }
+                        // Check if target is deleted
+                        if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                            continue;
+                        }
+                        result_ids.push(target);
+                    }
+                }
+            }
+        }
+
+        // Deduplicate results
+        result_ids.sort_unstable();
+        result_ids.dedup();
+
+        // Convert back to strings
+        result_ids
+            .into_iter()
+            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Recursive traversal (BFS) with depth bounds.
+    /// Returns unique node IDs reachable within [min_depth, max_depth].
+    #[allow(clippy::too_many_arguments)]
+    pub fn traverse_recursive(
+        &self,
+        sources: &[String],
+        edge_type: Option<&str>,
+        direction: Direction,
+        min_depth: usize,
+        max_depth: usize,
+        as_of: Option<i64>,
+        monotonic: bool,
+    ) -> Vec<String> {
+        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+        
+        // Track visited nodes to prevent cycles (O(1) access)
+        // We assume the interner length is the upper bound of IDs
+        let mut visited = bitvec![u8, Lsb0; 0; self.node_interner.len()];
+        let mut result_ids: Vec<u32> = Vec::new();
+        
+        // Queue stores (node_id, current_depth, arrival_time)
+        // arrival_time is i64::MIN for start nodes
+        let mut queue: VecDeque<(u32, usize, i64)> = VecDeque::new();
+
+        let adjacency = match direction {
+            Direction::Outgoing => &self.outgoing,
+            Direction::Incoming => &self.incoming,
+        };
+
+        // Initialize Queue
+        for src_str in sources {
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                // Skip soft-deleted nodes
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+                
+                // Mark source as visited so we don't loop back to it
+                if (src_id as usize) < visited.len() {
+                    visited.set(src_id as usize, true);
+                }
+                
+                // If min_depth is 0, include sources in result
+                if min_depth == 0 {
+                    result_ids.push(src_id);
+                }
+                
+                // Start search
+                queue.push_back((src_id, 0, i64::MIN));
+            }
+        }
+
+        while let Some((curr_id, curr_depth, arrival_time)) = queue.pop_front() {
+            if curr_depth >= max_depth {
+                continue;
+            }
+            
+            let next_depth = curr_depth + 1;
+
+            if let Some(edges) = adjacency.get(curr_id as usize) {
+                for &(target, type_id, vf, vt, _heat) in edges {
+                    // Apply edge type filter
+                    if let Some(req_type) = type_filter {
+                        if req_type != type_id {
+                            continue;
+                        }
+                    }
+
+                    // Monotonic Check
+                    if monotonic && vf < arrival_time {
+                        continue;
+                    }
+                    
+                    // Temporal Check
+                    match as_of {
+                        Some(ts) => { if !(vf <= ts && vt > ts) { continue; } },
+                        None => { if vt != MAX_TIME { continue; } }
+                    }
+                    
+                    // Check soft delete
+                    if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                        continue;
+                    }
+                    
+                    // Check visited and bounds
+                    if (target as usize) < visited.len() && !visited[target as usize] {
+                        visited.set(target as usize, true);
+                        
+                        if next_depth >= min_depth {
+                            result_ids.push(target);
+                        }
+                        
+                        // Continue BFS only if we haven't hit max depth
+                        if next_depth < max_depth {
+                            // For monotonic, next arrival time is this edge's valid_from
+                            // If not monotonic, we just pass down min (effectively ignoring)
+                            let next_arrival = if monotonic { vf } else { i64::MIN };
+                            queue.push_back((target, next_depth, next_arrival));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort for deterministic output
+        result_ids.sort_unstable();
+
+        result_ids
+            .into_iter()
+            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Traverses edges that overlap with the given time interval [start, end).
+    /// Overlap logic: edge.valid_from < end && edge.valid_to > start.
+    /// Returns unique neighbor IDs.
+    pub fn traverse_interval(&self, sources: &[String], edge_type: Option<&str>, direction: Direction, start: i64, end: i64, constraint: IntervalConstraint) -> Vec<String> {
+        let type_filter = edge_type.and_then(|t| self.edge_type_map.get(t).copied());
+        let mut result_ids: Vec<u32> = Vec::with_capacity(sources.len() * 2);
+        
+        let adjacency = match direction {
+            Direction::Outgoing => &self.outgoing,
+            Direction::Incoming => &self.incoming,
+        };
+
+        for src_str in sources {
+            if let Some(src_id) = self.node_interner.lookup_id(src_str) {
+                if self.tombstones.get(src_id as usize).as_deref() == Some(&true) {
+                    continue;
+                }
+
+                if let Some(edges) = adjacency.get(src_id as usize) {
+                    for &(target, type_id, vf, vt, _heat) in edges {
+                        if let Some(req_type) = type_filter {
+                            if req_type != type_id { continue; }
+                        }
+                        
+                        // Interval Check
+                        let is_match = match constraint {
+                            IntervalConstraint::Overlaps => vf < end && vt > start,
+                            // Edge contains the window [start, end)
+                            IntervalConstraint::Contains => vf <= start && vt >= end,
+                            // Edge is contained by the window [start, end)
+                            IntervalConstraint::During => vf >= start && vt <= end,
+                            IntervalConstraint::Meets => vt == start || vf == end,
+                        };
+
+                        if is_match {
+                             if self.tombstones.get(target as usize).as_deref() == Some(&true) {
+                                continue;
+                            }
+                            result_ids.push(target);
+                        }
+                    }
+                }
+            }
+        }
+        
+        result_ids.sort_unstable();
+        result_ids.dedup();
+        
+        result_ids
+            .into_iter()
+            .filter_map(|id| self.node_interner.lookup(id).map(|s| s.to_string()))
+            .collect()
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.node_interner.len()
+    }
+
+    /// Serializes the entire graph topology to a binary file.
+    pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+        let file = File::create(path).map_err(|e| e.to_string())?;
+        let writer = BufWriter::new(file);
+        bincode::serialize_into(writer, self).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Deserializes the graph topology from a binary file.
+    pub fn load_from_file(path: &str) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(file);
+        bincode::deserialize_from(reader).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bulk_add_dedup() {
+        let mut graph = GraphIndex::new();
+        
+        // Simulate batch loading with duplicates
+        // A -> B (KNOWS)
+        // A -> B (KNOWS)
+        // A -> B (LIKES)
+        
+        let u_a = graph.get_or_create_node("A");
+        let u_b = graph.get_or_create_node("B");
+        let t_knows = graph.get_or_create_type("KNOWS");
+        let t_likes = graph.get_or_create_type("LIKES");
+
+        // Manually push duplicates simulating blind batch add
+        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0));
+        graph.outgoing[u_a as usize].push((u_b, t_knows, 0, MAX_TIME, 0)); // Duplicate
+        graph.outgoing[u_a as usize].push((u_b, t_likes, 0, MAX_TIME, 0)); // Different type
+
+        // Pre-compact: 3 edges
+        assert_eq!(graph.outgoing[u_a as usize].len(), 3);
+
+        // Compact
+        graph.compact();
+
+        // Post-compact: 2 edges (KNOWS, LIKES)
+        assert_eq!(graph.outgoing[u_a as usize].len(), 2);
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_knows, 0, MAX_TIME, 0)));
+        assert!(graph.outgoing[u_a as usize].contains(&(u_b, t_likes, 0, MAX_TIME, 0)));
+    }
+}
+```
+
+## File: packages/quackgraph/packages/quack-graph/src/schema.ts
 ```typescript
-import { z } from 'zod';
+import type { DuckDBManager, DbExecutor } from './db';
 
-export const RouterDecisionSchema = z.object({
-  domain: z.string(),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
+const NODES_TABLE = `
+CREATE TABLE IF NOT EXISTS nodes (
+    row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
+    id TEXT NOT NULL,
+    labels TEXT[],
+    properties JSON,
+    embedding DOUBLE[], -- Vector embedding
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
+    valid_to TIMESTAMPTZ DEFAULT NULL
+);
+CREATE SEQUENCE IF NOT EXISTS seq_node_id;
+`;
 
-export const JudgeDecisionSchema = z.object({
-  isAnswer: z.boolean(),
-  answer: z.string(),
-  confidence: z.number().min(0).max(1),
-});
+const EDGES_TABLE = `
+CREATE TABLE IF NOT EXISTS edges (
+    source TEXT NOT NULL,
+    target TEXT NOT NULL,
+    type TEXT NOT NULL,
+    properties JSON,
+    heat UTINYINT DEFAULT 0,
+    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
+    valid_to TIMESTAMPTZ DEFAULT NULL
+);
+`;
 
-// Discriminated Union for Scout Actions
-const MoveAction = z.object({
-  action: z.literal('MOVE'),
-  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
-  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-  alternativeMoves: z.array(z.object({
-    edgeType: z.string(),
-    confidence: z.number(),
-    reasoning: z.string()
-  })).optional()
-});
+export interface TemporalOptions {
+  validFrom?: Date;
+  validTo?: Date;
+}
 
-const CheckAction = z.object({
-  action: z.literal('CHECK'),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
+export class SchemaManager {
+  constructor(private db: DuckDBManager) {}
 
-const MatchAction = z.object({
-  action: z.literal('MATCH'),
-  pattern: z.array(z.object({
-    srcVar: z.number(),
-    tgtVar: z.number(),
-    edgeType: z.string(),
-    direction: z.string().optional()
-  })),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
+  async ensureSchema() {
+    // Ensure sequence exists before table creation to avoid race conditions.
+    // Note: Breaking NODES_TABLE into separate executions to ensure sequence is ready.
+    await this.db.execute("CREATE SEQUENCE IF NOT EXISTS seq_node_id");
+    
+    await this.db.execute(NODES_TABLE);
+    await this.db.execute(EDGES_TABLE);
 
-const AbortAction = z.object({
-  action: z.literal('ABORT'),
-  confidence: z.number().min(0).max(1),
-  reasoning: z.string(),
-});
+    // Sync sequence to avoid collisions if table existed with data but sequence was reset
+    // Force checkpoint to ensure we see committed data for sequence calc
+    try { await this.db.execute("CHECKPOINT"); } catch {}
 
-export const ScoutDecisionSchema = z.discriminatedUnion('action', [
-  MoveAction,
-  CheckAction,
-  MatchAction,
-  AbortAction
-]);
+    // We use a robust query to find the max ID, handling potential NULLs from empty tables
+    const rows = await this.db.query("SELECT COALESCE(MAX(row_id), 0) as max_id FROM nodes");
+    const maxId = rows.length > 0 ? BigInt(rows[0].max_id) : 0n;
 
-// --- Scribe Agent Schemas (Mutations) ---
+    // Recreate sequence starting after maxId.
+    // Only advance sequence if needed (idempotent for persistent stores)
+    if (maxId > 0n) {
+      const nextVal = maxId + 1n;
+      // Try setval (standard), fallback to ALTER (Postgres/DuckDB variant), fallback to DROP/CREATE
+      try {
+        await this.db.execute(`SELECT setval('seq_node_id', ${nextVal})`);
+      } catch {
+        try {
+          await this.db.execute(`ALTER SEQUENCE seq_node_id RESTART WITH ${nextVal}`);
+        } catch (e) {
+          try {
+            await this.db.execute(`DROP SEQUENCE IF EXISTS seq_node_id`);
+            await this.db.execute(`CREATE SEQUENCE seq_node_id START ${nextVal}`);
+          } catch (finalErr) {
+            console.warn("SchemaManager: Could not sync sequence", finalErr);
+          }
+        }
+      }
+    }
 
-const CreateNodeOp = z.object({
-  op: z.literal('CREATE_NODE'),
-  id: z.string().optional().describe('Optional custom ID. If omitted, system generates UUID.'),
-  labels: z.array(z.string()),
-  properties: z.record(z.any()),
-  validFrom: z.string().optional().describe('ISO Date string. If omitted, defaults to NOW.'),
-  validTo: z.string().optional().describe('ISO Date string. If omitted, node is active indefinitely.')
-});
+    // Performance Indexes
+    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
+    // We use standard indexes for now.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
+    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
+    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
+  }
 
-const UpdateNodeOp = z.object({
-  op: z.literal('UPDATE_NODE'),
-  // We use a match query (usually ID) to find the node
-  match: z.object({
-    id: z.string().describe('The distinct ID of the node to update.')
-  }),
-  set: z.record(z.any()),
-  validFrom: z.string().optional().describe('ISO Date string. The effective start time of this update.')
-});
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}, options: TemporalOptions = {}) {
+    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
+    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
 
-const DeleteNodeOp = z.object({
-  op: z.literal('DELETE_NODE'),
-  id: z.string(),
-  validTo: z.string().optional().describe('ISO Date string. When the node ceased to exist/be valid.')
-});
+    await this.db.transaction(async (tx: DbExecutor) => {
+      // 1. Close existing record (SCD Type 2)
+      await tx.execute(
+        `UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`,
+        [id]
+      );
+      // 2. Insert new version
+      await tx.execute(`
+        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
+      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
+    });
+  }
 
-const CreateEdgeOp = z.object({
-  op: z.literal('CREATE_EDGE'),
-  source: z.string().describe('Source Node ID'),
-  target: z.string().describe('Target Node ID'),
-  type: z.string().describe('Edge Type (e.g. KNOWS, BOUGHT)'),
-  properties: z.record(z.any()).optional(),
-  validFrom: z.string().optional().describe('ISO Date string. When this relationship started.'),
-  validTo: z.string().optional().describe('ISO Date string. When this relationship ended (if applicable).')
-});
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}, options: TemporalOptions = {}) {
+    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
+    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
 
-const CloseEdgeOp = z.object({
-  op: z.literal('CLOSE_EDGE'),
-  source: z.string(),
-  target: z.string(),
-  type: z.string(),
-  validTo: z.string().describe('ISO Date string. When this relationship ended.')
-});
+    await this.db.transaction(async (tx: DbExecutor) => {
+      // 1. Close existing edge
+      await tx.execute(
+        `UPDATE edges SET valid_to = ${vf} WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        [source, target, type]
+      );
+      // 2. Insert new version
+      await tx.execute(`
+        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
+        VALUES (?, ?, ?, ?::JSON, ${vf}, ${vt})
+      `, [source, target, type, JSON.stringify(properties)]);
+    });
+  }
 
-export const GraphMutationSchema = z.discriminatedUnion('op', [
-  CreateNodeOp,
-  UpdateNodeOp,
-  DeleteNodeOp,
-  CreateEdgeOp,
-  CloseEdgeOp
-]);
+  async deleteNode(id: string) {
+    // Soft Delete: Close the validity period
+    await this.db.transaction(async (tx: DbExecutor) => {
+      await tx.execute(
+        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
+        [id]
+      );
+    });
+  }
 
-export const ScribeDecisionSchema = z.object({
-  reasoning: z.string().describe('Explanation of why these mutations are required.'),
-  operations: z.array(GraphMutationSchema),
-  requiresClarification: z.string().optional().describe('If the user intent is ambiguous, ask a question instead of mutating.')
-});
+  async deleteEdge(source: string, target: string, type: string) {
+    // Soft Delete: Close the validity period
+    await this.db.transaction(async (tx: DbExecutor) => {
+      await tx.execute(
+        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
+        [source, target, type]
+      );
+    });
+  }
+
+  /**
+   * Promotes a JSON property to a native column for faster filtering.
+   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
+   * 
+   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
+   * @param property The property key to promote (e.g., 'age').
+   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+   */
+  async promoteNodeProperty(label: string, property: string, type: string) {
+    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
+    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
+    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
+    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
+    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
+    
+    // 1. Add Column (Idempotent)
+    try {
+      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
+      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
+    } catch (_e) {
+      // Fallback or ignore if column exists
+    }
+
+    // 2. Backfill Data
+    // We use list_contains to only update relevant nodes
+    const sql = `
+      UPDATE nodes 
+      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
+      WHERE list_contains(labels, ?)
+    `;
+    await this.db.execute(sql, [label]);
+  }
+
+  /**
+   * Declarative Merge (Upsert).
+   * Finds a node by `matchProps` and `label`.
+   * If found: Updates properties with `setProps`.
+   * If not found: Creates new node with `matchProps` + `setProps`.
+   * Returns the node ID.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>, options: TemporalOptions = {}): Promise<string> {
+    // 1. Build Search Query
+    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
+    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
+
+    const matchKeys = Object.keys(matchProps);
+    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
+    // biome-ignore lint/suspicious/noExplicitAny: Params array
+    const params: any[] = [label];
+    
+    for (const key of matchKeys) {
+      if (key === 'id') {
+        conditions.push(`id = ?`);
+        params.push(matchProps[key]);
+      } else {
+        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
+        params.push(JSON.stringify(matchProps[key]));
+      }
+    }
+
+    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
+
+    return await this.db.transaction(async (tx) => {
+      const rows = await tx.query(searchSql, params);
+      let id: string;
+      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
+      let finalProps: Record<string, any>;
+      let finalLabels: string[];
+
+      if (rows.length > 0) {
+        // Update Existing
+        const row = rows[0];
+        id = row.id;
+        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
+        finalProps = { ...currentProps, ...setProps };
+        finalLabels = row.labels; // Preserve existing labels
+
+        // Close old version
+        await tx.execute(`UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`, [id]);
+      } else {
+        // Insert New
+        id = matchProps.id || crypto.randomUUID();
+        finalProps = { ...matchProps, ...setProps };
+        finalLabels = [label];
+      }
+
+      // Insert new version (for both Update and Create cases)
+      await tx.execute(`
+        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
+        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
+      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
+
+      return id;
+    });
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeNodesBulk(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
+    if (nodes.length === 0) return;
+    
+    // Using Staging Table Strategy for efficient SCD-2
+    const stagingName = `staging_nodes_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    
+    await this.db.transaction(async (tx) => {
+      await tx.execute(`CREATE TEMP TABLE ${stagingName} (id TEXT, labels TEXT[], properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ)`);
+      
+      // Bulk Insert into Staging
+      const BATCH_SIZE = 200;
+      for (let i = 0; i < nodes.length; i += BATCH_SIZE) {
+        const chunk = nodes.slice(i, i + BATCH_SIZE);
+        const placeholders = chunk.map(() => `(?, ?::JSON::TEXT[], ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ)`).join(',');
+        // biome-ignore lint/suspicious/noExplicitAny: SQL params
+        const params: any[] = [];
+
+        for (const n of chunk) {
+          const vf = n.validFrom ? n.validFrom.toISOString() : new Date().toISOString(); // Fallback to JS now if undefined (since we can't use SQL function in param)
+          const vt = n.validTo ? n.validTo.toISOString() : null;
+          params.push(n.id, JSON.stringify(n.labels), JSON.stringify(n.properties), vf, vt);
+        }
+        
+        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
+      }
+
+      // SCD-2 Close Old Rows (Set valid_to = new_valid_from for existing active rows)
+      await tx.execute(`
+        UPDATE nodes 
+        SET valid_to = s.valid_from 
+        FROM ${stagingName} s 
+        WHERE nodes.id = s.id AND nodes.valid_to IS NULL
+      `);
+
+      // Insert New Rows
+      await tx.execute(`
+        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to)
+        SELECT nextval('seq_node_id'), id, labels, properties, valid_from, valid_to FROM ${stagingName}
+      `);
+
+      await tx.execute(`DROP TABLE ${stagingName}`);
+    });
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: generic properties
+  async writeEdgesBulk(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
+    if (edges.length === 0) return;
+
+    const stagingName = `staging_edges_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+    await this.db.transaction(async (tx) => {
+      await tx.execute(`CREATE TEMP TABLE ${stagingName} (source TEXT, target TEXT, type TEXT, properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, heat UTINYINT)`);
+
+      const BATCH_SIZE = 200;
+      for (let i = 0; i < edges.length; i += BATCH_SIZE) {
+        const chunk = edges.slice(i, i + BATCH_SIZE);
+        const placeholders = chunk.map(() => `(?, ?, ?, ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ, ?::UTINYINT)`).join(',');
+        // biome-ignore lint/suspicious/noExplicitAny: SQL params
+        const params: any[] = [];
+
+        for (const e of chunk) {
+          const vf = e.validFrom ? e.validFrom.toISOString() : new Date().toISOString();
+          const vt = e.validTo ? e.validTo.toISOString() : null;
+          const heat = e.heat || 0;
+          params.push(e.source, e.target, e.type, JSON.stringify(e.properties), vf, vt, heat);
+        }
+        
+        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
+      }
+
+      // Close Old Edges
+      await tx.execute(`
+        UPDATE edges 
+        SET valid_to = s.valid_from
+        FROM ${stagingName} s
+        WHERE edges.source = s.source AND edges.target = s.target AND edges.type = s.type AND edges.valid_to IS NULL
+      `);
+
+      // Insert New Edges
+      await tx.execute(`
+        INSERT INTO edges (source, target, type, properties, valid_from, valid_to, heat)
+        SELECT source, target, type, properties, valid_from, valid_to, heat FROM ${stagingName}
+      `);
+
+      await tx.execute(`DROP TABLE ${stagingName}`);
+    });
+  }
+}
+```
+
+## File: packages/agent/test/utils/result-helper.ts
+```typescript
+export function getWorkflowResult(res: any): any {
+  if (res.status === 'failed') {
+    throw new Error(`Workflow failed: ${res.error?.message || 'Unknown error'}`);
+  }
+  
+  // Prioritize "results" (plural) as seen in some Mastra versions/mocks
+  if (res.results) return res.results;
+  
+  // Check "result" (singular)
+  if (res.result) return res.result;
+  
+  // Fallback: Check if the object itself looks like a payload (has artifact or success)
+  // or if it's just the wrapper but missing the specific keys we know.
+  // We return res to handle cases where the payload is the root object.
+  return res;
+}
 ```
 
 ## File: packages/agent/src/agent/chronos.ts
@@ -233,7 +1257,7 @@ export class Chronos {
     // Initial state (baseline)
     let prevSummary: Map<string, number> = new Map();
 
-    for (const ts of sortedTimes) {
+    for (const ts of sortedTimes || []) {
       // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
       const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
 
@@ -282,216 +1306,6 @@ export class Chronos {
 }
 ```
 
-## File: packages/agent/test/e2e/labyrinth.test.ts
-```typescript
-import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
-import { createTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scoutAgent } from "../../src/mastra/agents/scout-agent";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { Labyrinth } from "../../src/labyrinth";
-import type { QuackGraph } from "@quackgraph/graph";
-
-// Helper to extract results safely across Mastra versions/mocks
-// biome-ignore lint/suspicious/noExplicitAny: generic
-function getArtifact(res: any) {
-    const payload = res.results || res;
-    return payload?.artifact;
-}
-
-describe("E2E: Labyrinth (Traversal Workflow)", () => {
-  let graph: QuackGraph;
-  let llm: SyntheticLLM;
-  let labyrinth: Labyrinth;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    // Providing safe defaults for each agent type to pass Zod schemas
-    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
-    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
-    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
-  });
-
-  beforeEach(async () => {
-    graph = await createTestGraph();
-    // Re-instantiate Labyrinth per test to ensure clean state config
-    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
-        llmProvider: { generate: async () => "" }, // Dummy, unused due to mock
-        maxHops: 5,
-        maxCursors: 3,
-        confidenceThreshold: 0.8
-    });
-  });
-
-  afterEach(async () => {
-    // @ts-expect-error
-    if (typeof graph.close === 'function') await graph.close();
-  });
-
-  it("Scenario: Single Hop Success", async () => {
-    // Topology: Start -> Middle -> Goal
-    // @ts-expect-error
-    await graph.addNode("start", ["Entity"], { name: "Start" });
-    // @ts-expect-error
-    await graph.addNode("goal_node", ["Entity"], { name: "The Answer" });
-    // @ts-expect-error
-    await graph.addEdge("start", "goal_node", "LINKS_TO", {});
-
-    // 1. Train Router
-    llm.addResponse("Find the answer", {
-        domain: "global",
-        confidence: 1.0,
-        reasoning: "General query"
-    });
-
-    // 2. Train Scout
-    // Step 1: At 'start', sees 'goal_node' via 'LINKS_TO'
-    llm.addResponse(`Node: "start"`, {
-        action: "MOVE",
-        edgeType: "LINKS_TO",
-        confidence: 1.0,
-        reasoning: "Moving to linked node"
-    });
-    
-    // Step 2: At 'goal_node', checks for answer
-    llm.addResponse(`Node: "goal_node"`, {
-        action: "CHECK",
-        confidence: 1.0,
-        reasoning: "This looks like the answer"
-    });
-
-    // 3. Train Judge
-    llm.addResponse(`Goal: Find the answer`, {
-        isAnswer: true,
-        answer: "Found the answer at goal_node",
-        confidence: 0.95
-    });
-
-    // 4. Run Labyrinth
-    const artifact = await labyrinth.findPath("start", "Find the answer");
-
-    expect(artifact).toBeDefined();
-    expect(artifact?.answer).toBe("Found the answer at goal_node");
-    expect(artifact?.sources).toContain("goal_node");
-    expect(artifact?.confidence).toBe(0.95);
-  });
-
-  it("Scenario: Speculative Forking (The Race)", async () => {
-    // Topology: 
-    // start -> path_A -> dead_end
-    // start -> path_B -> success
-    // @ts-expect-error
-    await graph.addNode("start", ["Entity"], {});
-    // @ts-expect-error
-    await graph.addNode("path_A", ["Entity"], {});
-    // @ts-expect-error
-    await graph.addNode("path_B", ["Entity"], {});
-    // @ts-expect-error
-    await graph.addNode("success", ["Entity"], { content: "Victory" });
-
-    // @ts-expect-error
-    await graph.addEdge("start", "path_A", "OPTION_A", {});
-    // @ts-expect-error
-    await graph.addEdge("start", "path_B", "OPTION_B", {});
-    // @ts-expect-error
-    await graph.addEdge("path_B", "success", "WIN", {});
-
-    // 1. Scout at Start: Unsure, forks!
-    // Keyword match on the Node ID provided in prompt
-    llm.addResponse(`Node: "start"`, {
-        action: "MOVE",
-        confidence: 0.5,
-        reasoning: "Unsure which path is better",
-        alternativeMoves: [
-            { edgeType: "OPTION_A", confidence: 0.5, reasoning: "Try A" },
-            { edgeType: "OPTION_B", confidence: 0.5, reasoning: "Try B" }
-        ]
-    });
-
-    // 2. Scout at Path A (Dead End)
-    llm.addResponse(`Node: "path_A"`, {
-        action: "ABORT", // Or exhaustive search that yields nothing
-        confidence: 0.0,
-        reasoning: "Dead end"
-    });
-
-    // 3. Scout at Path B (Good Path)
-    llm.addResponse(`Node: "path_B"`, {
-        action: "MOVE",
-        edgeType: "WIN",
-        confidence: 0.9,
-        reasoning: "Found winning path"
-    });
-
-    // 4. Scout at Success
-    llm.addResponse(`Node: "success"`, {
-        action: "CHECK",
-        confidence: 1.0,
-        reasoning: "Check this"
-    });
-
-    // 5. Judge
-    llm.addResponse(`Goal: Race`, {
-        isAnswer: true,
-        answer: "Victory found",
-        confidence: 1.0
-    });
-
-    // Router default
-    llm.setDefault({ domain: "global", confidence: 1.0, reasoning: "default" });
-
-    const artifact = await labyrinth.findPath("start", "Race");
-
-    expect(artifact).toBeDefined();
-    expect(artifact?.sources).toContain("success");
-    
-    // Use getTrace to verify forking happened
-    const _trace = await labyrinth.getTrace(artifact?.traceId || "");
-    // In our implementation, execution trace is in metadata
-    // We expect at least 2 threads to have existed
-    // The winner thread + dead thread(s)
-    
-    // Note: In the mock implementation `labyrinth.ts`, we copy metadata to traceCache. 
-    // The test might access `artifact.metadata.execution` directly if Labyrinth returns it (it strips it for the public return, but keeps in cache).
-    
-    // For this test, verifying we found the answer via path_B is sufficient proof the B-thread survived.
-  });
-
-  it("Scenario: Max Hops Exhaustion", async () => {
-    // Loop: A <-> B
-    // @ts-expect-error
-    await graph.addNode("A", ["Entity"], {});
-    // @ts-expect-error
-    await graph.addNode("B", ["Entity"], {});
-    // @ts-expect-error
-    await graph.addEdge("A", "B", "LOOP", {});
-    // @ts-expect-error
-    await graph.addEdge("B", "A", "LOOP", {});
-
-    // Scout just bounces
-    llm.addResponse("LOOP", {
-        action: "MOVE",
-        edgeType: "LOOP",
-        confidence: 0.5,
-        reasoning: "Looping"
-    });
-
-    // Limit hops
-    labyrinth = new Labyrinth(graph, { scout: scoutAgent, judge: judgeAgent, router: routerAgent }, {
-        llmProvider: { generate: async () => "" },
-        maxHops: 3, // Very short leash
-        maxCursors: 1
-    });
-
-    const artifact = await labyrinth.findPath("A", "Infinite Loop");
-
-    // Should fail gracefully
-    expect(artifact).toBeNull();
-  });
-});
-```
-
 ## File: packages/agent/test/utils/synthetic-llm.ts
 ```typescript
 import { mock } from "bun:test";
@@ -509,6 +1323,7 @@ export class SyntheticLLM {
   private globalDefault: object = { 
     // Scout (Action Union)
     action: "ABORT",
+    alternativeMoves: [], // Satisfy MoveAction optional but good to have empty
     
     // Router
     domain: "global",
@@ -580,584 +1395,6 @@ export class SyntheticLLM {
 }
 ```
 
-## File: packages/agent/test/e2e/mutation-complex.test.ts
-```typescript
-import { describe, it, expect, beforeAll } from "bun:test";
-import { runWithTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
-import { mastra } from "../../src/mastra/index";
-
-describe("E2E: Scribe (Complex Mutations)", () => {
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    llm.mockAgent(scribeAgent, { operations: [], reasoning: "Default", requiresClarification: undefined });
-  });
-
-  it("Halts on Ambiguity ('Delete the blue car')", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Setup: Two blue cars
-      // @ts-expect-error
-      await graph.addNode("ford", ["Car"], { color: "blue" });
-      // @ts-expect-error
-      await graph.addNode("chevy", ["Car"], { color: "blue" });
-
-      // Train Scribe to be confused
-      llm.addResponse("Delete the blue car", {
-        reasoning: "Ambiguous target.",
-        operations: [],
-        requiresClarification: "Did you mean the Ford or the Chevy?"
-      });
-
-      const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
-      const res = await run.start({
-        inputData: { query: "Delete the blue car" }
-      });
-
-      // @ts-expect-error
-      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-
-      // @ts-expect-error
-      const payload = res.results || res;
-      
-      // @ts-expect-error
-      expect(payload?.success).toBe(false);
-      // @ts-expect-error
-      expect(payload?.summary).toContain("Did you mean the Ford or the Chevy?");
-
-      // Verify no deletion happened
-      const cars = await graph.match([]).where({ labels: ["Car"] }).select();
-      expect(cars.length).toBe(2);
-    });
-  });
-
-  it("Executes Temporal Deletion ('Sold it yesterday')", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Setup
-      // @ts-expect-error
-      await graph.addNode("me", ["User"], {});
-      // @ts-expect-error
-      await graph.addNode("bike", ["Item"], {});
-      // @ts-expect-error
-      await graph.addEdge("me", "bike", "OWNS", {});
-
-      const YESTERDAY = new Date(Date.now() - 86400000).toISOString();
-
-      // Train Scribe
-      llm.addResponse("I sold the bike yesterday", {
-        reasoning: "Ownership ended.",
-        operations: [
-          {
-            op: "CLOSE_EDGE",
-            source: "me",
-            target: "bike",
-            type: "OWNS",
-            validTo: YESTERDAY
-          }
-        ]
-      });
-
-      const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
-      const res = await run.start({ inputData: { query: "I sold the bike yesterday" } });
-
-      // @ts-expect-error
-      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-      
-      // Verify Physics: Edge should not exist in "Present" view
-      // traverse() defaults to now()
-      const currentItems = await graph.native.traverse(["me"], "OWNS", "out");
-      expect(currentItems).not.toContain("bike");
-
-      // Verify it exists in the past (Time Travel)
-      // Check 2 days ago
-      const twoDaysAgo = Date.now() - (2 * 86400000);
-      const pastItems = await graph.native.traverse(["me"], "OWNS", "out", twoDaysAgo);
-      // Depending on how strict the test graph implementation is, this should be true if supported
-      // For in-memory QuackGraph, basic time travel is supported.
-      expect(pastItems).toContain("bike");
-    });
-  });
-});
-```
-
-## File: packages/agent/test/e2e/resilience.test.ts
-```typescript
-import { describe, it, expect, beforeAll, mock } from "bun:test";
-import { runWithTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scoutAgent } from "../../src/mastra/agents/scout-agent";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { mastra } from "../../src/mastra/index";
-
-describe("E2E: Chaos Monkey (Resilience)", () => {
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    // Safe defaults
-    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
-    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
-    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
-  });
-
-  it("handles Brain Damage (Malformed JSON from Scout)", async () => {
-    await runWithTestGraph(async (graph) => {
-      // @ts-expect-error
-      await graph.addNode("start", ["Entity"], {});
-      // @ts-expect-error
-      await graph.addNode("end", ["Entity"], {});
-      // @ts-expect-error
-      await graph.addEdge("start", "end", "LINK", {});
-
-      // 1. Sabotage the Scout Agent for this specific run
-      // We override the generate method to throw garbage
-      const originalGenerate = scoutAgent.generate;
-      
-      // @ts-expect-error - hijacking
-      scoutAgent.generate = mock(async () => {
-        return {
-          text: "{ NOT VALID JSON ",
-          object: null, // Simulate parser failure or raw text return
-          usage: { totalTokens: 0 }
-        };
-      });
-
-      try {
-        const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-        const res = await run.start({
-          inputData: {
-            goal: "Garbage In",
-            start: "start",
-            maxHops: 2
-          }
-        });
-
-        // The workflow should complete, but find nothing because the thread was killed
-        // @ts-expect-error
-        const payload = res.results || res;
-        const artifact = payload?.artifact;
-        expect(artifact).toBeNull(); // No winner found
-
-      } finally {
-        // Restore sanity
-        scoutAgent.generate = originalGenerate;
-      }
-    });
-  });
-
-  it("handles Exhaustion (Max Hops Reached)", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Infinite Chain: 1 -> 2 -> 3 ...
-      // @ts-expect-error
-      await graph.addNode("1", ["Entity"], {});
-      // @ts-expect-error
-      await graph.addNode("2", ["Entity"], {});
-      // @ts-expect-error
-      await graph.addEdge("1", "2", "NEXT", {});
-      // @ts-expect-error
-      await graph.addEdge("2", "3", "NEXT", {}); // Ghost edge to 3
-
-      // Train Scout to always move NEXT
-      llm.setDefault({
-        action: "MOVE",
-        edgeType: "NEXT",
-        confidence: 0.9,
-        reasoning: "Forever onward"
-      });
-
-      // Judge never satisfied
-      llm.addResponse("search", { isAnswer: false, confidence: 0 });
-
-      // Router
-      llm.addResponse("search", { domain: "global" });
-
-      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      const res = await run.start({
-        inputData: {
-          goal: "search",
-          start: "1",
-          maxHops: 1 // Strict limit
-        }
-      });
-
-      // @ts-expect-error
-      const payload = res.results || res;
-      const artifact = payload?.artifact;
-      
-      // Should result in null (failure to find) rather than hanging
-      expect(artifact).toBeNull();
-    });
-  });
-});
-```
-
-## File: packages/agent/test/e2e/labyrinth-complex.test.ts
-```typescript
-import { describe, it, expect, beforeAll, beforeEach } from "bun:test";
-import { runWithTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scoutAgent } from "../../src/mastra/agents/scout-agent";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { mastra } from "../../src/mastra/index";
-
-interface WorkflowResult {
-  artifact: {
-    answer: string;
-    confidence: number;
-    sources: string[];
-    traceId: string;
-    metadata?: unknown;
-  } | null;
-}
-
-describe("E2E: Labyrinth (Advanced)", () => {
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    // Safe defaults
-    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
-    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
-    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
-  });
-
-  // Default Router Response
-  beforeEach(() => {
-      llm.setDefault({ domain: "global", confidence: 1.0, reasoning: "Global search" });
-  });
-
-  it("Executes Speculative Forking (The Race)", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Topology: start -> (A | B) -> goal
-      // @ts-expect-error
-      await graph.addNode("start", ["Start"], {});
-      // @ts-expect-error
-      await graph.addNode("path_A", ["Way"], {});
-      // @ts-expect-error
-      await graph.addNode("path_B", ["Way"], {});
-      // @ts-expect-error
-      await graph.addNode("goal", ["End"], { content: "The Answer" });
-
-      // @ts-expect-error
-      await graph.addEdge("start", "path_A", "LEFT", {});
-      // @ts-expect-error
-      await graph.addEdge("start", "path_B", "RIGHT", {});
-      // @ts-expect-error
-      await graph.addEdge("path_B", "goal", "WIN", {});
-
-      // 1. Train Scout at 'start' to FORK
-      // Returns a MOVE for 'LEFT' but alternative 'RIGHT'
-      llm.addResponse(`Node: "start"`, {
-        action: "MOVE",
-        edgeType: "LEFT",
-        confidence: 0.5,
-        reasoning: "Maybe left?",
-        alternativeMoves: [
-            { edgeType: "RIGHT", confidence: 0.5, reasoning: "Or maybe right?" }
-        ]
-      });
-
-      // 2. Train Scout at 'path_A' (Dead End)
-      llm.addResponse(`Node: "path_A"`, {
-        action: "ABORT",
-        confidence: 0.0,
-        reasoning: "Dead end here"
-      });
-
-      // 3. Train Scout at 'path_B' (Winner)
-      llm.addResponse(`Node: "path_B"`, {
-        action: "MOVE",
-        edgeType: "WIN",
-        confidence: 0.9,
-        reasoning: "Found the path"
-      });
-
-      // 4. Train Scout at 'goal'
-      llm.addResponse(`Node: "goal"`, {
-          action: "CHECK",
-          confidence: 1.0,
-          reasoning: "Goal found"
-      });
-
-      // 5. Train Judge
-      llm.addResponse(`Goal: Race`, {
-          isAnswer: true,
-          answer: "Found it via Path B",
-          confidence: 1.0
-      });
-
-      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      const res = await run.start({
-          inputData: { goal: "Race", start: "start", maxCursors: 5 }
-      });
-
-      // @ts-expect-error
-      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-
-      // @ts-expect-error
-      const results = (res.results || res) as WorkflowResult;
-      const artifact = results?.artifact;
-      
-      expect(artifact).toBeDefined();
-      expect(artifact?.sources).toContain("goal");
-
-      // We implicitly proved forking works because the "Primary" move was LEFT (Dead End),
-      // but the agent found the goal via RIGHT (Alternative), which was only explored due to forking.
-    });
-  });
-
-  it("Reinforces Path (Pheromones)", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Simple path: Start -> End
-      // @ts-expect-error
-      await graph.addNode("s1", ["Start"], {});
-      // @ts-expect-error
-      await graph.addNode("e1", ["End"], {});
-      // @ts-expect-error
-      await graph.addEdge("s1", "e1", "DIRECT", { weight: 0 }); // Cold edge
-
-      // Train Scout
-      llm.addResponse(`Node: "s1"`, { action: "MOVE", edgeType: "DIRECT", confidence: 1.0, reasoning: "Go" });
-      llm.addResponse(`Node: "e1"`, { action: "CHECK", confidence: 1.0, reasoning: "Done" });
-      // Train Judge
-      llm.addResponse(`Goal: Heat`, { isAnswer: true, answer: "Done", confidence: 1.0 });
-
-      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      const res = await run.start({
-          inputData: { goal: "Heat", start: "s1" }
-      });
-
-      // @ts-expect-error
-      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-
-      // Verify Heat Increase
-      // Note: In a real integration test we'd check the native graph store.
-      // Here we trust the GraphTools implementation which we tested in unit tests.
-      // But we can check if getSectorSummary reports >0 heat now if supported.
-      // (This assumes the in-memory graph persists state across the workflow step and verify call)
-      
-      // We rely on the workflow completing successfully as proof the reinforce step ran.
-      // Ideally, we'd query: graph.native.getEdge("s1", "e1", "DIRECT").heat
-      
-      // Let's assume verifying the workflow output contains no error is sufficient for E2E
-      // as we tested `reinforcePath` logic in unit tests.
-    });
-  });
-});
-```
-
-## File: packages/agent/test/e2e/metabolism.test.ts
-```typescript
-import { describe, it, expect, beforeAll } from "bun:test";
-import { runWithTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { mastra } from "../../src/mastra/index";
-import { generateTimeSeries } from "../utils/generators";
-
-interface MetabolismResult {
-  success: boolean;
-  summary: string;
-}
-
-describe("E2E: Metabolism (The Dreaming Graph)", () => {
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
-  });
-
-  it("Digests raw logs into a summary node", async () => {
-    await runWithTestGraph(async (graph) => {
-      // 1. Generate 10 days of "Mood" logs
-      // @ts-expect-error
-      await graph.addNode("user_alice", ["User"], { name: "Alice" });
-      const { eventIds } = await generateTimeSeries(graph, "user_alice", 10, 24 * 60, 10 * 24 * 60);
-
-      // 2. Train the Brain (Judge)
-      llm.addResponse("Summarize these", {
-        isAnswer: true,
-        answer: "User mood was generally positive with a dip on day 3.",
-        confidence: 1.0
-      });
-
-      // 3. Run Metabolism Workflow
-      const run = await mastra.getWorkflow("metabolismWorkflow").createRunAsync();
-      const res = await run.start({
-        inputData: {
-          minAgeDays: 0, // Process everything immediately for test
-          targetLabel: "Event" // Matching generator label
-        }
-      });
-
-      // @ts-expect-error
-      if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-
-      // 4. Verify Success
-      // @ts-expect-error
-      const results = (res.results || res) as MetabolismResult;
-      expect(results?.success).toBe(true);
-
-      // 5. Verify Physics (Graph State)
-      // Old nodes should be gone (or disconnected/deleted)
-      const oldNodes = await graph.match([]).where({ id: eventIds }).select();
-      expect(oldNodes.length).toBe(0);
-
-      // Summary node should exist
-      const summaries = await graph.match([]).where({ labels: ["Summary"] }).select();
-      expect(summaries.length).toBe(1);
-      expect(summaries[0].properties.content).toBe("User mood was generally positive with a dip on day 3.");
-
-      // Check linkage: user_alice -> HAS_SUMMARY -> SummaryNode
-      // We need to verify user_alice is connected to the new summary
-      const summaryId = summaries[0].id;
-      const neighbors = await graph.native.traverse(["user_alice"], "HAS_SUMMARY", "out");
-      expect(neighbors).toContain(summaryId);
-    });
-  });
-});
-```
-
-## File: packages/agent/test/e2e/time-travel.test.ts
-```typescript
-import { describe, it, expect, beforeAll } from "bun:test";
-import { runWithTestGraph } from "../utils/test-graph";
-import { SyntheticLLM } from "../utils/synthetic-llm";
-import { scoutAgent } from "../../src/mastra/agents/scout-agent";
-import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { mastra } from "../../src/mastra/index";
-
-interface LabyrinthResult {
-  artifact: {
-    answer: string;
-    sources: string[];
-  } | null;
-}
-
-describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
-  let llm: SyntheticLLM;
-
-  beforeAll(() => {
-    llm = new SyntheticLLM();
-    // Safe defaults
-    llm.mockAgent(scoutAgent, { action: "ABORT", confidence: 0, reasoning: "Default Abort" });
-    llm.mockAgent(judgeAgent, { isAnswer: false, answer: "No", confidence: 0 });
-    llm.mockAgent(routerAgent, { domain: "global", confidence: 1, reasoning: "Default Global" });
-  });
-
-  it("returns different answers for 2023 vs 2024 contexts", async () => {
-    await runWithTestGraph(async (graph) => {
-      // Topology: Employee managed by different people at different times
-      // @ts-expect-error
-      await graph.addNode("dave", ["Employee"], { name: "Dave" });
-      // @ts-expect-error
-      await graph.addNode("alice", ["Manager"], { name: "Alice" }); // 2023
-      // @ts-expect-error
-      await graph.addNode("bob", ["Manager"], { name: "Bob" });     // 2024
-
-      const t2023_start = new Date("2023-01-01").toISOString();
-      const t2023_end   = new Date("2023-12-31").toISOString();
-      const t2024_start = new Date("2024-01-01").toISOString();
-
-      // Dave --(MANAGED_BY)--> Alice (2023 only)
-      // @ts-expect-error
-      await graph.addEdges([{ 
-        source: "dave", target: "alice", type: "MANAGED_BY", properties: {}, 
-        validFrom: new Date(t2023_start), validTo: new Date(t2023_end) 
-      }]);
-
-      // Dave --(MANAGED_BY)--> Bob (2024 onwards)
-      // @ts-expect-error
-      await graph.addEdges([{ 
-        source: "dave", target: "bob", type: "MANAGED_BY", properties: {}, 
-        validFrom: new Date(t2024_start)
-      }]);
-
-      // --- Train the Synthetic Brain ---
-      
-      // Router: Always Global
-      llm.addResponse("Who managed Dave", { domain: "global", confidence: 1.0, reasoning: "HR Query" });
-
-      // Scout: Sees MANAGED_BY edges. 
-      // NOTE: The Scout prompt contains the sector summary. 
-      // The sector summary is generated by GraphTools, which respects `asOf`.
-      // So if asOf=2023, Scout only sees Alice. If asOf=2024, Scout only sees Bob.
-      
-      // Generic move response (Scout decides based on what it sees)
-      // We'll trust the "Ghost Earth" logic: if it sees an edge, it takes it.
-      llm.setDefault({
-        action: "MOVE",
-        edgeType: "MANAGED_BY",
-        confidence: 0.9,
-        reasoning: "Following management chain",
-        // Safety fields for other agents (Router/Judge) if they fall back
-        domain: "global",
-        isAnswer: false,
-        answer: "Fallback"
-      });
-
-      // Special case: If at Alice or Bob, Check for answer
-      llm.addResponse(`Node: "alice"`, { action: "CHECK", confidence: 1.0, reasoning: "Checking Alice" });
-      llm.addResponse(`Node: "bob"`, { action: "CHECK", confidence: 1.0, reasoning: "Checking Bob" });
-
-      // Judge: Confirms answer
-      llm.addResponse(`Node: "alice"`, { isAnswer: true, answer: "Manager was Alice", confidence: 1.0 }); // Wrong prompt key, relying on content retrieval mock implicitly or explicit pattern
-      // Let's make Judge robust:
-      llm.addResponse(`"name":"Alice"`, { isAnswer: true, answer: "Manager was Alice", confidence: 1.0 });
-      llm.addResponse(`"name":"Bob"`, { isAnswer: true, answer: "Manager was Bob", confidence: 1.0 });
-
-
-      // --- Execution 1: Query as of mid-2023 ---
-      const run2023 = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      const res2023 = await run2023.start({
-        inputData: {
-          goal: "Who managed Dave?",
-          start: "dave",
-          timeContext: { asOf: new Date("2023-06-15").getTime() }
-        }
-      });
-
-      // @ts-expect-error
-      if (res2023.status === "failed") throw new Error(`Workflow failed: ${res2023.error?.message}`);
-
-      // @ts-expect-error
-      const payload2023 = res2023.results || res2023;
-      const art2023 = (payload2023 as LabyrinthResult)?.artifact;
-      expect(art2023).toBeDefined();
-      expect(art2023?.answer).toContain("Alice");
-      expect(art2023?.sources).toContain("alice");
-
-
-      // --- Execution 2: Query as of 2024 ---
-      const run2024 = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
-      const res2024 = await run2024.start({
-        inputData: {
-          goal: "Who managed Dave?",
-          start: "dave",
-          timeContext: { asOf: new Date("2024-06-15").getTime() }
-        }
-      });
-
-      // @ts-expect-error
-      if (res2024.status === "failed") throw new Error(`Workflow failed: ${res2024.error?.message}`);
-
-      // @ts-expect-error
-      const payload2024 = res2024.results || res2024;
-      const art2024 = (payload2024 as LabyrinthResult)?.artifact;
-      expect(art2024).toBeDefined();
-      expect(art2024?.answer).toContain("Bob");
-      expect(art2024?.sources).toContain("bob");
-    });
-  });
-});
-```
-
 ## File: packages/agent/test/e2e/mutation.test.ts
 ```typescript
 import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test";
@@ -1167,6 +1404,7 @@ import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
 import { mastra } from "../../src/mastra/index";
 import type { QuackGraph } from "@quackgraph/graph";
 import { z } from "zod";
+import { getWorkflowResult } from "../utils/result-helper";
 
 const MutationResultSchema = z.object({
   success: z.boolean(),
@@ -1232,9 +1470,8 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     
     expect(parsed.data.success).toBe(true);
     expect(parsed.data.summary).toContain("Created Node bob_1");
-
-    // 4. Verify Side Effects (Graph Physics)
-    const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
+    
+    const rawResults = getWorkflowResult(result);
     expect(storedNode.length).toBe(1);
     expect(storedNode[0].properties.name).toBe("Bob");
   });
@@ -1276,8 +1513,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify
-    // @ts-expect-error
-    const rawResults = result.results || result;
+    const rawResults = getWorkflowResult(result);
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
       throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
@@ -1325,8 +1561,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify
-    // @ts-expect-error
-    const rawResults = result.results || result;
+    const rawResults = getWorkflowResult(result);
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) throw new Error("Invalid Result");
 
@@ -1339,263 +1574,4 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     expect(cars.length).toBe(2);
   });
 });
-```
-
-## File: packages/agent/src/tools/graph-tools.ts
-```typescript
-import type { QuackGraph } from '@quackgraph/graph';
-import type { SectorSummary, LabyrinthContext } from '../types';
-// import type { JsPatternEdge } from '@quackgraph/native';
-
-export interface JsPatternEdge {
-  srcVar: number;
-  tgtVar: number;
-  edgeType: string;
-  direction: string;
-}
-
-export class GraphTools {
-  constructor(private graph: QuackGraph) { }
-
-  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
-    let ms: number | undefined;
-    if (typeof contextOrAsOf === 'number') {
-      ms = contextOrAsOf;
-    } else if (contextOrAsOf?.asOf) {
-      ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
-    }
-    
-    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally
-    return ms;
-  }
-
-  /**
-   * LOD 0: Sector Scan / Satellite View
-   * Returns a summary of available moves from the current nodes.
-   */
-  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
-    if (currentNodes.length === 0) return [];
-
-    const asOf = this.resolveAsOf(contextOrAsOf);
-
-    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
-    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
-
-    // 2. Filter if explicit allowed list provided (double check)
-    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
-    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
-      return results.filter((r: SectorSummary) => allowedEdgeTypes.includes(r.edgeType)).sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
-    }
-
-    // 3. Sort by count (descending)
-    return results.sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
-  }
-
-  /**
-   * LOD 1.5: Ghost Map / Navigational Map
-   * Generates an ASCII tree of the topology up to a certain depth.
-   * Uses geometric pruning and token budgeting to keep the map readable.
-   */
-  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
-    const maxDepth = Math.min(depth, 3); // Hard cap at depth 3 for safety
-    const treeLines: string[] = [`[ROOT] ${rootId}`];
-    let isTruncated = false;
-    let totalLines = 0;
-    const MAX_LINES = 40; // Prevent context window explosion
-
-    // Helper for recursion
-    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
-      if (currentDepth >= maxDepth) return;
-      if (totalLines >= MAX_LINES) {
-        if (!isTruncated) {
-          treeLines.push(`${prefix}... (truncated)`);
-          isTruncated = true;
-        }
-        return;
-      }
-
-      // Geometric pruning: 8 -> 4 -> 2
-      const branchLimit = Math.max(2, Math.floor(8 / 2 ** currentDepth));
-      let branchesCount = 0;
-
-      // 1. Get stats to find "hot" edges
-      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
-
-      // Sort by Heat first, then Count to prioritize "Hot" paths in the view
-      stats.sort((a, b) => (b.avgHeat || 0) - (a.avgHeat || 0) || b.count - a.count);
-
-      for (const stat of stats) {
-        if (branchesCount >= branchLimit) break;
-        if (totalLines >= MAX_LINES) break;
-
-        const edgeType = stat.edgeType;
-        const heatVal = stat.avgHeat || 0;
-        let heatMarker = '';
-        if (heatVal > 80) heatMarker = ' 🔥🔥🔥';
-        else if (heatVal > 50) heatMarker = ' 🔥';
-        else if (heatVal > 20) heatMarker = ' ♨️';
-
-        // 2. Traverse to get samples (fetch just enough to display)
-        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
-
-        // Pruning neighbor display based on depth
-        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1);
-        const displayNeighbors = neighbors.slice(0, neighborLimit);
-
-        for (let i = 0; i < displayNeighbors.length; i++) {
-          if (branchesCount >= branchLimit) break;
-          if (totalLines >= MAX_LINES) { isTruncated = true; break; }
-
-          const neighborId = displayNeighbors[i];
-          if (!neighborId) continue;
-
-          // Check if this is the last item to choose the connector symbol
-          const isLast = (i === displayNeighbors.length - 1) && (stats.indexOf(stat) === stats.length - 1 || branchesCount === branchLimit - 1);
-          const connector = isLast ? '└──' : '├──';
-
-          treeLines.push(`${prefix}${connector} [${edgeType}]──> (${neighborId})${heatMarker}`);
-          totalLines++;
-
-          const nextPrefix = prefix + (isLast ? '    ' : '│   ');
-          await buildTree(neighborId, currentDepth + 1, nextPrefix);
-          branchesCount++;
-        }
-      }
-    };
-
-    await buildTree(rootId, 0, ' ');
-
-    return {
-      map: treeLines.join('\n'),
-      truncated: isTruncated
-    };
-  }
-
-  /**
-   * LOD 1: Topology Scan
-   * Returns the IDs of neighbors reachable via a specific edge type.
-   */
-  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
-    if (currentNodes.length === 0) return [];
-    const asOf = this.resolveAsOf(contextOrAsOf);
-    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
-  }
-
-  /**
-   * LOD 1: Temporal Interval Scan
-   * Finds neighbors connected via edges overlapping/contained in the window.
-   */
-  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
-  }
-
-  /**
-   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
-   */
-  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    if (currentNodes.length === 0) return [];
-    // We use the native traverseInterval which accepts edgeType
-    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
-  }
-
-  /**
-   * LOD 1.5: Pattern Matching (Structural Inference)
-   * Finds subgraphs matching a specific shape.
-   */
-  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
-    if (startNodes.length === 0) return [];
-    const nativePattern = pattern.map(p => ({
-      srcVar: p.srcVar || 0,
-      tgtVar: p.tgtVar || 0,
-      edgeType: p.edgeType || '',
-      direction: p.direction || 'out'
-    }));
-    const asOf = this.resolveAsOf(contextOrAsOf);
-    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
-  }
-
-  /**
-   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
-   * If nodes are part of a document chain (NEXT/PREV), fetch context.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
-  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
-    if (nodeIds.length === 0) return [];
-
-    // 1. Fetch Primary Content
-    const primaryNodes = await this.graph.match([])
-      .where({ id: nodeIds })
-      .select();
-
-    // 2. Virtual Spine Expansion
-    // Check for "NEXT" or "PREV" connections to provide document flow context.
-    const spineContextIds = new Set<string>();
-
-    for (const id of nodeIds) {
-      // Look ahead
-      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach((nid: string) => { spineContextIds.add(nid); });
-
-      // Look back
-      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach((nid: string) => { spineContextIds.add(nid); });
-
-      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach((nid: string) => { spineContextIds.add(nid); });
-    }
-
-    // Remove duplicates (original nodes)
-    nodeIds.forEach(id => { spineContextIds.delete(id); });
-
-    if (spineContextIds.size > 0) {
-      const contextNodes = await this.graph.match([])
-        .where({ id: Array.from(spineContextIds) })
-        .select();
-
-      // Merge and Annotate
-      // Create a map for fast lookup
-      const contextMap = new Map(contextNodes.map(n => [n.id, n]));
-
-      return primaryNodes.map(node => {
-        // Find connected context nodes?
-        // For simplicity, we just attach all found spine context, 
-        // ideally we would link specific context to specific nodes but that requires tracking edges again.
-        // We will just return the primary node and let the LLM see the expanded content if requested separately
-        // or attach generic context.
-        return {
-          ...node,
-          _isPrimary: true,
-          _context: Array.from(contextMap.values()).map(c => ({ id: c.id, ...c.properties }))
-        };
-      });
-    }
-
-    return primaryNodes;
-  }
-
-  /**
-   * Pheromones: Reinforce a successful path by increasing edge heat.
-   */
-  async reinforcePath(nodes: string[], edges: (string | undefined)[], qualityScore: number = 1.0) {
-    if (nodes.length < 2) return;
-
-    // Base increment is 50 for a perfect score. 
-    const heatDelta = Math.floor(qualityScore * 50);
-
-    for (let i = 0; i < nodes.length - 1; i++) {
-      const source = nodes[i];
-      const target = nodes[i + 1];
-      const edge = edges[i + 1]; // edges[0] is undefined (start)
-
-      if (source && target && edge) {
-        // Call native update
-        try {
-          await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
-        } catch (e) {
-          console.warn(`[Pheromones] Failed to update heat for ${source}->${target}:`, e);
-        }
-      }
-    }
-  }
-}
 ```

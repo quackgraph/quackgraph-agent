@@ -61,18 +61,19 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify Result
-    // @ts-expect-error - Mastra generic return type
-    const rawResults = result.results || result;
-    
+    const rawResults = getWorkflowResult(result);
+
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
       throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
     }
-    
+
     expect(parsed.data.success).toBe(true);
     expect(parsed.data.summary).toContain("Created Node bob_1");
-    
-    const rawResults = getWorkflowResult(result);
+
+    // Verify side effects
+    // @ts-expect-error
+    const storedNode = await graph.match([]).where({ labels: ["User"], id: "bob_1" }).select();
     expect(storedNode.length).toBe(1);
     expect(storedNode[0].properties.name).toBe("Bob");
   });
