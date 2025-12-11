@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from "bun:test";
 import { runWithTestGraph } from "../utils/test-graph";
 import { SyntheticLLM } from "../utils/synthetic-llm";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
-import { metabolismWorkflow } from "../../src/mastra/workflows/metabolism-workflow";
+import { mastra } from "../../src/mastra/index";
 import { generateTimeSeries } from "../utils/generators";
 
 describe("E2E: Metabolism (The Dreaming Graph)", () => {
@@ -28,7 +28,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
       });
 
       // 3. Run Metabolism Workflow
-      const run = await metabolismWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("metabolismWorkflow").createRunAsync();
       const res = await run.start({
         inputData: {
           minAgeDays: 0, // Process everything immediately for test

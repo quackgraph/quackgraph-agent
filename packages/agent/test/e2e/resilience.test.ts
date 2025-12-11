@@ -4,7 +4,7 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scoutAgent } from "../../src/mastra/agents/scout-agent";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { labyrinthWorkflow } from "../../src/mastra/workflows/labyrinth-workflow";
+import { mastra } from "../../src/mastra/index";
 
 describe("E2E: Chaos Monkey (Resilience)", () => {
   let llm: SyntheticLLM;
@@ -39,7 +39,7 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
       });
 
       try {
-        const run = await labyrinthWorkflow.createRunAsync();
+        const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
         const res = await run.start({
           inputData: {
             goal: "Garbage In",
@@ -86,7 +86,7 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
       // Router
       llm.addResponse("search", { domain: "global" });
 
-      const run = await labyrinthWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
       const res = await run.start({
         inputData: {
           goal: "search",

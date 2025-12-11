@@ -1,16 +1,27 @@
 import type { QuackGraph } from '@quackgraph/graph';
 import type { SectorSummary, LabyrinthContext } from '../types';
-import type { JsPatternEdge } from '@quackgraph/native';
+// import type { JsPatternEdge } from '@quackgraph/native';
+
+export interface JsPatternEdge {
+  srcVar: number;
+  tgtVar: number;
+  edgeType: string;
+  direction: string;
+}
 
 export class GraphTools {
   constructor(private graph: QuackGraph) { }
 
   private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
-    if (typeof contextOrAsOf === 'number') return contextOrAsOf;
-    if (contextOrAsOf?.asOf) {
-      return contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
+    let ms: number | undefined;
+    if (typeof contextOrAsOf === 'number') {
+      ms = contextOrAsOf;
+    } else if (contextOrAsOf?.asOf) {
+      ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
     }
-    return undefined;
+    
+    // Convert ms to microseconds for Native Rust layer
+    return ms !== undefined ? ms * 1000 : undefined;
   }
 
   /**
@@ -28,11 +39,11 @@ export class GraphTools {
     // 2. Filter if explicit allowed list provided (double check)
     // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
     if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
-      return results.filter(r => allowedEdgeTypes.includes(r.edgeType)).sort((a, b) => b.count - a.count);
+      return results.filter((r: SectorSummary) => allowedEdgeTypes.includes(r.edgeType)).sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
     }
 
     // 3. Sort by count (descending)
-    return results.sort((a, b) => b.count - a.count);
+    return results.sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
   }
 
   /**
@@ -64,7 +75,7 @@ export class GraphTools {
 
       // 1. Get stats to find "hot" edges
       const stats = await this.getSectorSummary([currentId], contextOrAsOf);
-      
+
       // Sort by Heat first, then Count to prioritize "Hot" paths in the view
       stats.sort((a, b) => (b.avgHeat || 0) - (a.avgHeat || 0) || b.count - a.count);
 
@@ -78,40 +89,40 @@ export class GraphTools {
         if (heatVal > 80) heatMarker = ' 🔥🔥🔥';
         else if (heatVal > 50) heatMarker = ' 🔥';
         else if (heatVal > 20) heatMarker = ' ♨️';
-        
+
         // 2. Traverse to get samples (fetch just enough to display)
         const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
-        
-        // Pruning neighbor display based on depth
-        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1); 
-        const displayNeighbors = neighbors.slice(0, neighborLimit);
-        
-        for (let i = 0; i < displayNeighbors.length; i++) {
-             if (branchesCount >= branchLimit) break;
-             if (totalLines >= MAX_LINES) { isTruncated = true; break; }
 
-             const neighborId = displayNeighbors[i];
-             if (!neighborId) continue;
-             
-             // Check if this is the last item to choose the connector symbol
-             const isLast = (i === displayNeighbors.length - 1) && (stats.indexOf(stat) === stats.length - 1 || branchesCount === branchLimit - 1);
-             const connector = isLast ? '└──' : '├──';
-             
-             treeLines.push(`${prefix}${connector} [${edgeType}]──> (${neighborId})${heatMarker}`);
-             totalLines++;
-             
-             const nextPrefix = prefix + (isLast ? '    ' : '│   ');
-             await buildTree(neighborId, currentDepth + 1, nextPrefix);
-             branchesCount++;
+        // Pruning neighbor display based on depth
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1);
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+
+        for (let i = 0; i < displayNeighbors.length; i++) {
+          if (branchesCount >= branchLimit) break;
+          if (totalLines >= MAX_LINES) { isTruncated = true; break; }
+
+          const neighborId = displayNeighbors[i];
+          if (!neighborId) continue;
+
+          // Check if this is the last item to choose the connector symbol
+          const isLast = (i === displayNeighbors.length - 1) && (stats.indexOf(stat) === stats.length - 1 || branchesCount === branchLimit - 1);
+          const connector = isLast ? '└──' : '├──';
+
+          treeLines.push(`${prefix}${connector} [${edgeType}]──> (${neighborId})${heatMarker}`);
+          totalLines++;
+
+          const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+          await buildTree(neighborId, currentDepth + 1, nextPrefix);
+          branchesCount++;
         }
       }
     };
 
     await buildTree(rootId, 0, ' ');
-    
+
     return {
-        map: treeLines.join('\n'),
-        truncated: isTruncated
+      map: treeLines.join('\n'),
+      truncated: isTruncated
     };
   }
 
@@ -178,14 +189,14 @@ export class GraphTools {
     for (const id of nodeIds) {
       // Look ahead
       const next = await this.graph.native.traverse([id], 'NEXT', 'out');
-      next.forEach(nid => { spineContextIds.add(nid); });
+      next.forEach((nid: string) => { spineContextIds.add(nid); });
 
       // Look back
       const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
-      incomingNext.forEach(nid => { spineContextIds.add(nid); });
+      incomingNext.forEach((nid: string) => { spineContextIds.add(nid); });
 
       const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
-      explicitPrev.forEach(nid => { spineContextIds.add(nid); });
+      explicitPrev.forEach((nid: string) => { spineContextIds.add(nid); });
     }
 
     // Remove duplicates (original nodes)
@@ -234,9 +245,9 @@ export class GraphTools {
       if (source && target && edge) {
         // Call native update
         try {
-            await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
-        } catch(e) {
-            console.warn(`[Pheromones] Failed to update heat for ${source}->${target}:`, e);
+          await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
+        } catch (e) {
+          console.warn(`[Pheromones] Failed to update heat for ${source}->${target}:`, e);
         }
       }
     }

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from "bun:test";
 import { runWithTestGraph } from "../utils/test-graph";
 import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
-import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
+import { mastra } from "../../src/mastra/index";
 
 describe("E2E: Scribe (Complex Mutations)", () => {
   let llm: SyntheticLLM;
@@ -27,7 +27,7 @@ describe("E2E: Scribe (Complex Mutations)", () => {
         requiresClarification: "Did you mean the Ford or the Chevy?"
       });
 
-      const run = await mutationWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
       const res = await run.start({
         inputData: { query: "Delete the blue car" }
       });
@@ -69,7 +69,7 @@ describe("E2E: Scribe (Complex Mutations)", () => {
         ]
       });
 
-      const run = await mutationWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
       await run.start({ inputData: { query: "I sold the bike yesterday" } });
 
       // Verify Physics: Edge should not exist in "Present" view

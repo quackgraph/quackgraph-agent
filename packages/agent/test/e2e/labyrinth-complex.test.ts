@@ -4,7 +4,7 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scoutAgent } from "../../src/mastra/agents/scout-agent";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { labyrinthWorkflow } from "../../src/mastra/workflows/labyrinth-workflow";
+import { mastra } from "../../src/mastra/index";
 
 describe("E2E: Labyrinth (Advanced)", () => {
   let llm: SyntheticLLM;
@@ -81,7 +81,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
           confidence: 1.0
       });
 
-      const run = await labyrinthWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
       const res = await run.start({
           inputData: { goal: "Race", start: "start", maxCursors: 5 }
       });
@@ -113,7 +113,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
       // Train Judge
       llm.addResponse(`Goal: Heat`, { isAnswer: true, answer: "Done", confidence: 1.0 });
 
-      const run = await labyrinthWorkflow.createRunAsync();
+      const run = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
       await run.start({
           inputData: { goal: "Heat", start: "s1" }
       });

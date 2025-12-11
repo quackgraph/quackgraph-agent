@@ -39,11 +39,11 @@ describe("Integration: Chronos (Temporal Physics)", () => {
 
       // Connect them all
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_inside", "HAS_NOTE", {});
+      await graph.addEdge("meeting", "note_inside", "HAS_NOTE", {}, new Date(BASE_TIME + 15 * 60 * 1000));
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_before", "HAS_NOTE", {});
+      await graph.addEdge("meeting", "note_before", "HAS_NOTE", {}, new Date(BASE_TIME - ONE_HOUR));
       // @ts-expect-error
-      await graph.addEdge("meeting", "note_after", "HAS_NOTE", {});
+      await graph.addEdge("meeting", "note_after", "HAS_NOTE", {}, new Date(BASE_TIME + 2 * ONE_HOUR));
 
       // Define Window: 12:00 -> 13:00
       const wStart = new Date(BASE_TIME);
@@ -99,6 +99,10 @@ describe("Integration: Chronos (Temporal Physics)", () => {
         "UPDATE edges SET valid_to = ? WHERE type = 'LINK'",
         [new Date(t1.getTime() + 1000).toISOString()] // Ends right after T1
       );
+
+      // Manually sync native graph (since we bypassed addEdge/removeEdge)
+      graph.native.removeEdge("anchor", "target", "LINK");
+      // Note: We don't need to re-add it for T2 view because it's effectively gone in T2.
 
       // Now request the diff in order: T1 -> T2 -> T3
       const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);

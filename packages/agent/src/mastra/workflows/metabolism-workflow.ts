@@ -110,7 +110,7 @@ const applySummary = createStep({
     );
 
     const candidateSet = new Set(inputData.candidateIds);
-    const externalParents = allParents.filter(p => !candidateSet.has(p));
+    const externalParents = allParents.filter((p: string) => !candidateSet.has(p));
 
     if (externalParents.length === 0) return { success: false };
 

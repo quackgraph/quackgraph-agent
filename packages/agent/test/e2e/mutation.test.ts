@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll } from "bun:test
 import { createTestGraph } from "../utils/test-graph";
 import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
-import { mutationWorkflow } from "../../src/mastra/workflows/mutation-workflow";
+import { mastra } from "../../src/mastra/index";
 import type { QuackGraph } from "@quackgraph/graph";
 
 describe("E2E: Mutation Workflow (The Scribe)", () => {
@@ -40,7 +40,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 2. Execute Workflow
-    const run = await mutationWorkflow.createRunAsync();
+    const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
     const result = await run.start({
       inputData: {
         query: "Create a user named Bob",
@@ -86,7 +86,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 2. Execute
-    const run = await mutationWorkflow.createRunAsync();
+    const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
     const result = await run.start({
       inputData: {
         query: "Bob left the company",
@@ -126,7 +126,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     });
 
     // 2. Execute
-    const run = await mutationWorkflow.createRunAsync();
+    const run = await mastra.getWorkflow("mutationWorkflow").createRunAsync();
     const result = await run.start({
       inputData: {
         query: "Delete the car",

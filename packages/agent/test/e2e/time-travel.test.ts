@@ -4,7 +4,7 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scoutAgent } from "../../src/mastra/agents/scout-agent";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
-import { labyrinthWorkflow } from "../../src/mastra/workflows/labyrinth-workflow";
+import { mastra } from "../../src/mastra/index";
 
 describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
   let llm: SyntheticLLM;
@@ -75,7 +75,7 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
 
 
       // --- Execution 1: Query as of mid-2023 ---
-      const run2023 = await labyrinthWorkflow.createRunAsync();
+      const run2023 = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
       const res2023 = await run2023.start({
         inputData: {
           goal: "Who managed Dave?",
@@ -92,7 +92,7 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
 
 
       // --- Execution 2: Query as of 2024 ---
-      const run2024 = await labyrinthWorkflow.createRunAsync();
+      const run2024 = await mastra.getWorkflow("labyrinthWorkflow").createRunAsync();
       const res2024 = await run2024.start({
         inputData: {
           goal: "Who managed Dave?",

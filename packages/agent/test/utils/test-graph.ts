@@ -7,19 +7,10 @@ import { setGraphInstance, enterGraphContext, runWithGraph } from '../../src/lib
  */
 export async function createTestGraph(): Promise<QuackGraph> {
   // Initialize QuackGraph in-memory
-  // Note: We assume the QuackGraph constructor supports a config object for storage.
-  // If the core package implementation differs, this needs adjustment.
-  const graph = new QuackGraph({
-    storage: ':memory:',
-    dbUrl: ':memory:', // Dual support depending on core version
-  });
+  const graph = new QuackGraph(':memory:');
 
-  // If there's an async init method, call it
-  // @ts-expect-error - Checking for potential init method
-  if (typeof graph.initialize === 'function') {
-    // @ts-expect-error
-    await graph.initialize();
-  }
+  // Call the async init method
+  await graph.init();
 
   // 1. Try to set isolation context for this async flow (Best effort for legacy tests)
   enterGraphContext(graph);
@@ -35,16 +26,9 @@ export async function createTestGraph(): Promise<QuackGraph> {
  * Ensures graph is closed after use and strictly isolated via AsyncLocalStorage.
  */
 export async function runWithTestGraph<T>(callback: (graph: QuackGraph) => Promise<T>): Promise<T> {
-  const graph = new QuackGraph({
-    storage: ':memory:',
-    dbUrl: ':memory:',
-  });
+  const graph = new QuackGraph(':memory:');
 
-  // @ts-expect-error - Checking for potential init method
-  if (typeof graph.initialize === 'function') {
-    // @ts-expect-error
-    await graph.initialize();
-  }
+  await graph.init();
 
   try {
     return await runWithGraph(graph, async () => {
