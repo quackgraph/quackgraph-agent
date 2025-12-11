@@ -38,12 +38,14 @@ export class SchemaRegistry {
     const domain = this.domains.get(domainName.toLowerCase());
     if (!domain) return true;
     
+    const target = edgeType.toLowerCase();
+
     // 1. Check Exclusion (Blacklist)
-    if (domain.excludedEdges?.includes(edgeType)) return false;
+    if (domain.excludedEdges?.some(e => e.toLowerCase() === target)) return false;
 
     // 2. Check Inclusion (Whitelist)
     if (domain.allowedEdges.length > 0) {
-      return domain.allowedEdges.includes(edgeType);
+      return domain.allowedEdges.some(e => e.toLowerCase() === target);
     }
 
     // 3. Default Permissive

@@ -23,7 +23,11 @@
         // Some stricter flags (disabled by default)
         "noUnusedLocals": false,
         "noUnusedParameters": false,
-        "noPropertyAccessFromIndexSignature": false
+        "noPropertyAccessFromIndexSignature": false,
+        "paths": {
+            "@quackgraph/graph": ["./packages/quackgraph/packages/quack-graph/src/index.ts"],
+            "@quackgraph/native": ["./packages/quackgraph/packages/native/index.js"]
+        }
     },
     "include": [
         "packages/agent/src/**/*",
