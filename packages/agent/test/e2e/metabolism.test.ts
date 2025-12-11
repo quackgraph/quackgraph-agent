@@ -57,7 +57,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
       // Summary node should exist
       const summaries = await graph.match([]).where({ labels: ["Summary"] }).select();
       expect(summaries.length).toBe(1);
-      expect(summaries[0].properties.content).toBe("User mood was generally positive with a dip on day 3.");
+      expect(summaries[0].content).toBe("User mood was generally positive with a dip on day 3.");
 
       // Check linkage: user_alice -> HAS_SUMMARY -> SummaryNode
       // We need to verify user_alice is connected to the new summary

@@ -51,15 +51,16 @@ describe("E2E: Scribe (Complex Mutations)", () => {
 
   it("Executes Temporal Deletion ('Sold it yesterday')", async () => {
     await runWithTestGraph(async (graph) => {
-      // Setup
+      const THREE_DAYS_AGO = new Date(Date.now() - (3 * 86400000));
+      const YESTERDAY = new Date(Date.now() - 86400000).toISOString();
+      
+      // Setup - create edge that existed 3 days ago
       // @ts-expect-error
       await graph.addNode("me", ["User"], {});
       // @ts-expect-error
       await graph.addNode("bike", ["Item"], {});
       // @ts-expect-error
-      await graph.addEdge("me", "bike", "OWNS", {});
-
-      const YESTERDAY = new Date(Date.now() - 86400000).toISOString();
+      await graph.addEdge("me", "bike", "OWNS", {}, { validFrom: THREE_DAYS_AGO });
 
       // Train Scribe
       llm.addResponse("I sold the bike yesterday", {

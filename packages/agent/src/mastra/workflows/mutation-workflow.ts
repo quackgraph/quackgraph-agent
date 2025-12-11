@@ -153,7 +153,23 @@ const applyMutations = createStep({
                        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`, 
                        [validTo.toISOString(), op.source, op.target, op.type]
                    );
+                   // Update RAM: remove old edge and re-add with validTo
+                   // First, get the edge properties from DB
+                   const existingEdge = await graph.db.query(
+                       `SELECT valid_from, valid_to, heat FROM edges WHERE source = ? AND target = ? AND type = ?`,
+                       [op.source, op.target, op.type]
+                   );
                    graph.native.removeEdge(op.source, op.target, op.type);
+                   if (existingEdge[0]) {
+                       graph.native.addEdge(
+                           op.source, 
+                           op.target, 
+                           op.type, 
+                           new Date(existingEdge[0].valid_from).getTime(),
+                           new Date(existingEdge[0].valid_to).getTime(),
+                           existingEdge[0].heat || 0
+                       );
+                   }
               } else {
                   await graph.deleteEdge(op.source, op.target, op.type);
               }

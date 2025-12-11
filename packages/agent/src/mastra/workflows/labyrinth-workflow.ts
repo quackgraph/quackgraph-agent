@@ -61,9 +61,9 @@ const routeDomain = createStep({
 
     // 1. Setup Configuration in State
     const config = {
-      maxHops: inputData.maxHops,
-      maxCursors: inputData.maxCursors,
-      confidenceThreshold: inputData.confidenceThreshold,
+      maxHops: inputData.maxHops ?? 10,
+      maxCursors: inputData.maxCursors ?? 3,
+      confidenceThreshold: inputData.confidenceThreshold ?? 0.7,
       timeContext: inputData.timeContext
     };
 

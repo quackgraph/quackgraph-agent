@@ -48,15 +48,18 @@ export class SyntheticLLM {
   /**
    * Hijacks the `generate` method of a Mastra agent to return synthetic data.
    * @param agent The agent to mock
-   * @param agentDefault Optional default response specific to this agent
+   * @param agentDefault Optional default response specific to this agent (deprecated - use setDefault instead)
    */
   // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
   mockAgent(agent: Agent<any, any, any>, agentDefault?: object) {
+    // Store a reference to self for closure
+    const self = this;
+    
     // @ts-expect-error - Overwriting the generate method for testing
     // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
     agent.generate = mock(async (prompt: string, _options?: any) => {
       // 1. Check for keyword matches
-      for (const [key, val] of this.responses) {
+      for (const [key, val] of self.responses) {
         if (prompt.includes(key)) {
           // Return a structured response that mimics Mastra's expected output
           return {
@@ -68,11 +71,14 @@ export class SyntheticLLM {
       }
 
       // 2. Fallback
-      // Use agent-specific default if provided, otherwise global default
-      const fallback = agentDefault || this.globalDefault;
+      // Always look up globalDefault dynamically to allow setDefault() to work after mockAgent()
+      const fallback = agentDefault || self.globalDefault;
 
       // Log warning for debugging
-      // console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 50)}...". Using default.`);
+      if (process.env.DEBUG_SYNTHETIC_LLM) {
+        console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 80)}..."`);
+        console.warn(`[SyntheticLLM] Using fallback:`, JSON.stringify(fallback).slice(0, 150));
+      }
 
       return {
         text: JSON.stringify(fallback),
