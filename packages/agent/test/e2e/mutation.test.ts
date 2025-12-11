@@ -5,6 +5,7 @@ import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
 import { mastra } from "../../src/mastra/index";
 import type { QuackGraph } from "@quackgraph/graph";
 import { z } from "zod";
+import { getWorkflowResult } from "../utils/result-helper";
 
 const MutationResultSchema = z.object({
   success: z.boolean(),
@@ -70,9 +71,8 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     
     expect(parsed.data.success).toBe(true);
     expect(parsed.data.summary).toContain("Created Node bob_1");
-
-    // 4. Verify Side Effects (Graph Physics)
-    const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
+    
+    const rawResults = getWorkflowResult(result);
     expect(storedNode.length).toBe(1);
     expect(storedNode[0].properties.name).toBe("Bob");
   });
@@ -114,8 +114,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify
-    // @ts-expect-error
-    const rawResults = result.results || result;
+    const rawResults = getWorkflowResult(result);
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
       throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
@@ -163,8 +162,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
     if (result.status === "failed") throw new Error(`Workflow failed: ${result.error?.message}`);
 
     // 3. Verify
-    // @ts-expect-error
-    const rawResults = result.results || result;
+    const rawResults = getWorkflowResult(result);
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) throw new Error("Invalid Result");
 

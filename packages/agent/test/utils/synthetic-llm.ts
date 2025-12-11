@@ -13,6 +13,7 @@ export class SyntheticLLM {
   private globalDefault: object = { 
     // Scout (Action Union)
     action: "ABORT",
+    alternativeMoves: [], // Satisfy MoveAction optional but good to have empty
     
     // Router
     domain: "global",

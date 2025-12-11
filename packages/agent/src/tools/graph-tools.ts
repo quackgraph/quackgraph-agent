@@ -20,8 +20,10 @@ export class GraphTools {
       ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
     }
     
-    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally
-    return ms;
+    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally.
+    // We default to Date.now() if no time is provided, to ensure "present" physics by default.
+    // This prevents future edges from leaking into implicit queries.
+    return ms ?? Date.now();
   }
 
   /**

@@ -3,10 +3,11 @@
 packages/
   agent/
     src/
-      mastra/
-        workflows/
-          labyrinth-workflow.ts
-      labyrinth.ts
+      agent/
+        chronos.ts
+      tools/
+        graph-tools.ts
+      agent-schemas.ts
     test/
       e2e/
         labyrinth-complex.test.ts
@@ -16,568 +17,267 @@ packages/
         mutation.test.ts
         resilience.test.ts
         time-travel.test.ts
-  quackgraph/
-    packages/
-      quack-graph/
-        src/
-          db.ts
-          schema.ts
+      utils/
+        synthetic-llm.ts
 ```
 
 # Files
 
-## File: packages/quackgraph/packages/quack-graph/src/db.ts
+## File: packages/agent/src/agent-schemas.ts
 ```typescript
-import duckdb from 'duckdb';
-import { tableFromJSON, tableToIPC } from 'apache-arrow';
+import { z } from 'zod';
 
-// Interface for operations that can be performed within a transaction or globally
-export interface DbExecutor {
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params are generic
-  execute(sql: string, params?: any[]): Promise<void>;
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results are generic
-  query(sql: string, params?: any[]): Promise<any[]>;
-}
+export const RouterDecisionSchema = z.object({
+  domain: z.string(),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
 
-export class DuckDBManager implements DbExecutor {
-  private db: duckdb.Database | null = null;
-  private _path: string;
-  private writeListeners: Array<() => Promise<void>> = [];
+export const JudgeDecisionSchema = z.object({
+  isAnswer: z.boolean(),
+  answer: z.string(),
+  confidence: z.number().min(0).max(1),
+});
 
-  constructor(path: string = ':memory:') {
-    this._path = path;
-  }
+// Discriminated Union for Scout Actions
+const MoveAction = z.object({
+  action: z.literal('MOVE'),
+  edgeType: z.string().optional().describe("The edge type to traverse (Single Hop)"),
+  path: z.array(z.string()).optional().describe("Sequence of node IDs to traverse (Multi Hop)"),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+  alternativeMoves: z.array(z.object({
+    edgeType: z.string(),
+    confidence: z.number(),
+    reasoning: z.string()
+  })).optional()
+});
 
-  async init() {
-    if (!this.db) {
-      // Native constructor is synchronous but can take a callback for errors
-      await new Promise<void>((resolve, reject) => {
-        this.db = new duckdb.Database(this._path, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-    }
-  }
+const CheckAction = z.object({
+  action: z.literal('CHECK'),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
 
-  async close() {
-    if (this.db) {
-      const db = this.db;
-      this.db = null;
-      await new Promise<void>((resolve, reject) => {
-        db.close((err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-    }
-  }
+const MatchAction = z.object({
+  action: z.literal('MATCH'),
+  pattern: z.array(z.object({
+    srcVar: z.number(),
+    tgtVar: z.number(),
+    edgeType: z.string(),
+    direction: z.string().optional()
+  })),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
 
-  onWrite(listener: () => Promise<void>) {
-    this.writeListeners.push(listener);
-  }
+const AbortAction = z.object({
+  action: z.literal('ABORT'),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string(),
+});
 
-  private async notifyListeners() {
-    await Promise.all(this.writeListeners.map(l => l()));
-  }
+export const ScoutDecisionSchema = z.discriminatedUnion('action', [
+  MoveAction,
+  CheckAction,
+  MatchAction,
+  AbortAction
+]);
 
-  get path(): string {
-    return this._path;
-  }
+// --- Scribe Agent Schemas (Mutations) ---
 
-  getDb(): duckdb.Database {
-    if (!this.db) {
-      throw new Error('Database not initialized. Call init() first.');
-    }
-    return this.db;
-  }
+const CreateNodeOp = z.object({
+  op: z.literal('CREATE_NODE'),
+  id: z.string().optional().describe('Optional custom ID. If omitted, system generates UUID.'),
+  labels: z.array(z.string()),
+  properties: z.record(z.any()),
+  validFrom: z.string().optional().describe('ISO Date string. If omitted, defaults to NOW.'),
+  validTo: z.string().optional().describe('ISO Date string. If omitted, node is active indefinitely.')
+});
 
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async execute(sql: string, params: any[] = []): Promise<void> {
-    const db = this.getDb();
-    await new Promise<void>((resolve, reject) => {
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB callback
-      db.run(sql, ...params, (err: any) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    await this.notifyListeners();
-  }
+const UpdateNodeOp = z.object({
+  op: z.literal('UPDATE_NODE'),
+  // We use a match query (usually ID) to find the node
+  match: z.object({
+    id: z.string().describe('The distinct ID of the node to update.')
+  }),
+  set: z.record(z.any()),
+  validFrom: z.string().optional().describe('ISO Date string. The effective start time of this update.')
+});
 
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results
-  async query(sql: string, params: any[] = []): Promise<any[]> {
-    const db = this.getDb();
-    return new Promise((resolve, reject) => {
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB callback
-      db.all(sql, ...params, (err: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
-  }
+const DeleteNodeOp = z.object({
+  op: z.literal('DELETE_NODE'),
+  id: z.string(),
+  validTo: z.string().optional().describe('ISO Date string. When the node ceased to exist/be valid.')
+});
 
-  /**
-   * Executes a callback within a transaction using a dedicated connection.
-   * This guarantees that all operations inside the callback share the same ACID scope.
-   */
-  async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
-    const db = this.getDb();
-    // Connect synchronously
-    const conn = db.connect();
-    
-    // Create a transaction-bound executor wrapper around the Connection object
-    const txExecutor: DbExecutor = {
-      // biome-ignore lint/suspicious/noExplicitAny: SQL params
-      execute: (sql: string, params: any[] = []) => {
-        return new Promise((resolve, reject) => {
-          conn.run(sql, ...params, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
-      },
-      // biome-ignore lint/suspicious/noExplicitAny: SQL results
-      query: (sql: string, params: any[] = []) => {
-        return new Promise((resolve, reject) => {
-          conn.all(sql, ...params, (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-          });
-        });
-      }
-    };
+const CreateEdgeOp = z.object({
+  op: z.literal('CREATE_EDGE'),
+  source: z.string().describe('Source Node ID'),
+  target: z.string().describe('Target Node ID'),
+  type: z.string().describe('Edge Type (e.g. KNOWS, BOUGHT)'),
+  properties: z.record(z.any()).optional(),
+  validFrom: z.string().optional().describe('ISO Date string. When this relationship started.'),
+  validTo: z.string().optional().describe('ISO Date string. When this relationship ended (if applicable).')
+});
 
-    try {
-      await txExecutor.execute('BEGIN TRANSACTION');
-      const result = await callback(txExecutor);
-      await txExecutor.execute('COMMIT');
-      await this.notifyListeners(); // Notify AFTER commit
-      return result;
-    } catch (e) {
-      try {
-        await txExecutor.execute('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('Failed to rollback transaction:', rollbackError);
-      }
-      throw e;
-    } finally {
-      // Best effort close - connection is native here
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types
-      if (conn && typeof (conn as any).close === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types
-        (conn as any).close();
-      }
-    }
-  }
+const CloseEdgeOp = z.object({
+  op: z.literal('CLOSE_EDGE'),
+  source: z.string(),
+  target: z.string(),
+  type: z.string(),
+  validTo: z.string().describe('ISO Date string. When this relationship ended.')
+});
 
-  /**
-   * Executes a query and returns the raw Apache Arrow IPC Buffer.
-   * Used for high-speed hydration.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
-    const db = this.getDb();
-    
-    return new Promise((resolve, reject) => {
-      // Helper to merge multiple Arrow batches if necessary
-      const mergeBatches = (batches: Uint8Array[]) => {
-        if (batches.length === 0) return new Uint8Array(0);
-        if (batches.length === 1) return batches[0] ?? new Uint8Array(0);
-        const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const batch of batches) {
-          merged.set(batch, offset);
-          offset += batch.length;
-        }
-        return merged;
-      };
+export const GraphMutationSchema = z.discriminatedUnion('op', [
+  CreateNodeOp,
+  UpdateNodeOp,
+  DeleteNodeOp,
+  CreateEdgeOp,
+  CloseEdgeOp
+]);
 
-      const runFallback = async () => {
-        try {
-          const rows = await this.query(sql, params);
-          if (rows.length === 0) return resolve(new Uint8Array(0));
-          const table = tableFromJSON(rows);
-          const ipc = tableToIPC(table, 'stream');
-          resolve(ipc);
-        } catch (e) {
-          reject(e);
-        }
-      };
-
-      // Try Database.arrowIPCAll (available in newer node-duckdb)
-      // biome-ignore lint/suspicious/noExplicitAny: duckdb native type check
-      if (typeof (db as any).arrowIPCAll === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-        (db as any).arrowIPCAll(sql, ...params, (err: any, result: any) => {
-          if (err) {
-            const msg = String(err.message || '');
-            if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-              return runFallback();
-            }
-            return reject(err);
-          }
-          // Result is usually Array<Uint8Array> (batches)
-          if (Array.isArray(result)) {
-            resolve(mergeBatches(result));
-          } else {
-            resolve(result ?? new Uint8Array(0));
-          }
-        });
-      } else {
-         // Fallback: Create a raw connection if db.arrowIPCAll missing
-         try {
-            const rawConn = db.connect();
-            
-            // biome-ignore lint/suspicious/noExplicitAny: check for method
-            if (rawConn && typeof (rawConn as any).arrowIPCAll === 'function') {
-               // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-               (rawConn as any).arrowIPCAll(sql, ...params, (err: any, result: any) => {
-                  if (err) {
-                    const msg = String(err.message || '');
-                    if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-                      return runFallback();
-                    }
-                    return reject(err);
-                  }
-                  if (Array.isArray(result)) {
-                    resolve(mergeBatches(result));
-                  } else {
-                    resolve(result ?? new Uint8Array(0));
-                  }
-               });
-            } else {
-               runFallback();
-            }
-         } catch(_e) {
-            runFallback();
-         }
-      }
-    });
-  }
-}
+export const ScribeDecisionSchema = z.object({
+  reasoning: z.string().describe('Explanation of why these mutations are required.'),
+  operations: z.array(GraphMutationSchema),
+  requiresClarification: z.string().optional().describe('If the user intent is ambiguous, ask a question instead of mutating.')
+});
 ```
 
-## File: packages/quackgraph/packages/quack-graph/src/schema.ts
+## File: packages/agent/src/agent/chronos.ts
 ```typescript
-import type { DuckDBManager, DbExecutor } from './db';
+import type { QuackGraph } from '@quackgraph/graph';
+import type { CorrelationResult, EvolutionResult, SectorSummary, TimeStepDiff } from '../types';
+import type { GraphTools } from '../tools/graph-tools';
 
-const NODES_TABLE = `
-CREATE TABLE IF NOT EXISTS nodes (
-    row_id UBIGINT PRIMARY KEY, -- Simple auto-increment equivalent logic handled by sequence
-    id TEXT NOT NULL,
-    labels TEXT[],
-    properties JSON,
-    embedding DOUBLE[], -- Vector embedding
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS seq_node_id;
-`;
+export class Chronos {
+  constructor(private graph: QuackGraph, private tools: GraphTools) { }
 
-const EDGES_TABLE = `
-CREATE TABLE IF NOT EXISTS edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    type TEXT NOT NULL,
-    properties JSON,
-    heat UTINYINT DEFAULT 0,
-    valid_from TIMESTAMPTZ DEFAULT (current_timestamp AT TIME ZONE 'UTC'),
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-`;
-
-export interface TemporalOptions {
-  validFrom?: Date;
-  validTo?: Date;
-}
-
-export class SchemaManager {
-  constructor(private db: DuckDBManager) {}
-
-  async ensureSchema() {
-    // Ensure sequence exists before table creation to avoid race conditions.
-    // Note: Breaking NODES_TABLE into separate executions to ensure sequence is ready.
-    await this.db.execute("CREATE SEQUENCE IF NOT EXISTS seq_node_id");
-    
-    await this.db.execute(NODES_TABLE);
-    await this.db.execute(EDGES_TABLE);
-
-    // Sync sequence to avoid collisions if table existed with data but sequence was reset
-    // Force checkpoint to ensure we see committed data for sequence calc
-    try { await this.db.execute("CHECKPOINT"); } catch {}
-
-    // We use a robust query to find the max ID, handling potential NULLs from empty tables
-    const rows = await this.db.query("SELECT COALESCE(MAX(row_id), 0) as max_id FROM nodes");
-    const maxId = rows.length > 0 ? BigInt(rows[0].max_id) : 0n;
-
-    // Recreate sequence starting after maxId.
-    // Only advance sequence if needed (idempotent for persistent stores)
-    if (maxId > 0n) {
-      // Try setval (standard), fallback to ALTER (Postgres/DuckDB variant)
-      try {
-        await this.db.execute(`SELECT setval('seq_node_id', ${maxId + 1n})`);
-      } catch {
-        try {
-          await this.db.execute(`ALTER SEQUENCE seq_node_id RESTART WITH ${maxId + 1n}`);
-        } catch (e) {
-          // Warn but proceed; if sequence is fresh it might be fine
-          console.warn("SchemaManager: Could not sync sequence", e);
-        }
-      }
-    }
-
-    // Performance Indexes
-    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
-    // We use standard indexes for now.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
-    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing record (SCD Type 2)
-      await tx.execute(
-        `UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing edge
-      await tx.execute(
-        `UPDATE edges SET valid_to = ${vf} WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
-        VALUES (?, ?, ?, ?::JSON, ${vf}, ${vt})
-      `, [source, target, type, JSON.stringify(properties)]);
-    });
-  }
-
-  async deleteNode(id: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE nodes SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE edges SET valid_to = (current_timestamp AT TIME ZONE 'UTC') WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-    });
+  /**
+   * Finds events connected to the anchor node that occurred or overlapped
+   * with the specified time window.
+   */
+  async findEventsDuring(
+    anchorNodeId: string,
+    windowStart: Date,
+    windowEnd: Date,
+    constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'
+  ): Promise<string[]> {
+    // Use native directly for granular control
+    return await this.graph.native.traverseInterval(
+      [anchorNodeId],
+      undefined,
+      'out',
+      windowStart.getTime(),
+      windowEnd.getTime(),
+      constraint
+    );
   }
 
   /**
-   * Promotes a JSON property to a native column for faster filtering.
-   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
-   * 
-   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
-   * @param property The property key to promote (e.g., 'age').
-   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
+   * Analyze correlation between an anchor node and a target label within a time window.
+   * Uses DuckDB SQL window functions.
    */
-  async promoteNodeProperty(label: string, property: string, type: string) {
-    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
-    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
-    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
-    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
-    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
-    
-    // 1. Add Column (Idempotent)
-    try {
-      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
-      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
-    } catch (_e) {
-      // Fallback or ignore if column exists
+  async analyzeCorrelation(
+    anchorNodeId: string,
+    targetLabel: string,
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
+    const anchorRows = await this.graph.db.query(
+      "SELECT valid_from FROM nodes WHERE id = ?",
+      [anchorNodeId]
+    );
+
+    if (anchorRows.length === 0) {
+      throw new Error(`Anchor node ${anchorNodeId} not found`);
     }
 
-    // 2. Backfill Data
-    // We use list_contains to only update relevant nodes
     const sql = `
-      UPDATE nodes 
-      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
-      WHERE list_contains(labels, ?)
+      WITH Anchor AS (
+        SELECT valid_from::TIMESTAMPTZ as t_anchor 
+        FROM nodes 
+        WHERE id = ?
+      ),
+      Targets AS (
+        SELECT id, valid_from::TIMESTAMPTZ as t_target 
+        FROM nodes 
+        WHERE list_contains(labels, ?)
+      )
+      SELECT count(*) as count
+      FROM Targets, Anchor
+      WHERE t_target >= (t_anchor - (INTERVAL 1 MINUTE * ${Math.floor(windowMinutes)}))
+        AND t_target <= t_anchor
     `;
-    await this.db.execute(sql, [label]);
+
+    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
+    const count = Number(result[0]?.count || 0);
+
+    return {
+      anchorLabel: 'Unknown',
+      targetLabel,
+      windowSizeMinutes: windowMinutes,
+      correlationScore: count > 0 ? 1.0 : 0.0, // Simplified boolean correlation
+      sampleSize: count,
+      description: `Found ${count} instances of ${targetLabel} in the ${windowMinutes}m window.`
+    };
   }
 
   /**
-   * Declarative Merge (Upsert).
-   * Finds a node by `matchProps` and `label`.
-   * If found: Updates properties with `setProps`.
-   * If not found: Creates new node with `matchProps` + `setProps`.
-   * Returns the node ID.
+   * Evolutionary Diffing: Watches how the topology around a node changes over time.
+   * Returns a diff of edges (Added, Removed, Persisted) between time snapshots.
    */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>, options: TemporalOptions = {}): Promise<string> {
-    // 1. Build Search Query
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp AT TIME ZONE 'UTC')";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
+  async evolutionaryDiff(anchorNodeId: string, timestamps: Date[]): Promise<EvolutionResult> {
+    const sortedTimes = timestamps.sort((a, b) => a.getTime() - b.getTime());
+    const timeline: TimeStepDiff[] = [];
 
-    const matchKeys = Object.keys(matchProps);
-    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
-    // biome-ignore lint/suspicious/noExplicitAny: Params array
-    const params: any[] = [label];
-    
-    for (const key of matchKeys) {
-      if (key === 'id') {
-        conditions.push(`id = ?`);
-        params.push(matchProps[key]);
-      } else {
-        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        params.push(JSON.stringify(matchProps[key]));
+    // Initial state (baseline)
+    let prevSummary: Map<string, number> = new Map();
+
+    for (const ts of sortedTimes) {
+      // Use standard JS timestamps (ms) to be consistent with GraphTools and native bindings
+      const currentSummaryList = await this.tools.getSectorSummary([anchorNodeId], ts.getTime());
+
+      const currentSummary = new Map<string, number>();
+      for (const s of currentSummaryList) {
+        currentSummary.set(s.edgeType, s.count);
       }
+
+      const addedEdges: SectorSummary[] = [];
+      const removedEdges: SectorSummary[] = [];
+      const persistedEdges: SectorSummary[] = [];
+
+      // Compare Current vs Prev
+      for (const [type, count] of currentSummary) {
+        if (prevSummary.has(type)) {
+          persistedEdges.push({ edgeType: type, count });
+        } else {
+          addedEdges.push({ edgeType: type, count });
+        }
+      }
+
+      for (const [type, count] of prevSummary) {
+        if (!currentSummary.has(type)) {
+          removedEdges.push({ edgeType: type, count });
+        }
+      }
+
+      const prevTotal = Array.from(prevSummary.values()).reduce((a, b) => a + b, 0);
+      const currTotal = Array.from(currentSummary.values()).reduce((a, b) => a + b, 0);
+
+      const densityChange = prevTotal === 0 ? (currTotal > 0 ? 100 : 0) : ((currTotal - prevTotal) / prevTotal) * 100;
+
+      timeline.push({
+        timestamp: ts,
+        addedEdges,
+        removedEdges,
+        persistedEdges,
+        densityChange
+      });
+
+      prevSummary = currentSummary;
     }
 
-    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
-
-    return await this.db.transaction(async (tx) => {
-      const rows = await tx.query(searchSql, params);
-      let id: string;
-      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-      let finalProps: Record<string, any>;
-      let finalLabels: string[];
-
-      if (rows.length > 0) {
-        // Update Existing
-        const row = rows[0];
-        id = row.id;
-        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
-        finalProps = { ...currentProps, ...setProps };
-        finalLabels = row.labels; // Preserve existing labels
-
-        // Close old version
-        await tx.execute(`UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`, [id]);
-      } else {
-        // Insert New
-        id = matchProps.id || crypto.randomUUID();
-        finalProps = { ...matchProps, ...setProps };
-        finalLabels = [label];
-      }
-
-      // Insert new version (for both Update and Create cases)
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
-
-      return id;
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNodesBulk(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
-    if (nodes.length === 0) return;
-    
-    // Using Staging Table Strategy for efficient SCD-2
-    const stagingName = `staging_nodes_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (id TEXT, labels TEXT[], properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ)`);
-      
-      // Bulk Insert into Staging
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < nodes.length; i += BATCH_SIZE) {
-        const chunk = nodes.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?::JSON::TEXT[], ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ)`).join(',');
-        // biome-ignore lint/suspicious/noExplicitAny: SQL params
-        const params: any[] = [];
-
-        for (const n of chunk) {
-          const vf = n.validFrom ? n.validFrom.toISOString() : new Date().toISOString(); // Fallback to JS now if undefined (since we can't use SQL function in param)
-          const vt = n.validTo ? n.validTo.toISOString() : null;
-          params.push(n.id, JSON.stringify(n.labels), JSON.stringify(n.properties), vf, vt);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
-
-      // SCD-2 Close Old Rows (Set valid_to = new_valid_from for existing active rows)
-      await tx.execute(`
-        UPDATE nodes 
-        SET valid_to = s.valid_from 
-        FROM ${stagingName} s 
-        WHERE nodes.id = s.id AND nodes.valid_to IS NULL
-      `);
-
-      // Insert New Rows
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to)
-        SELECT nextval('seq_node_id'), id, labels, properties, valid_from, valid_to FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdgesBulk(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
-    if (edges.length === 0) return;
-
-    const stagingName = `staging_edges_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (source TEXT, target TEXT, type TEXT, properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, heat UTINYINT)`);
-
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < edges.length; i += BATCH_SIZE) {
-        const chunk = edges.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?, ?, ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ, ?::UTINYINT)`).join(',');
-        // biome-ignore lint/suspicious/noExplicitAny: SQL params
-        const params: any[] = [];
-
-        for (const e of chunk) {
-          const vf = e.validFrom ? e.validFrom.toISOString() : new Date().toISOString();
-          const vt = e.validTo ? e.validTo.toISOString() : null;
-          const heat = e.heat || 0;
-          params.push(e.source, e.target, e.type, JSON.stringify(e.properties), vf, vt, heat);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
-
-      // Close Old Edges
-      await tx.execute(`
-        UPDATE edges 
-        SET valid_to = s.valid_from
-        FROM ${stagingName} s
-        WHERE edges.source = s.source AND edges.target = s.target AND edges.type = s.type AND edges.valid_to IS NULL
-      `);
-
-      // Insert New Edges
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to, heat)
-        SELECT source, target, type, properties, valid_from, valid_to, heat FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
-    });
+    return { anchorNodeId, timeline };
   }
 }
 ```
@@ -592,6 +292,13 @@ import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { Labyrinth } from "../../src/labyrinth";
 import type { QuackGraph } from "@quackgraph/graph";
+
+// Helper to extract results safely across Mastra versions/mocks
+// biome-ignore lint/suspicious/noExplicitAny: generic
+function getArtifact(res: any) {
+    const payload = res.results || res;
+    return payload?.artifact;
+}
 
 describe("E2E: Labyrinth (Traversal Workflow)", () => {
   let graph: QuackGraph;
@@ -785,6 +492,94 @@ describe("E2E: Labyrinth (Traversal Workflow)", () => {
 });
 ```
 
+## File: packages/agent/test/utils/synthetic-llm.ts
+```typescript
+import { mock } from "bun:test";
+import type { Agent } from "@mastra/core/agent";
+
+/**
+ * A deterministic LLM simulator for testing Mastra Agents.
+ * Allows mapping prompt keywords to specific JSON responses.
+ */
+export class SyntheticLLM {
+  private responses: Map<string, object> = new Map();
+  
+  // A "God Object" default that satisfies Scout, Judge, Router, and Scribe schemas
+  // to prevent Zod validation errors during test fallbacks.
+  private globalDefault: object = { 
+    // Scout (Action Union)
+    action: "ABORT",
+    
+    // Router
+    domain: "global",
+    
+    // Judge
+    isAnswer: false,
+    answer: "Synthetic Fallback",
+    
+    // Scribe
+    operations: [],
+    requiresClarification: undefined,
+
+    // Common
+    confidence: 0.0,
+    reasoning: "No matching synthetic response configured (Fallback)." 
+  };
+
+  /**
+   * Register a response trigger.
+   * @param keyword If the prompt contains this string, the response will be returned.
+   * @param response The JSON object to return.
+   */
+  addResponse(keyword: string, response: object) {
+    this.responses.set(keyword, response);
+  }
+
+  setDefault(response: object) {
+    this.globalDefault = response;
+  }
+
+  /**
+   * Hijacks the `generate` method of a Mastra agent to return synthetic data.
+   * @param agent The agent to mock
+   * @param agentDefault Optional default response specific to this agent
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
+  mockAgent(agent: Agent<any, any, any>, agentDefault?: object) {
+    // @ts-expect-error - Overwriting the generate method for testing
+    // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
+    agent.generate = mock(async (prompt: string, _options?: any) => {
+      // 1. Check for keyword matches
+      for (const [key, val] of this.responses) {
+        if (prompt.includes(key)) {
+          // Return a structured response that mimics Mastra's expected output
+          return {
+            text: JSON.stringify(val),
+            object: val,
+            usage: { promptTokens: 10, completionTokens: 10, totalTokens: 20 },
+          };
+        }
+      }
+
+      // 2. Fallback
+      // Use agent-specific default if provided, otherwise global default
+      const fallback = agentDefault || this.globalDefault;
+
+      // Log warning for debugging
+      // console.warn(`[SyntheticLLM] No match for prompt: "${prompt.slice(0, 50)}...". Using default.`);
+
+      return {
+        text: JSON.stringify(fallback),
+        object: fallback,
+        usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+      };
+    });
+
+    return agent;
+  }
+}
+```
+
 ## File: packages/agent/test/e2e/mutation-complex.test.ts
 ```typescript
 import { describe, it, expect, beforeAll } from "bun:test";
@@ -825,9 +620,12 @@ describe("E2E: Scribe (Complex Mutations)", () => {
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // @ts-expect-error
-      expect(res.results?.success).toBe(false);
+      const payload = res.results || res;
+      
       // @ts-expect-error
-      expect(res.results?.summary).toContain("Did you mean the Ford or the Chevy?");
+      expect(payload?.success).toBe(false);
+      // @ts-expect-error
+      expect(payload?.summary).toContain("Did you mean the Ford or the Chevy?");
 
       // Verify no deletion happened
       const cars = await graph.match([]).where({ labels: ["Car"] }).select();
@@ -939,7 +737,8 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
 
         // The workflow should complete, but find nothing because the thread was killed
         // @ts-expect-error
-        const artifact = res.results?.artifact;
+        const payload = res.results || res;
+        const artifact = payload?.artifact;
         expect(artifact).toBeNull(); // No winner found
 
       } finally {
@@ -985,7 +784,8 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
       });
 
       // @ts-expect-error
-      const artifact = res.results?.artifact;
+      const payload = res.results || res;
+      const artifact = payload?.artifact;
       
       // Should result in null (failure to find) rather than hanging
       expect(artifact).toBeNull();
@@ -1099,7 +899,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // @ts-expect-error
-      const results = res.results as WorkflowResult;
+      const results = (res.results || res) as WorkflowResult;
       const artifact = results?.artifact;
       
       expect(artifact).toBeDefined();
@@ -1200,7 +1000,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
 
       // 4. Verify Success
       // @ts-expect-error
-      const results = res.results as MetabolismResult;
+      const results = (res.results || res) as MetabolismResult;
       expect(results?.success).toBe(true);
 
       // 5. Verify Physics (Graph State)
@@ -1327,7 +1127,8 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       if (res2023.status === "failed") throw new Error(`Workflow failed: ${res2023.error?.message}`);
 
       // @ts-expect-error
-      const art2023 = (res2023.results as LabyrinthResult)?.artifact;
+      const payload2023 = res2023.results || res2023;
+      const art2023 = (payload2023 as LabyrinthResult)?.artifact;
       expect(art2023).toBeDefined();
       expect(art2023?.answer).toContain("Alice");
       expect(art2023?.sources).toContain("alice");
@@ -1347,7 +1148,8 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       if (res2024.status === "failed") throw new Error(`Workflow failed: ${res2024.error?.message}`);
 
       // @ts-expect-error
-      const art2024 = (res2024.results as LabyrinthResult)?.artifact;
+      const payload2024 = res2024.results || res2024;
+      const art2024 = (payload2024 as LabyrinthResult)?.artifact;
       expect(art2024).toBeDefined();
       expect(art2024?.answer).toContain("Bob");
       expect(art2024?.sources).toContain("bob");
@@ -1421,7 +1223,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify Result
     // @ts-expect-error - Mastra generic return type
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
@@ -1475,7 +1277,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) {
       throw new Error(`Invalid workflow result: ${JSON.stringify(rawResults)}`);
@@ -1524,7 +1326,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    const rawResults = result.results;
+    const rawResults = result.results || result;
     const parsed = MutationResultSchema.safeParse(rawResults);
     if (!parsed.success) throw new Error("Invalid Result");
 
@@ -1539,713 +1341,261 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 });
 ```
 
-## File: packages/agent/src/mastra/workflows/labyrinth-workflow.ts
-```typescript
-import { createStep, createWorkflow } from '@mastra/core/workflows';
-import { AISpanType } from '@mastra/core/ai-tracing';
-import { z } from 'zod';
-import { randomUUID } from 'node:crypto';
-import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
-import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
-import { getSchemaRegistry } from '../../governance/schema-registry';
-
-// --- State Schema ---
-// This tracks the "memory" of the entire traversal run
-const LabyrinthStateSchema = z.object({
-  // Traversal State
-  cursors: z.array(z.custom<LabyrinthCursor>()).default([]),
-  deadThreads: z.array(z.custom<ThreadTrace>()).default([]),
-  winner: z.custom<LabyrinthArtifact | null>().optional(),
-  tokensUsed: z.number().default(0),
-
-  // Governance & Config State (Persisted from init)
-  domain: z.string().default('global'),
-  governance: z.any().default({}),
-  config: z.object({
-    maxHops: z.number(),
-    maxCursors: z.number(),
-    confidenceThreshold: z.number(),
-    timeContext: z.any().optional()
-  }).optional()
-});
-
-// --- Input Schemas ---
-
-const WorkflowInputSchema = z.object({
-  goal: z.string(),
-  start: z.union([z.string(), z.object({ query: z.string() })]),
-  domain: z.string().optional(),
-  maxHops: z.number().optional().default(10),
-  maxCursors: z.number().optional().default(3),
-  confidenceThreshold: z.number().optional().default(0.7),
-  timeContext: z.object({
-    asOf: z.number().optional(),
-    windowStart: z.string().optional(),
-    windowEnd: z.string().optional()
-  }).optional()
-});
-
-// --- Step 1: Route Domain ---
-// Determines the "Ghost Earth" layer (Domain) and initializes state configuration
-const routeDomain = createStep({
-  id: 'route-domain',
-  inputSchema: WorkflowInputSchema,
-  outputSchema: z.object({
-    selectedDomain: z.string(),
-    goal: z.string(),
-    start: z.union([z.string(), z.object({ query: z.string() })])
-  }),
-  stateSchema: LabyrinthStateSchema,
-  execute: async ({ inputData, mastra, setState, state }) => {
-    const registry = getSchemaRegistry();
-    const availableDomains = registry.getAllDomains();
-
-    // 1. Setup Configuration in State
-    const config = {
-      maxHops: inputData.maxHops,
-      maxCursors: inputData.maxCursors,
-      confidenceThreshold: inputData.confidenceThreshold,
-      timeContext: inputData.timeContext
-    };
-
-    let selectedDomain = inputData.domain || 'global';
-    let reasoning = 'Default';
-    let rejected: string[] = [];
-
-    // 2. AI Routing (if multiple domains exist and none specified)
-    if (availableDomains.length > 1 && !inputData.domain) {
-      const router = mastra?.getAgent('routerAgent');
-      if (router) {
-        const descriptions = availableDomains.map(d => `- ${d.name}: ${d.description}`).join('\n');
-        const prompt = `Goal: "${inputData.goal}"\nAvailable Domains:\n${descriptions}`;
-        try {
-          const res = await router.generate(prompt, { structuredOutput: { schema: RouterDecisionSchema } });
-          const decision = res.object;
-          if (decision) {
-            const valid = availableDomains.find(d => d.name.toLowerCase() === decision.domain.toLowerCase());
-            if (valid) selectedDomain = decision.domain;
-            reasoning = decision.reasoning;
-            rejected = availableDomains.map(d => d.name).filter(n => n.toLowerCase() !== selectedDomain.toLowerCase());
-          }
-        } catch (e) { console.warn("Router failed", e); }
-      }
-    }
-
-    // 3. Update Global State
-    setState({
-      ...state,
-      domain: selectedDomain,
-      governance: { query: inputData.goal, selected_domain: selectedDomain, rejected_domains: rejected, reasoning },
-      config,
-      // Reset counters
-      tokensUsed: 0,
-      cursors: [],
-      deadThreads: [],
-      winner: undefined
-    });
-
-    // Pass-through essential inputs for the next step in the chain
-    return { selectedDomain, goal: inputData.goal, start: inputData.start };
-  }
-});
-
-// --- Step 2: Initialize Cursors ---
-// Bootstraps the search threads
-const initializeCursors = createStep({
-  id: 'initialize-cursors',
-  inputSchema: z.object({
-    goal: z.string(),
-    start: z.union([z.string(), z.object({ query: z.string() })]),
-    selectedDomain: z.string()
-  }),
-  outputSchema: z.object({
-    cursorCount: z.number(),
-    goal: z.string()
-  }),
-  stateSchema: LabyrinthStateSchema,
-  execute: async ({ inputData, state, setState }) => {
-    let startNodes: string[] = [];
-    if (typeof inputData.start === 'string') {
-      startNodes = [inputData.start];
-    } else {
-      // Future: Vector search fallback logic
-      console.warn("Vector search not implemented in this workflow step yet.");
-      startNodes = [];
-    }
-
-    const initialCursors: LabyrinthCursor[] = startNodes.map(nodeId => ({
-      id: randomUUID().slice(0, 8),
-      currentNodeId: nodeId,
-      path: [nodeId],
-      pathEdges: [undefined],
-      stepHistory: [{
-        step: 0,
-        node_id: nodeId,
-        action: 'START',
-        reasoning: 'Initialized',
-        ghost_view: 'N/A'
-      }],
-      stepCount: 0,
-      confidence: 1.0
-    }));
-
-    setState({
-      ...state,
-      cursors: initialCursors
-    });
-
-    return { cursorCount: initialCursors.length, goal: inputData.goal };
-  }
-});
-
-// --- Step 3: Speculative Traversal ---
-// The Core Loop: Runs agents, branches threads, and updates state until a winner is found or hops exhausted
-const speculativeTraversal = createStep({
-  id: 'speculative-traversal',
-  inputSchema: z.object({
-    goal: z.string(),
-    cursorCount: z.number()
-  }),
-  outputSchema: z.object({
-    foundWinner: z.boolean()
-  }),
-  stateSchema: LabyrinthStateSchema,
-  execute: async ({ inputData, mastra, state, setState, tracingContext }) => {
-    // Agents & Tools
-    const scout = mastra?.getAgent('scoutAgent');
-    const judge = mastra?.getAgent('judgeAgent');
-    if (!scout || !judge) throw new Error("Missing agents");
-
-    const graph = getGraphInstance();
-    const tools = new GraphTools(graph);
-    const registry = getSchemaRegistry();
-
-    // Load from State
-    const { goal } = inputData;
-    const { domain, config } = state;
-    if (!config) throw new Error("Config missing in state");
-
-    // Local mutable copies for the loop (will sync back to state at end)
-    let cursors = [...state.cursors];
-    const deadThreads = [...state.deadThreads];
-    let winner: LabyrinthArtifact | null = state.winner || null;
-    let tokensUsed = state.tokensUsed;
-
-    const asOfTs = config.timeContext?.asOf;
-    const timeDesc = asOfTs ? `As of: ${new Date(asOfTs).toISOString()}` : '';
-
-    // --- The Loop ---
-    // Note: We loop inside the step because Mastra workflows are currently DAGs.
-    // Ideally, this would be a cyclic workflow, but loop-in-step is robust for now.
-    while (cursors.length > 0 && !winner) {
-      const nextCursors: LabyrinthCursor[] = [];
-
-      // Parallel execution of all active cursors
-      const promises = cursors.map(async (cursor) => {
-        if (winner) return; // Short circuit
-
-        // Trace this specific thread's execution for this step
-        const threadSpan = tracingContext?.currentSpan?.createChildSpan({
-          type: AISpanType.GENERIC,
-          name: `thread-exec-${cursor.id}`,
-          metadata: {
-            thread_id: cursor.id,
-            step_count: cursor.stepCount,
-            current_node: cursor.currentNodeId
-          }
-        });
-
-        try {
-          // 1. Max Hops Check
-          if (cursor.stepCount >= config.maxHops) {
-            deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
-            threadSpan?.end({ output: { result: 'max_hops' } });
-            return;
-          }
-
-          // 2. Fetch Node Metadata (LOD 1)
-          const nodeMeta = await graph.match([]).where({ id: cursor.currentNodeId }).select();
-          if (!nodeMeta[0]) {
-            threadSpan?.end({ output: { result: 'node_not_found' } });
-            return;
-          }
-          const currentNode = nodeMeta[0];
-
-          // 3. Sector Scan (LOD 0) - "Satellite View"
-          const allowedEdges = registry.getValidEdges(domain);
-          const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
-          const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
-
-          // 4. Scout Decision
-          const prompt = `
-            Goal: "${goal}"
-            Domain: "${domain}"
-            Node: "${cursor.currentNodeId}" (Labels: ${JSON.stringify(currentNode.labels)})
-            Path: ${JSON.stringify(cursor.path)}
-            Time: "${timeDesc}"
-            Moves:
-            ${summaryList}
-          `;
-
-          // biome-ignore lint/suspicious/noExplicitAny: Agent result is loosely typed
-          let res: any;
-          try {
-            // Note: We inject runtimeContext here to ensure tools called by Scout respect "Time" and "Domain"
-            res = await scout.generate(prompt, {
-              structuredOutput: { schema: ScoutDecisionSchema },
-              memory: {
-                thread: cursor.id,
-                resource: state.governance?.query || 'global-query'
-              },
-              // Pass "Ghost Earth" context to the agent runtime
-              runtimeContext: new Map([['asOf', asOfTs], ['domain', domain]])
-            } as any);
-          } catch (err) {
-             console.warn(`Thread ${cursor.id} agent generation failed:`, err);
-             deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
-             threadSpan?.end({ output: { error: 'agent_failure' } });
-             return;
-          }
-
-          if (res.usage) tokensUsed += (res.usage.promptTokens || 0) + (res.usage.completionTokens || 0);
-
-          const decision = res.object;
-          if (!decision) {
-            threadSpan?.end({ output: { error: 'no_decision' } });
-            return;
-          }
-
-          // Log step
-          cursor.stepHistory.push({
-            step: cursor.stepCount + 1,
-            node_id: cursor.currentNodeId,
-            action: decision.action,
-            reasoning: decision.reasoning,
-            ghost_view: sectorSummary.slice(0, 3).map(s => s.edgeType).join(',')
-          });
-
-          // 5. Handle Actions
-          if (decision.action === 'CHECK') {
-            // Judge Agent: "Street View" (LOD 2 - Full Content)
-            const content = await tools.contentRetrieval([cursor.currentNodeId]);
-            const jRes = await judge.generate(`Goal: ${goal}\nData: ${JSON.stringify(content)}`, {
-              structuredOutput: { schema: JudgeDecisionSchema },
-              memory: {
-                thread: cursor.id,
-                resource: state.governance?.query || 'global-query'
-              }
-            });
-            // @ts-expect-error usage
-            if (jRes.object && jRes.usage) tokensUsed += (jRes.usage.promptTokens || 0) + (jRes.usage.completionTokens || 0);
-
-            if (jRes.object?.isAnswer && jRes.object.confidence >= config.confidenceThreshold) {
-              winner = {
-                answer: jRes.object.answer,
-                confidence: jRes.object.confidence,
-                traceId: randomUUID(),
-                sources: [cursor.currentNodeId],
-                metadata: {
-                  duration_ms: 0,
-                  tokens_used: 0,
-                  governance: state.governance,
-                  execution: [],
-                  judgment: { verdict: jRes.object.answer, confidence: jRes.object.confidence }
-                }
-              };
-              if (winner.metadata) winner.metadata.execution = [{ thread_id: cursor.id, status: 'COMPLETED', steps: cursor.stepHistory }];
-            }
-          } else if (decision.action === 'MOVE') {
-            // Collect all intended moves (Primary + Alternatives)
-            const moves = [];
-
-            // 1. Primary Move
-            if (decision.edgeType || decision.path) {
-              moves.push({
-                edgeType: decision.edgeType,
-                path: decision.path,
-                confidence: decision.confidence,
-                reasoning: decision.reasoning
-              });
-            }
-
-            // 2. Alternative Moves (Semantic Forking)
-            if (decision.alternativeMoves) {
-              for (const alt of decision.alternativeMoves) {
-                moves.push({
-                  edgeType: alt.edgeType,
-                  path: undefined,
-                  confidence: alt.confidence,
-                  reasoning: alt.reasoning
-                });
-              }
-            }
-
-            // Process all moves
-            for (const move of moves) {
-              if (move.path) {
-                // Multi-hop jump (from Navigational Map)
-                const target = move.path.length > 0 ? move.path[move.path.length - 1] : undefined;
-                if (target) {
-                  nextCursors.push({
-                    ...cursor,
-                    id: randomUUID(),
-                    currentNodeId: target,
-                    path: [...cursor.path, ...move.path],
-                    pathEdges: [...cursor.pathEdges, ...new Array(move.path.length).fill(undefined)],
-                    stepCount: cursor.stepCount + move.path.length,
-                    confidence: cursor.confidence * move.confidence
-                  });
-                }
-              } else if (move.edgeType) {
-                // Single-hop move
-                const neighbors = await tools.topologyScan([cursor.currentNodeId], move.edgeType, asOfTs);
-
-                // Speculative Forking: Take top 3 paths per semantic branch to handle topological ambiguity
-                for (const t of neighbors.slice(0, 3)) {
-                  nextCursors.push({
-                    ...cursor,
-                    id: randomUUID(),
-                    currentNodeId: t,
-                    path: [...cursor.path, t],
-                    pathEdges: [...cursor.pathEdges, move.edgeType],
-                    stepCount: cursor.stepCount + 1,
-                    confidence: cursor.confidence * move.confidence
-                  });
-                }
-              }
-
-              threadSpan?.end({ output: { action: 'MOVE', branches: moves.length } });
-            }
-          } else {
-            threadSpan?.end({ output: { action: decision.action } });
-          }
-        } catch (e) {
-          console.warn(`Thread ${cursor.id} failed:`, e);
-          deadThreads.push({ thread_id: cursor.id, status: 'KILLED', steps: cursor.stepHistory });
-          // @ts-expect-error - span.error exists in runtime but typing might be strict
-          threadSpan?.error({ error: e });
-        }
-      });
-
-      await Promise.all(promises);
-      if (winner) break;
-
-      // 6. Pruning (Survival of the Fittest)
-      nextCursors.sort((a, b) => b.confidence - a.confidence);
-      // Kill excess threads
-      for (let i = config.maxCursors; i < nextCursors.length; i++) {
-        const c = nextCursors[i];
-        if (c) deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
-      }
-      cursors = nextCursors.slice(0, config.maxCursors);
-    }
-
-    // Cleanup if no winner
-    if (!winner) {
-      cursors.forEach(c => {
-        deadThreads.push({ thread_id: c.id, status: 'KILLED', steps: c.stepHistory });
-      });
-      cursors = []; // Clear active
-    }
-
-    // 7. Update State
-    setState({
-      ...state,
-      cursors, // Should be empty if no winner, or active if paused? Logic here assumes run-to-completion.
-      deadThreads,
-      winner: winner || undefined,
-      tokensUsed
-    });
-
-    return { foundWinner: !!winner };
-  }
-});
-
-// --- Step 4: Finalize Artifact ---
-// Compiles the final report and metadata
-const finalizeArtifact = createStep({
-  id: 'finalize-artifact',
-  inputSchema: z.object({
-    foundWinner: z.boolean()
-  }),
-  stateSchema: LabyrinthStateSchema,
-  outputSchema: z.object({
-    artifact: z.custom<LabyrinthArtifact | null>()
-  }),
-  execute: async ({ state }) => {
-    if (!state.winner || !state.winner.metadata) return { artifact: null };
-
-    const w = state.winner;
-    if (w.metadata) {
-      w.metadata.tokens_used = state.tokensUsed;
-      // Attach a few dead threads for debugging context
-      w.metadata.execution.push(...state.deadThreads.slice(-5));
-    }
-    return { artifact: w };
-  }
-});
-
-// --- Step 5: Pheromone Reinforcement ---
-// Heats up the edges of the winning path to guide future agents
-const reinforcePath = createStep({
-  id: 'reinforce-path',
-  inputSchema: z.object({
-    artifact: z.custom<LabyrinthArtifact | null>()
-  }),
-  stateSchema: LabyrinthStateSchema,
-  outputSchema: z.object({ success: z.boolean() }),
-  execute: async ({ state, tracingContext }) => {
-    if (!state.winner || !state.winner.sources) return { success: false };
-
-    // Find the cursor that produced the winner
-    const winningCursor = state.cursors.find(c => state.winner?.sources.includes(c.currentNodeId));
-    if (winningCursor) {
-      const graph = getGraphInstance();
-      const tools = new GraphTools(graph);
-
-      const span = tracingContext?.currentSpan?.createChildSpan({
-        type: AISpanType.GENERIC,
-        name: 'apply-pheromones',
-        metadata: { path_length: winningCursor.path.length }
-      });
-
-      try {
-        await tools.reinforcePath(winningCursor.path, winningCursor.pathEdges, state.winner.confidence);
-        span?.end();
-      } catch (e) {
-        // @ts-expect-error - span.error usage
-        span?.error({ error: e });
-        throw e;
-      }
-      return { success: true };
-    }
-
-    return { success: false };
-  }
-});
-
-// --- Workflow Definition ---
-
-export const labyrinthWorkflow = createWorkflow({
-  id: 'labyrinth-workflow',
-  description: 'Agentic Labyrinth Traversal with Parallel Speculation',
-  inputSchema: WorkflowInputSchema,
-  outputSchema: z.object({ artifact: z.custom<LabyrinthArtifact | null>() }),
-  stateSchema: LabyrinthStateSchema,
-})
-  .then(routeDomain)
-  .then(initializeCursors)
-  .then(speculativeTraversal)
-  .then(finalizeArtifact)
-  .then(reinforcePath)
-  .commit();
-```
-
-## File: packages/agent/src/labyrinth.ts
+## File: packages/agent/src/tools/graph-tools.ts
 ```typescript
 import type { QuackGraph } from '@quackgraph/graph';
-import type {
-  AgentConfig,
-  LabyrinthArtifact,
-  CorrelationResult,
-  TimeContext,
-  DomainConfig,
-  MastraAgent
-} from './types';
-import { trace, type Span } from '@opentelemetry/api';
+import type { SectorSummary, LabyrinthContext } from '../types';
+// import type { JsPatternEdge } from '@quackgraph/native';
 
-// Core Dependencies
-import { setGraphInstance } from './lib/graph-instance';
-import { mastra } from './mastra';
-import { Chronos } from './agent/chronos';
-import { GraphTools } from './tools/graph-tools';
-import { SchemaRegistry } from './governance/schema-registry';
+export interface JsPatternEdge {
+  srcVar: number;
+  tgtVar: number;
+  edgeType: string;
+  direction: string;
+}
 
-/**
- * The QuackGraph Agent Facade.
- * 
- * A Native Mastra implementation.
- * This class acts as a thin client that orchestrates the `labyrinth-workflow` 
- * and injects the RuntimeContext (Time Travel & Governance).
- */
-export class Labyrinth {
-  public chronos: Chronos;
-  public tools: GraphTools;
-  public registry: SchemaRegistry;
-  
-  // Simulating persistence layer for traces (In production, use Redis/DB via Mastra Storage)
-  private traceCache = new Map<string, LabyrinthArtifact>();
-  private logger = mastra.getLogger();
-  private tracer = trace.getTracer('quackgraph-agent');
+export class GraphTools {
+  constructor(private graph: QuackGraph) { }
 
-  constructor(
-    graph: QuackGraph,
-    _agents: {
-      scout: MastraAgent;
-      judge: MastraAgent;
-      router: MastraAgent;
-    },
-    private config: AgentConfig
-  ) {
-    // Bridge Pattern: Inject the graph instance into the global scope
-    // so Mastra Tools can access it without passing it through every step.
-    setGraphInstance(graph);
-
-    // Utilities
-    this.tools = new GraphTools(graph);
-    this.chronos = new Chronos(graph, this.tools);
-    this.registry = new SchemaRegistry();
+  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
+    let ms: number | undefined;
+    if (typeof contextOrAsOf === 'number') {
+      ms = contextOrAsOf;
+    } else if (contextOrAsOf?.asOf) {
+      ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
+    }
+    
+    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally
+    return ms;
   }
 
   /**
-   * Registers a semantic domain (LOD 0 governance).
-   * Direct proxy to the singleton registry used by tools.
+   * LOD 0: Sector Scan / Satellite View
+   * Returns a summary of available moves from the current nodes.
    */
-  registerDomain(config: DomainConfig) {
-    this.registry.register(config);
-  }
+  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+    if (currentNodes.length === 0) return [];
 
-  /**
-   * Main Entry Point: Finds a path through the Labyrinth.
-   * 
-   * @param start - Starting Node ID or natural language query
-   * @param goal - The question to answer
-   * @param timeContext - "Time Travel" parameters (asOf, window)
-   */
-  async findPath(
-    start: string | { query: string },
-    goal: string,
-    timeContext?: TimeContext
-  ): Promise<LabyrinthArtifact | null> {
-    return this.tracer.startActiveSpan('labyrinth.findPath', async (span: Span) => {
-        try {
-            const workflow = mastra.getWorkflow('labyrinthWorkflow');
-            if (!workflow) throw new Error("Labyrinth Workflow not registered in Mastra.");
+    const asOf = this.resolveAsOf(contextOrAsOf);
 
-            // 1. Prepare Input Data & Configuration
-            const inputData = {
-                goal,
-                start,
-                // Domain is left undefined here; the 'route-domain' step will decide it
-                // unless we wanted to force it via config.
-                maxHops: this.config.maxHops,
-                maxCursors: this.config.maxCursors,
-                confidenceThreshold: this.config.confidenceThreshold,
-                timeContext: timeContext ? {
-                    asOf: timeContext.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext.asOf,
-                    windowStart: timeContext.windowStart?.toISOString(),
-                    windowEnd: timeContext.windowEnd?.toISOString()
-                } : undefined
-            };
+    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
+    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
 
-            // 2. Execute Workflow
-            const run = await workflow.createRunAsync();
-            
-            // The workflow steps are responsible for extracting timeContext from input
-            // and passing it to agents via runtimeContext injection in the 'speculative-traversal' step.
-            const result = await run.start({ inputData });
-            
-            // 3. Extract Result
-            // @ts-expect-error - Result payload typing
-            const artifact = result.results?.artifact as LabyrinthArtifact | null;
-            if (!artifact && result.status === 'failed') {
-                 throw new Error(`Workflow failed: ${result.error?.message || 'Unknown error'}`);
-            }
-
-            if (artifact) {
-              // Sync traceId with the actual Run ID for retrievability
-              // @ts-expect-error - runId access
-              const runId = run.runId || run.id;
-              artifact.traceId = runId;
-
-              span.setAttribute('labyrinth.confidence', artifact.confidence);
-              span.setAttribute('labyrinth.traceId', artifact.traceId);
-
-              // Cache the full artifact (with heavy execution trace)
-              this.traceCache.set(runId, JSON.parse(JSON.stringify(artifact)));
-
-              // Return "Executive Briefing" version (strip execution logs)
-              if (artifact.metadata) {
-                 artifact.metadata.execution = []; 
-              }
-            }
-
-            return artifact;
-
-        } catch (e) {
-            this.logger.error("Labyrinth traversal failed", { error: e });
-            span.recordException(e as Error);
-            throw e;
-        } finally {
-            span.end();
-        }
-    });
-  }
-
-  /**
-   * Retrieve the full reasoning trace for a specific run.
-   * Useful for auditing or "Show your work" features.
-   */
-  async getTrace(traceId: string): Promise<LabyrinthArtifact | undefined> {
-    // 1. Try Memory Cache
-    if (this.traceCache.has(traceId)) {
-        return this.traceCache.get(traceId);
+    // 2. Filter if explicit allowed list provided (double check)
+    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
+    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
+      return results.filter((r: SectorSummary) => allowedEdgeTypes.includes(r.edgeType)).sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
     }
 
-    // 2. Future: Try Mastra Storage (DB)
-    // const run = await mastra.getRun(traceId);
-    // return run?.result?.artifact;
-
-    return undefined;
+    // 3. Sort by count (descending)
+    return results.sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
   }
 
   /**
-   * Direct access to Chronos for temporal analytics.
-   * Useful for "Life Coach" dashboards that need raw stats without full agent traversal.
+   * LOD 1.5: Ghost Map / Navigational Map
+   * Generates an ASCII tree of the topology up to a certain depth.
+   * Uses geometric pruning and token budgeting to keep the map readable.
    */
-  async analyzeCorrelation(
-    anchorNodeId: string,
-    targetLabel: string,
-    windowMinutes: number
-  ): Promise<CorrelationResult> {
-    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
+  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
+    const maxDepth = Math.min(depth, 3); // Hard cap at depth 3 for safety
+    const treeLines: string[] = [`[ROOT] ${rootId}`];
+    let isTruncated = false;
+    let totalLines = 0;
+    const MAX_LINES = 40; // Prevent context window explosion
+
+    // Helper for recursion
+    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
+      if (currentDepth >= maxDepth) return;
+      if (totalLines >= MAX_LINES) {
+        if (!isTruncated) {
+          treeLines.push(`${prefix}... (truncated)`);
+          isTruncated = true;
+        }
+        return;
+      }
+
+      // Geometric pruning: 8 -> 4 -> 2
+      const branchLimit = Math.max(2, Math.floor(8 / 2 ** currentDepth));
+      let branchesCount = 0;
+
+      // 1. Get stats to find "hot" edges
+      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
+
+      // Sort by Heat first, then Count to prioritize "Hot" paths in the view
+      stats.sort((a, b) => (b.avgHeat || 0) - (a.avgHeat || 0) || b.count - a.count);
+
+      for (const stat of stats) {
+        if (branchesCount >= branchLimit) break;
+        if (totalLines >= MAX_LINES) break;
+
+        const edgeType = stat.edgeType;
+        const heatVal = stat.avgHeat || 0;
+        let heatMarker = '';
+        if (heatVal > 80) heatMarker = ' 🔥🔥🔥';
+        else if (heatVal > 50) heatMarker = ' 🔥';
+        else if (heatVal > 20) heatMarker = ' ♨️';
+
+        // 2. Traverse to get samples (fetch just enough to display)
+        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
+
+        // Pruning neighbor display based on depth
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1);
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+
+        for (let i = 0; i < displayNeighbors.length; i++) {
+          if (branchesCount >= branchLimit) break;
+          if (totalLines >= MAX_LINES) { isTruncated = true; break; }
+
+          const neighborId = displayNeighbors[i];
+          if (!neighborId) continue;
+
+          // Check if this is the last item to choose the connector symbol
+          const isLast = (i === displayNeighbors.length - 1) && (stats.indexOf(stat) === stats.length - 1 || branchesCount === branchLimit - 1);
+          const connector = isLast ? '└──' : '├──';
+
+          treeLines.push(`${prefix}${connector} [${edgeType}]──> (${neighborId})${heatMarker}`);
+          totalLines++;
+
+          const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+          await buildTree(neighborId, currentDepth + 1, nextPrefix);
+          branchesCount++;
+        }
+      }
+    };
+
+    await buildTree(rootId, 0, ' ');
+
+    return {
+      map: treeLines.join('\n'),
+      truncated: isTruncated
+    };
   }
 
   /**
-   * Execute a Natural Language Mutation.
-   * Uses the Scribe Agent to parse intent and apply graph operations.
+   * LOD 1: Topology Scan
+   * Returns the IDs of neighbors reachable via a specific edge type.
    */
-  async mutate(query: string, timeContext?: TimeContext): Promise<{ success: boolean; summary: string }> {
-    return this.tracer.startActiveSpan('labyrinth.mutate', async (span: Span) => {
-      try {
-        const workflow = mastra.getWorkflow('mutationWorkflow');
-        if (!workflow) throw new Error("Mutation Workflow not registered.");
+  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
+  }
 
-        const inputData = {
-          query,
-          asOf: timeContext?.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext?.asOf,
-          userId: 'Me' // Default context
+  /**
+   * LOD 1: Temporal Interval Scan
+   * Finds neighbors connected via edges overlapping/contained in the window.
+   */
+  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
+   */
+  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    // We use the native traverseInterval which accepts edgeType
+    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1.5: Pattern Matching (Structural Inference)
+   * Finds subgraphs matching a specific shape.
+   */
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
+    if (startNodes.length === 0) return [];
+    const nativePattern = pattern.map(p => ({
+      srcVar: p.srcVar || 0,
+      tgtVar: p.tgtVar || 0,
+      edgeType: p.edgeType || '',
+      direction: p.direction || 'out'
+    }));
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
+  }
+
+  /**
+   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
+   * If nodes are part of a document chain (NEXT/PREV), fetch context.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
+  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
+    if (nodeIds.length === 0) return [];
+
+    // 1. Fetch Primary Content
+    const primaryNodes = await this.graph.match([])
+      .where({ id: nodeIds })
+      .select();
+
+    // 2. Virtual Spine Expansion
+    // Check for "NEXT" or "PREV" connections to provide document flow context.
+    const spineContextIds = new Set<string>();
+
+    for (const id of nodeIds) {
+      // Look ahead
+      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
+      next.forEach((nid: string) => { spineContextIds.add(nid); });
+
+      // Look back
+      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
+      incomingNext.forEach((nid: string) => { spineContextIds.add(nid); });
+
+      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
+      explicitPrev.forEach((nid: string) => { spineContextIds.add(nid); });
+    }
+
+    // Remove duplicates (original nodes)
+    nodeIds.forEach(id => { spineContextIds.delete(id); });
+
+    if (spineContextIds.size > 0) {
+      const contextNodes = await this.graph.match([])
+        .where({ id: Array.from(spineContextIds) })
+        .select();
+
+      // Merge and Annotate
+      // Create a map for fast lookup
+      const contextMap = new Map(contextNodes.map(n => [n.id, n]));
+
+      return primaryNodes.map(node => {
+        // Find connected context nodes?
+        // For simplicity, we just attach all found spine context, 
+        // ideally we would link specific context to specific nodes but that requires tracking edges again.
+        // We will just return the primary node and let the LLM see the expanded content if requested separately
+        // or attach generic context.
+        return {
+          ...node,
+          _isPrimary: true,
+          _context: Array.from(contextMap.values()).map(c => ({ id: c.id, ...c.properties }))
         };
+      });
+    }
 
-        const run = await workflow.createRunAsync();
-        const result = await run.start({ inputData });
-        if (result.status === 'failed') {
-          throw new Error(`Mutation failed: ${result.error.message}`);
+    return primaryNodes;
+  }
+
+  /**
+   * Pheromones: Reinforce a successful path by increasing edge heat.
+   */
+  async reinforcePath(nodes: string[], edges: (string | undefined)[], qualityScore: number = 1.0) {
+    if (nodes.length < 2) return;
+
+    // Base increment is 50 for a perfect score. 
+    const heatDelta = Math.floor(qualityScore * 50);
+
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const source = nodes[i];
+      const target = nodes[i + 1];
+      const edge = edges[i + 1]; // edges[0] is undefined (start)
+
+      if (source && target && edge) {
+        // Call native update
+        try {
+          await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
+        } catch (e) {
+          console.warn(`[Pheromones] Failed to update heat for ${source}->${target}:`, e);
         }
-        if (result.status !== 'success') {
-          throw new Error(`Mutation failed with status: ${result.status}`);
-        }
-        return result.result as { success: boolean; summary: string };
-          } catch (e) {
-            this.logger.error("Mutation failed", { error: e });
-            span.recordException(e as Error);
-            return { success: false, summary: `Mutation failed: ${(e as Error).message}` };
-          } finally {
-            span.end();
-          }
-    });
+      }
+    }
   }
 }
 ```

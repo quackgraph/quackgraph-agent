@@ -4,6 +4,7 @@ import { SyntheticLLM } from "../utils/synthetic-llm";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { mastra } from "../../src/mastra/index";
 import { generateTimeSeries } from "../utils/generators";
+import { getWorkflowResult } from "../utils/result-helper";
 
 interface MetabolismResult {
   success: boolean;
@@ -45,8 +46,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
       // 4. Verify Success
-      // @ts-expect-error
-      const results = (res.results || res) as MetabolismResult;
+      const results = getWorkflowResult(res) as MetabolismResult;
       expect(results?.success).toBe(true);
 
       // 5. Verify Physics (Graph State)

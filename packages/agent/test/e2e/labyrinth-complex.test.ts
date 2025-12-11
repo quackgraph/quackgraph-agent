@@ -5,6 +5,7 @@ import { scoutAgent } from "../../src/mastra/agents/scout-agent";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { mastra } from "../../src/mastra/index";
+import { getWorkflowResult } from "../utils/result-helper";
 
 interface WorkflowResult {
   artifact: {
@@ -100,8 +101,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
       // @ts-expect-error
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
 
-      // @ts-expect-error
-      const results = (res.results || res) as WorkflowResult;
+      const results = getWorkflowResult(res) as WorkflowResult;
       const artifact = results?.artifact;
       
       expect(artifact).toBeDefined();

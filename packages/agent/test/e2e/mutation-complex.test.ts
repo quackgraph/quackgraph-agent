@@ -3,6 +3,7 @@ import { runWithTestGraph } from "../utils/test-graph";
 import { SyntheticLLM } from "../utils/synthetic-llm";
 import { scribeAgent } from "../../src/mastra/agents/scribe-agent";
 import { mastra } from "../../src/mastra/index";
+import { getWorkflowResult } from "../utils/result-helper";
 
 describe("E2E: Scribe (Complex Mutations)", () => {
   let llm: SyntheticLLM;
@@ -34,10 +35,9 @@ describe("E2E: Scribe (Complex Mutations)", () => {
 
       // @ts-expect-error
       if (res.status === "failed") throw new Error(`Workflow failed: ${res.error?.message}`);
-
-      // @ts-expect-error
-      const payload = res.results || res;
       
+      const payload = getWorkflowResult(res);
+
       // @ts-expect-error
       expect(payload?.success).toBe(false);
       // @ts-expect-error

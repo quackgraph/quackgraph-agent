@@ -5,6 +5,7 @@ import { scoutAgent } from "../../src/mastra/agents/scout-agent";
 import { judgeAgent } from "../../src/mastra/agents/judge-agent";
 import { routerAgent } from "../../src/mastra/agents/router-agent";
 import { mastra } from "../../src/mastra/index";
+import { getWorkflowResult } from "../utils/result-helper";
 
 describe("E2E: Chaos Monkey (Resilience)", () => {
   let llm: SyntheticLLM;
@@ -50,8 +51,7 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
         });
 
         // The workflow should complete, but find nothing because the thread was killed
-        // @ts-expect-error
-        const payload = res.results || res;
+        const payload = getWorkflowResult(res);
         const artifact = payload?.artifact;
         expect(artifact).toBeNull(); // No winner found
 
@@ -97,8 +97,7 @@ describe("E2E: Chaos Monkey (Resilience)", () => {
         }
       });
 
-      // @ts-expect-error
-      const payload = res.results || res;
+      const payload = getWorkflowResult(res);
       const artifact = payload?.artifact;
       
       // Should result in null (failure to find) rather than hanging
