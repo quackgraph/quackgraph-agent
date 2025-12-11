@@ -38,7 +38,7 @@ describe("E2E: Metabolism (The Dreaming Graph)", () => {
 
       // 4. Verify Success
       // @ts-expect-error
-      expect(res.results.success).toBe(true);
+      expect(res.results?.success).toBe(true);
 
       // 5. Verify Physics (Graph State)
       // Old nodes should be gone (or disconnected/deleted)

@@ -85,7 +85,7 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       });
 
       // @ts-expect-error
-      const art2023 = res2023.results.artifact;
+      const art2023 = res2023.results?.artifact;
       expect(art2023).toBeDefined();
       expect(art2023.answer).toContain("Alice");
       expect(art2023.sources).toContain("alice");
@@ -102,7 +102,7 @@ describe("E2E: The Time Traveler (Labyrinth Workflow)", () => {
       });
 
       // @ts-expect-error
-      const art2024 = res2024.results.artifact;
+      const art2024 = res2024.results?.artifact;
       expect(art2024).toBeDefined();
       expect(art2024.answer).toContain("Bob");
       expect(art2024.sources).toContain("bob");

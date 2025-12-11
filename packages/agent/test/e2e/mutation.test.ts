@@ -51,9 +51,9 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify Result
     // @ts-expect-error
-    expect(result.results.success).toBe(true);
+    expect(result.results?.success).toBe(true);
     // @ts-expect-error
-    expect(result.results.summary).toContain("Created Node bob_1");
+    expect(result.results?.summary).toContain("Created Node bob_1");
 
     // 4. Verify Side Effects (Graph Physics)
     const storedNode = await graph.match([]).where({ id: "bob_1" }).select();
@@ -96,7 +96,7 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    expect(result.results.success).toBe(true);
+    expect(result.results?.success).toBe(true);
 
     // 4. Verify Side Effects (Time Travel)
     // The edge should still exist physically but have a valid_to set
@@ -136,11 +136,11 @@ describe("E2E: Mutation Workflow (The Scribe)", () => {
 
     // 3. Verify
     // @ts-expect-error
-    expect(result.results.success).toBe(false);
+    expect(result.results?.success).toBe(false);
     // @ts-expect-error
-    expect(result.results.summary).toContain("Clarification needed");
+    expect(result.results?.summary).toContain("Clarification needed");
     // @ts-expect-error
-    expect(result.results.summary).toContain("The Ford or the Chevy");
+    expect(result.results?.summary).toContain("The Ford or the Chevy");
 
     // 4. Verify Safety (No deletes happened)
     const cars = await graph.match([]).where({ labels: ["Car"] }).select();

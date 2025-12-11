@@ -23,21 +23,13 @@
     }
   },
   "include": 
-    [
-  "packages/agent/src/agent/chronos.ts",
-  "packages/agent/src/mastra/index.ts",
-  "packages/agent/src/mastra/workflows/labyrinth-workflow.ts",
-  "packages/agent/src/mastra/workflows/metabolism-workflow.ts",
-  "packages/agent/src/mastra/workflows/mutation-workflow.ts",
-  "packages/agent/src/tools/graph-tools.ts",
-  "packages/agent/test/e2e/labyrinth-complex.test.ts",
-  "packages/agent/test/e2e/labyrinth.test.ts",
-  "packages/agent/test/e2e/metabolism.test.ts",
-  "packages/agent/test/e2e/mutation-complex.test.ts",
-  "packages/agent/test/e2e/mutation.test.ts",
-  "packages/agent/test/e2e/resilience.test.ts",
-  "packages/agent/test/e2e/time-travel.test.ts",
-  "packages/agent/test/integration/chronos.test.ts"
+ [
+  "package.json",
+        "packages/quackgraph/tsup.config.ts",
+  "packages/quackgraph/packages/quack-graph/package.json",
+  "packages/quackgraph/packages/quack-graph/src/db.ts",
+  "packages/quackgraph/packages/quack-graph/src/graph.ts",
+  "packages/quackgraph/packages/quack-graph/src/schema.ts"
 ],
   "ignore": {
     "useGitignore": true,

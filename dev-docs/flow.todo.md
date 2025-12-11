@@ -1,3 +1,6 @@
+well db - memory sync should happen natively in core package/quackgraph without additional api to use by external, auto hydrate? on every direct duckdb change? without requiring anyone to call reload/hydrate, so should not be concern for packages/agent and everyone can modify db directly without any problem
+
+===
 
 is the external agent can see temporal evolution of the overall graph nodes edges relationship network?
 

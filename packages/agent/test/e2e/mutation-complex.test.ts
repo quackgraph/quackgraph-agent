@@ -33,9 +33,9 @@ describe("E2E: Scribe (Complex Mutations)", () => {
       });
 
       // @ts-expect-error
-      expect(res.results.success).toBe(false);
+      expect(res.results?.success).toBe(false);
       // @ts-expect-error
-      expect(res.results.summary).toContain("Did you mean the Ford or the Chevy?");
+      expect(res.results?.summary).toContain("Did you mean the Ford or the Chevy?");
 
       // Verify no deletion happened
       const cars = await graph.match([]).where({ labels: ["Car"] }).select();

@@ -27,7 +27,10 @@ describe("Integration: Chronos (Temporal Physics)", () => {
 
       // Target A: Inside (12:15)
       // @ts-expect-error
-      await graph.addNode("note_inside", ["Note"], {}, new Date(BASE_TIME + 15 * 60 * 1000)); // 12:15
+      await graph.addNode("note_inside", ["Note"], {}, {
+        validFrom: new Date(BASE_TIME + 15 * 60 * 1000), // 12:15
+        validTo: new Date(BASE_TIME + 45 * 60 * 1000)    // 12:45 (Must end before window end for strictly DURING)
+      });
       
       // Target B: Before (11:00)
       // @ts-expect-error

@@ -87,7 +87,7 @@ describe("E2E: Labyrinth (Advanced)", () => {
       });
 
       // @ts-expect-error
-      const artifact = res.results.artifact;
+      const artifact = res.results?.artifact;
       
       expect(artifact).toBeDefined();
       expect(artifact.sources).toContain("goal");
