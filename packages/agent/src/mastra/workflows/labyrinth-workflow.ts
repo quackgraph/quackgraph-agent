@@ -258,6 +258,7 @@ const speculativeTraversal = createStep({
               },
               // Pass "Ghost Earth" context to the agent runtime
               runtimeContext: new Map([['asOf', asOfTs], ['domain', domain]])
+            // biome-ignore lint/suspicious/noExplicitAny: RuntimeContext type compatibility
             } as any);
           } catch (err) {
              console.warn(`Thread ${cursor.id} agent generation failed:`, err);

@@ -1,5 +1,5 @@
 
-should be now raw duckdb query in quackgraph-agent , should only in quackgraph core
+should be no raw duckdb query in quackgraph-agent , should only in quackgraph core
 
 ===
 

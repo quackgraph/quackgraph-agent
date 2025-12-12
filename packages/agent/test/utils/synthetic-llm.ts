@@ -52,14 +52,11 @@ export class SyntheticLLM {
    */
   // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
   mockAgent(agent: Agent<any, any, any>, agentDefault?: object) {
-    // Store a reference to self for closure
-    const self = this;
-    
     // @ts-expect-error - Overwriting the generate method for testing
     // biome-ignore lint/suspicious/noExplicitAny: Mocking internal agent types
     agent.generate = mock(async (prompt: string, _options?: any) => {
       // 1. Check for keyword matches
-      for (const [key, val] of self.responses) {
+      for (const [key, val] of this.responses) {
         if (prompt.includes(key)) {
           // Return a structured response that mimics Mastra's expected output
           return {
@@ -72,7 +69,7 @@ export class SyntheticLLM {
 
       // 2. Fallback
       // Always look up globalDefault dynamically to allow setDefault() to work after mockAgent()
-      const fallback = agentDefault || self.globalDefault;
+      const fallback = agentDefault || this.globalDefault;
 
       // Log warning for debugging
       if (process.env.DEBUG_SYNTHETIC_LLM) {

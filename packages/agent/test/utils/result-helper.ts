@@ -1,4 +1,12 @@
-export function getWorkflowResult(res: any): any {
+interface WorkflowResult {
+  status: 'success' | 'failed' | 'suspended';
+  error?: { message: string };
+  results?: unknown;
+  result?: unknown;
+  payload?: unknown;
+}
+
+export function getWorkflowResult(res: WorkflowResult): unknown {
   if (res.status === 'failed') {
     throw new Error(`Workflow failed: ${res.error?.message || 'Unknown error'}`);
   }

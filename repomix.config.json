@@ -23,13 +23,8 @@
     }
   },
   "include": 
-[
-  "packages/quackgraph/packages/native/src/lib.rs",
-  "packages/quackgraph/packages/quack-graph/src/graph.ts",
-  "packages/quackgraph/test/integration/concurrency.test.ts",
-  "packages/quackgraph/test/integration/temporal.test.ts"
-]
 
+[]
 ,
   "ignore": {
     "useGitignore": true,
@@ -48,8 +43,8 @@
 "packages/quackgraph/packages/quack-graph/dist",
 //      "packages/quackgraph/test/",
       "packages/quackgraph/test-docs/",
-      "packages/quackgraph/test/e2e/",
-      "packages/quackgraph/src",
+  //    "packages/quackgraph/test/e2e/",
+  //    "packages/quackgraph/src",
             "packages/quackgraph/RFC.README.md",
             "packages/quackgraph/README.md"
     ]

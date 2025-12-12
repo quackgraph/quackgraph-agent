@@ -188,11 +188,9 @@ export class Labyrinth {
         if (result.status === 'failed') {
           throw new Error(`Mutation failed: ${result.error.message}`);
         }
-        // Some runtimes return 'completed' or 'success'
-        if (result.status !== 'success' && result.status !== 'completed') {
+        if (result.status !== 'success') {
           throw new Error(`Mutation possibly failed with status: ${result.status}`);
         }
-        // @ts-expect-error - Result payload typing
         const payload = result.result || result;
         return payload as { success: boolean; summary: string };
           } catch (e) {
