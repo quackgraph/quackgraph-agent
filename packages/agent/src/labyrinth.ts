@@ -12,8 +12,7 @@ import { trace, type Span } from '@opentelemetry/api';
 // Core Dependencies
 import { setGraphInstance } from './lib/graph-instance';
 import { mastra } from './mastra';
-import { Chronos } from './agent/chronos';
-import { GraphTools } from './tools/graph-tools';
+import { Chronos, GraphTools } from '@quackgraph/graph';
 import { SchemaRegistry } from './governance/schema-registry';
 
 /**

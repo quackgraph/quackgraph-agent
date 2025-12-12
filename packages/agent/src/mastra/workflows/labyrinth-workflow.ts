@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type { LabyrinthCursor, LabyrinthArtifact, ThreadTrace } from '../../types';
 import { RouterDecisionSchema, ScoutDecisionSchema, JudgeDecisionSchema } from '../../agent-schemas';
 import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
+import { GraphTools } from '@quackgraph/graph';
 import { getSchemaRegistry } from '../../governance/schema-registry';
 
 // --- State Schema ---
@@ -232,7 +232,7 @@ const speculativeTraversal = createStep({
 
           // 3. Sector Scan (LOD 0) - "Satellite View"
           const allowedEdges = registry.getValidEdges(domain);
-          const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges);
+          const sectorSummary = await tools.getSectorSummary([cursor.currentNodeId], asOfTs, allowedEdges) || [];
           const summaryList = sectorSummary.map(s => `- ${s.edgeType}: ${s.count}`).join('\n');
 
           // 4. Scout Decision

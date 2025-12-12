@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { GraphTools } from "../../src/tools/graph-tools";
+import { GraphTools } from "@quackgraph/graph";
 import { createTestGraph } from "../utils/test-graph";
 import type { QuackGraph } from "@quackgraph/graph";
 

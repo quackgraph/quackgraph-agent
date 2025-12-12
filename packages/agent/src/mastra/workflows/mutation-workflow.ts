@@ -120,7 +120,7 @@ const applyMutations = createStep({
             let label = 'Entity'; // Fallback
             const labels = await graph.getNodeLabels(op.match.id);
             if (labels.length > 0) {
-                label = labels[0];
+                label = labels[0] as string;
             }
 
             await graph.mergeNode(

@@ -1,9 +1,8 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { getGraphInstance } from '../../lib/graph-instance';
-import { GraphTools } from '../../tools/graph-tools';
 import { getSchemaRegistry } from '../../governance/schema-registry';
-import { Chronos } from '../../agent/chronos';
+import { GraphTools, Chronos } from '@quackgraph/graph';
 
 // Helper to reliably extract context from Mastra's RuntimeContext
 // biome-ignore lint/suspicious/noExplicitAny: RuntimeContext access
@@ -85,7 +84,7 @@ export const topologyScanTool = createTool({
       let truncated = false;
       for (const id of context.nodeIds) {
         // Note: NavigationalMap respects asOf
-        const res = await tools.getNavigationalMap(id, context.depth, { asOf });
+        const res = await tools.getNavigationalMap(id, context.depth, asOf);
         maps.push(res.map);
         if (res.truncated) truncated = true;
       }
@@ -96,14 +95,14 @@ export const topologyScanTool = createTool({
     if (!context.edgeType) {
         const maps = [];
         for (const id of context.nodeIds) {
-            const res = await tools.getNavigationalMap(id, 1, { asOf });
+            const res = await tools.getNavigationalMap(id, 1, asOf);
             maps.push(res.map);
         }
         return { map: maps.join('\n\n') };
     }
 
     // 3. Standard Traversal
-    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, { asOf });
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, asOf);
     return { neighborIds };
   },
 });

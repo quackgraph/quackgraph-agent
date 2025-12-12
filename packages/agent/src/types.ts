@@ -9,6 +9,7 @@ import type { Agent, ToolsInput } from '@mastra/core/agent';
 import type { Metric } from '@mastra/core/eval';
 import type { z } from 'zod';
 import type { RouterDecisionSchema, ScoutDecisionSchema } from './agent-schemas';
+import type { SectorSummary, CorrelationResult, EvolutionResult, TimeStepDiff } from '@quackgraph/graph';
 
 // Re-export as an alias for cleaner internal usage
 export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
@@ -68,12 +69,6 @@ export interface TimeContext {
   asOf?: Date;
   windowStart?: Date;
   windowEnd?: Date;
-}
-
-export interface SectorSummary {
-  edgeType: string;
-  count: number;
-  avgHeat?: number;
 }
 
 export type ScoutDecision = z.infer<typeof ScoutDecisionSchema>;
@@ -139,29 +134,7 @@ export interface TemporalWindow {
   windowStart: number; // Unix timestamp
   windowEnd: number;   // Unix timestamp
 }
-
-export interface CorrelationResult {
-  anchorLabel: string;
-  targetLabel: string;
-  windowSizeMinutes: number;
-  correlationScore: number; // 0.0 - 1.0
-  sampleSize: number;
-  description: string;
-}
-
-export interface EvolutionResult {
-  anchorNodeId: string;
-  timeline: TimeStepDiff[];
-}
-
-export interface TimeStepDiff {
-  timestamp: Date;
-  // Comparison vs previous step (or baseline)
-  addedEdges: SectorSummary[];
-  removedEdges: SectorSummary[];
-  persistedEdges: SectorSummary[];
-  densityChange: number; // percentage
-}
+export type { SectorSummary, CorrelationResult, EvolutionResult, TimeStepDiff };
 
 export interface StepEvent {
   step: number;

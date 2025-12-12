@@ -1,6 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { Chronos } from "../../src/agent/chronos";
-import { GraphTools } from "../../src/tools/graph-tools";
+import { Chronos, GraphTools } from "@quackgraph/graph";
 import { runWithTestGraph } from "../utils/test-graph";
 import { generateTimeSeries } from "../utils/generators";
 

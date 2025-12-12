@@ -6,7 +6,7 @@ export * from './types';
 export * from './agent-schemas';
 
 // Utilities
-export * from './agent/chronos';
+export { Chronos } from '@quackgraph/graph';
 export * from './governance/schema-registry';
 
 // Mastra Internals (Exposed for advanced configuration)

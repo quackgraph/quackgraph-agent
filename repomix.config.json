@@ -36,7 +36,21 @@
   "packages/agent/test/unit/graph-tools.test.ts",
   "packages/agent/test/unit/temporal.test.ts",
   "packages/quackgraph/packages/quack-graph/src/index.ts",
-  "packages/quackgraph/test/utils/helpers.ts"
+  "packages/quackgraph/test/utils/helpers.ts",
+
+  "packages/agent/src/index.ts",
+  "packages/agent/src/mastra/workflows/labyrinth-workflow.ts",
+  "packages/agent/src/mastra/workflows/mutation-workflow.ts",
+  "packages/agent/test/e2e/labyrinth-complex.test.ts",
+  "packages/agent/test/e2e/labyrinth.test.ts",
+  "packages/agent/test/e2e/metabolism.test.ts",
+  "packages/agent/test/e2e/mutation-complex.test.ts",
+  "packages/agent/test/e2e/mutation.test.ts",
+  "packages/agent/test/e2e/resilience.test.ts",
+  "packages/agent/test/e2e/time-travel.test.ts",
+  "packages/agent/test/integration/chronos.test.ts",
+  "packages/agent/test/integration/tools.test.ts"
+
 ]
 ,
   "ignore": {
