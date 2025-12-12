@@ -23,21 +23,6 @@ export async function corruptNode(graph: QuackGraph, nodeId: string) {
  */
 export async function severConnection(graph: QuackGraph, source: string, target: string, type: string) {
     // 1. Soft Delete (Time Travel)
-    const now = new Date().toISOString();
-    await graph.db.execute(
-        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [now, source, target, type]
-    );
-    
-    // 2. Force removal from RAM index if applicable to simulation
-    // (Assuming graph.native has a remove method exposed or we rely on reload)
-    try {
-        // @ts-expect-error - native method might vary
-        if (graph.native.removeEdge) {
-            // @ts-expect-error
-            graph.native.removeEdge(source, target, type);
-        }
-    } catch (e) {
-        console.warn("Could not remove edge from native index manually:", e);
-    }
+    const now = new Date();
+    await graph.expireEdge(source, target, type, now);
 }

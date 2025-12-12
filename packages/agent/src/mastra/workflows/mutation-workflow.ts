@@ -118,9 +118,9 @@ const applyMutations = createStep({
             // For now, we assume simple properties update.
             // If the schema requires label, we find it.
             let label = 'Entity'; // Fallback
-            const existing = await graph.db.query('SELECT labels FROM nodes WHERE id = ?', [op.match.id]);
-            if (existing.length > 0 && existing[0].labels && existing[0].labels.length > 0) {
-                label = existing[0].labels[0];
+            const labels = await graph.getNodeLabels(op.match.id);
+            if (labels.length > 0) {
+                label = labels[0];
             }
 
             await graph.mergeNode(
@@ -135,12 +135,7 @@ const applyMutations = createStep({
           case 'DELETE_NODE': {
               // Direct DB manipulation for retroactive delete if needed
               if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE nodes SET valid_to = ? WHERE id = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.id]
-                   );
-                   // Update RAM
-                   graph.native.removeNode(op.id);
+                   await graph.expireNode(op.id, validTo);
               } else {
                   await graph.deleteNode(op.id);
               }
@@ -149,27 +144,7 @@ const applyMutations = createStep({
           }
           case 'CLOSE_EDGE': {
               if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.source, op.target, op.type]
-                   );
-                   // Update RAM: remove old edge and re-add with validTo
-                   // First, get the edge properties from DB
-                   const existingEdge = await graph.db.query(
-                       `SELECT valid_from, valid_to, heat FROM edges WHERE source = ? AND target = ? AND type = ?`,
-                       [op.source, op.target, op.type]
-                   );
-                   graph.native.removeEdge(op.source, op.target, op.type);
-                   if (existingEdge[0]) {
-                       graph.native.addEdge(
-                           op.source, 
-                           op.target, 
-                           op.type, 
-                           new Date(existingEdge[0].valid_from).getTime(),
-                           new Date(existingEdge[0].valid_to).getTime(),
-                           existingEdge[0].heat || 0
-                       );
-                   }
+                   await graph.expireEdge(op.source, op.target, op.type, validTo);
               } else {
                   await graph.deleteEdge(op.source, op.target, op.type);
               }

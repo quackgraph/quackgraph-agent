@@ -18,23 +18,10 @@ const identifyCandidates = createStep({
   }),
   execute: async ({ inputData }) => {
     const graph = getGraphInstance();
-    // Raw SQL for efficiency
-    // Ensure we don't accidentally wipe recent data if minAgeDays is too small
-    const safeDays = Math.max(inputData.minAgeDays, 1);
-    const sql = `
-      SELECT id, properties 
-      FROM nodes 
-      WHERE list_contains(labels, ?) 
-        AND valid_from < (current_timestamp - INTERVAL ${safeDays} DAY)
-        AND valid_to IS NULL
-      LIMIT 100
-    `;
-    const rows = await graph.db.query(sql, [inputData.targetLabel]);
+    const candidates = await graph.getStaleNodes(inputData.targetLabel, inputData.minAgeDays);
 
-    const candidatesContent = rows.map((c) =>
-      typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
-    );
-    const candidateIds = rows.map(c => c.id);
+    const candidateIds = candidates.map(c => c.id);
+    const candidatesContent = candidates.map(c => c.properties);
 
     return { candidateIds, candidatesContent };
   },

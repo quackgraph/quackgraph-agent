@@ -24,7 +24,18 @@
   },
   "include": 
 
-[]
+[
+  "packages/agent/src/agent/chronos.ts",
+  "packages/agent/src/mastra/workflows/metabolism-workflow.ts",
+  "packages/agent/src/mastra/workflows/mutation-workflow.ts",
+  "packages/agent/test/utils/chaos-graph.ts",
+  "packages/quackgraph/packages/quack-graph/src/db.ts",
+  "packages/quackgraph/packages/quack-graph/src/graph.ts",
+  "packages/quackgraph/packages/quack-graph/src/schema.ts",
+  "packages/quackgraph/test/unit/graph.test.ts",
+  "packages/agent/test/integration/chronos.test.ts",
+  "packages/agent/test/unit/chronos.test.ts"
+]
 ,
   "ignore": {
     "useGitignore": true,

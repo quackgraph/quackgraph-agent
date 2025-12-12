@@ -35,34 +35,7 @@ export class Chronos {
     targetLabel: string,
     windowMinutes: number
   ): Promise<CorrelationResult> {
-    const anchorRows = await this.graph.db.query(
-      "SELECT valid_from FROM nodes WHERE id = ?",
-      [anchorNodeId]
-    );
-
-    if (anchorRows.length === 0) {
-      throw new Error(`Anchor node ${anchorNodeId} not found`);
-    }
-
-    const sql = `
-      WITH Anchor AS (
-        SELECT valid_from::TIMESTAMPTZ as t_anchor 
-        FROM nodes 
-        WHERE id = ?
-      ),
-      Targets AS (
-        SELECT id, valid_from::TIMESTAMPTZ as t_target 
-        FROM nodes 
-        WHERE list_contains(labels, ?)
-      )
-      SELECT count(*) as count
-      FROM Targets, Anchor
-      WHERE t_target >= (t_anchor - (INTERVAL 1 MINUTE * ${Math.floor(windowMinutes)}))
-        AND t_target <= t_anchor
-    `;
-
-    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
-    const count = Number(result[0]?.count || 0);
+    const count = await this.graph.getTemporalCorrelation(anchorNodeId, targetLabel, windowMinutes);
 
     return {
       anchorLabel: 'Unknown',
