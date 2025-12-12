@@ -26,15 +26,17 @@
 
 [
   "packages/agent/src/agent/chronos.ts",
-  "packages/agent/src/mastra/workflows/metabolism-workflow.ts",
-  "packages/agent/src/mastra/workflows/mutation-workflow.ts",
-  "packages/agent/test/utils/chaos-graph.ts",
-  "packages/quackgraph/packages/quack-graph/src/db.ts",
-  "packages/quackgraph/packages/quack-graph/src/graph.ts",
-  "packages/quackgraph/packages/quack-graph/src/schema.ts",
-  "packages/quackgraph/test/unit/graph.test.ts",
-  "packages/agent/test/integration/chronos.test.ts",
-  "packages/agent/test/unit/chronos.test.ts"
+  "packages/agent/src/labyrinth.ts",
+  "packages/agent/src/lib/config.ts",
+  "packages/agent/src/mastra/tools/index.ts",
+  "packages/agent/src/tools/graph-tools.ts",
+  "packages/agent/src/types.ts",
+  "packages/agent/src/utils/temporal.ts",
+  "packages/agent/test/unit/chronos.test.ts",
+  "packages/agent/test/unit/graph-tools.test.ts",
+  "packages/agent/test/unit/temporal.test.ts",
+  "packages/quackgraph/packages/quack-graph/src/index.ts",
+  "packages/quackgraph/test/utils/helpers.ts"
 ]
 ,
   "ignore": {

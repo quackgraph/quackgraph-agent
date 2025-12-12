@@ -5,1101 +5,348 @@ packages/
     src/
       agent/
         chronos.ts
+      lib/
+        config.ts
       mastra/
-        workflows/
-          metabolism-workflow.ts
-          mutation-workflow.ts
+        tools/
+          index.ts
+      tools/
+        graph-tools.ts
+      utils/
+        temporal.ts
+      labyrinth.ts
+      types.ts
     test/
-      integration/
-        chronos.test.ts
       unit/
         chronos.test.ts
-      utils/
-        chaos-graph.ts
+        graph-tools.test.ts
+        temporal.test.ts
   quackgraph/
     packages/
       quack-graph/
         src/
-          db.ts
-          graph.ts
-          schema.ts
+          index.ts
     test/
-      unit/
-        graph.test.ts
+      utils/
+        helpers.ts
 ```
 
 # Files
 
-## File: packages/quackgraph/packages/quack-graph/src/db.ts
+## File: packages/quackgraph/packages/quack-graph/src/index.ts
 ```typescript
-import duckdb from 'duckdb';
-import { tableFromJSON, tableToIPC } from 'apache-arrow';
+export * from './db';
+export * from './graph';
+export * from './query';
+export * from './schema';
+```
 
-// Interface for operations that can be performed within a transaction or globally
-export interface DbExecutor {
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params are generic
-  execute(sql: string, params?: any[]): Promise<void>;
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results are generic
-  query(sql: string, params?: any[]): Promise<any[]>;
-}
+## File: packages/quackgraph/test/utils/helpers.ts
+```typescript
+import { unlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { QuackGraph } from '../../packages/quack-graph/src/index';
 
-export class DuckDBManager implements DbExecutor {
-  private db: duckdb.Database | null = null;
-  private _path: string;
-  private writeListeners: Array<() => Promise<void>> = [];
+export const getTempPath = (prefix = 'quack-test') => {
+  const uuid = crypto.randomUUID();
+  return join(tmpdir(), `${prefix}-${uuid}.duckdb`);
+};
 
-  constructor(path: string = ':memory:') {
-    this._path = path;
+export const createGraph = async (mode: 'memory' | 'disk' = 'memory', dbName?: string) => {
+  const path = mode === 'memory' ? ':memory:' : getTempPath(dbName);
+  const graph = new QuackGraph(path);
+  await graph.init();
+  return { graph, path };
+};
+
+export const cleanupGraph = async (path: string) => {
+  if (path === ':memory:') return;
+  try {
+    // Aggressively clean up main DB file and potential WAL/tmp files
+    await unlink(path).catch(() => {});
+    await unlink(`${path}.wal`).catch(() => {});
+    await unlink(`${path}.tmp`).catch(() => {});
+    // Snapshots are sometimes saved as .bin
+    await unlink(`${path}.bin`).catch(() => {});
+  } catch (_e) {
+    // Ignore errors if file doesn't exist
+  }
+};
+
+/**
+ * Wait for a short duration. Useful if we need to ensure timestamps differ slightly
+ * (though QuackGraph uses microsecond precision usually, node might be ms).
+ */
+export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Seeds a basic graph with a few nodes and edges for testing traversals.
+ * A -> B -> C
+ *      |
+ *      v
+ *      D
+ */
+export const seedBasicGraph = async (g: QuackGraph) => {
+  await g.addNode('a', ['Node']);
+  await g.addNode('b', ['Node']);
+  await g.addNode('c', ['Node']);
+  await g.addNode('d', ['Node']);
+  await g.addEdge('a', 'b', 'NEXT');
+  await g.addEdge('b', 'c', 'NEXT');
+  await g.addEdge('b', 'd', 'NEXT');
+};
+```
+
+## File: packages/agent/src/lib/config.ts
+```typescript
+import { z } from 'zod';
+
+const envSchema = z.object({
+  // Server Config
+  MASTRA_PORT: z.coerce.number().default(4111),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+
+  // Agent Model Configuration (Granular)
+  // Format: provider/model-name (e.g., 'groq/llama-3.3-70b-versatile', 'openai/gpt-4')
+  AGENT_SCOUT_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_JUDGE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_ROUTER_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+  AGENT_SCRIBE_MODEL: z.string().default('groq/llama-3.3-70b-versatile'),
+
+  // API Keys (Validated for existence if required by selected models)
+  GROQ_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  ANTHROPIC_API_KEY: z.string().optional(),
+});
+
+// Validate process.env
+// Note: In Bun, process.env is automatically populated from .env files
+const parsed = envSchema.parse(process.env);
+
+export const config = {
+  server: {
+    port: parsed.MASTRA_PORT,
+    logLevel: parsed.LOG_LEVEL,
+  },
+  agents: {
+    scout: {
+      model: { id: parsed.AGENT_SCOUT_MODEL as `${string}/${string}` },
+    },
+    judge: {
+      model: { id: parsed.AGENT_JUDGE_MODEL as `${string}/${string}` },
+    },
+    router: {
+      model: { id: parsed.AGENT_ROUTER_MODEL as `${string}/${string}` },
+    },
+    scribe: {
+      model: { id: parsed.AGENT_SCRIBE_MODEL as `${string}/${string}` },
+    },
+  },
+};
+```
+
+## File: packages/agent/src/utils/temporal.ts
+```typescript
+/**
+ * Simple heuristic parser for relative time strings.
+ * Used to ground natural language ("yesterday") into absolute ISO timestamps for the Graph.
+ * 
+ * In a production system, this would be replaced by a robust library like `chrono-node`.
+ */
+export function resolveRelativeTime(input: string, referenceDate: Date = new Date()): Date | null {
+  const lower = input.toLowerCase().trim();
+  const now = referenceDate.getTime();
+  const ONE_MINUTE = 60 * 1000;
+  const ONE_HOUR = 60 * ONE_MINUTE;
+  const ONE_DAY = 24 * ONE_HOUR;
+
+  // 1. Direct keywords
+  if (lower === 'now' || lower === 'today') return new Date(now);
+  if (lower === 'yesterday') return new Date(now - ONE_DAY);
+  if (lower === 'tomorrow') return new Date(now + ONE_DAY);
+
+  // 2. "X [unit] ago"
+  const agoMatch = lower.match(/^(\d+)\s+(day|days|hour|hours|minute|minutes|week|weeks)\s+ago$/);
+  if (agoMatch) {
+    const amount = parseInt(agoMatch[1] || '0', 10);
+    const unit = agoMatch[2] || '';
+    if (unit.startsWith('day')) return new Date(now - amount * ONE_DAY);
+    if (unit.startsWith('hour')) return new Date(now - amount * ONE_HOUR);
+    if (unit.startsWith('minute')) return new Date(now - amount * ONE_MINUTE);
+    if (unit.startsWith('week')) return new Date(now - amount * 7 * ONE_DAY);
   }
 
-  async init() {
-    if (!this.db) {
-      // Native constructor is synchronous but can take a callback for errors
-      await new Promise<void>((resolve, reject) => {
-        this.db = new duckdb.Database(this._path, (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-      
-      // Force UTC timezone for consistent timestamp handling across all environments
-      // This prevents timezone conversion issues when storing/retrieving TIMESTAMPTZ values
-      await this.execute("SET TimeZone='UTC'");
-    }
+  // 3. "in X [unit]"
+  const inMatch = lower.match(/^in\s+(\d+)\s+(day|days|hour|hours|minute|minutes|week|weeks)$/);
+  if (inMatch) {
+    const amount = parseInt(inMatch[1] || '0', 10);
+    const unit = inMatch[2] || '';
+    if (unit.startsWith('day')) return new Date(now + amount * ONE_DAY);
+    if (unit.startsWith('hour')) return new Date(now + amount * ONE_HOUR);
+    if (unit.startsWith('minute')) return new Date(now + amount * ONE_MINUTE);
+    if (unit.startsWith('week')) return new Date(now + amount * 7 * ONE_DAY);
   }
 
-  async close() {
-    if (this.db) {
-      const db = this.db;
-      this.db = null;
-      await new Promise<void>((resolve, reject) => {
-        db.close((err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-    }
+  // 4. Fallback: Try native Date parse (e.g. "2023-01-01", "Oct 5 2024")
+  const parsed = Date.parse(input);
+  if (!Number.isNaN(parsed)) {
+    return new Date(parsed);
   }
 
-  onWrite(listener: () => Promise<void>) {
-    this.writeListeners.push(listener);
-  }
-
-  private async notifyListeners() {
-    await Promise.all(this.writeListeners.map(l => l()));
-  }
-
-  get path(): string {
-    return this._path;
-  }
-
-  getDb(): duckdb.Database {
-    if (!this.db) {
-      throw new Error('Database not initialized. Call init() first.');
-    }
-    return this.db;
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async execute(sql: string, params: any[] = []): Promise<void> {
-    const db = this.getDb();
-    await new Promise<void>((resolve, reject) => {
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB callback
-      db.run(sql, ...params, (err: any) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
-    await this.notifyListeners();
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: SQL results
-  async query(sql: string, params: any[] = []): Promise<any[]> {
-    const db = this.getDb();
-    return new Promise((resolve, reject) => {
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB callback
-      db.all(sql, ...params, (err: any, rows: any[]) => {
-        if (err) reject(err);
-        else resolve(rows);
-      });
-    });
-  }
-
-  /**
-   * Executes a callback within a transaction using a dedicated connection.
-   * This guarantees that all operations inside the callback share the same ACID scope.
-   */
-  async transaction<T>(callback: (executor: DbExecutor) => Promise<T>): Promise<T> {
-    const db = this.getDb();
-    // Connect synchronously
-    const conn = db.connect();
-    
-    // Create a transaction-bound executor wrapper around the Connection object
-    const txExecutor: DbExecutor = {
-      // biome-ignore lint/suspicious/noExplicitAny: SQL params
-      execute: (sql: string, params: any[] = []) => {
-        return new Promise((resolve, reject) => {
-          conn.run(sql, ...params, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
-      },
-      // biome-ignore lint/suspicious/noExplicitAny: SQL results
-      query: (sql: string, params: any[] = []) => {
-        return new Promise((resolve, reject) => {
-          conn.all(sql, ...params, (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-          });
-        });
-      }
-    };
-
-    try {
-      await txExecutor.execute('BEGIN TRANSACTION');
-      const result = await callback(txExecutor);
-      await txExecutor.execute('COMMIT');
-      await this.notifyListeners(); // Notify AFTER commit
-      return result;
-    } catch (e) {
-      try {
-        await txExecutor.execute('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('Failed to rollback transaction:', rollbackError);
-      }
-      throw e;
-    } finally {
-      // Best effort close - connection is native here
-      // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types
-      if (conn && typeof (conn as any).close === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: DuckDB connection types
-        (conn as any).close();
-      }
-    }
-  }
-
-  /**
-   * Executes a query and returns the raw Apache Arrow IPC Buffer.
-   * Used for high-speed hydration.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: SQL params
-  async queryArrow(sql: string, params: any[] = []): Promise<Uint8Array> {
-    const db = this.getDb();
-    
-    return new Promise((resolve, reject) => {
-      // Helper to merge multiple Arrow batches if necessary
-      const mergeBatches = (batches: Uint8Array[]) => {
-        if (batches.length === 0) return new Uint8Array(0);
-        if (batches.length === 1) return batches[0] ?? new Uint8Array(0);
-        const totalLength = batches.reduce((acc, val) => acc + val.length, 0);
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const batch of batches) {
-          merged.set(batch, offset);
-          offset += batch.length;
-        }
-        return merged;
-      };
-
-      const runFallback = async () => {
-        try {
-          const rows = await this.query(sql, params);
-          if (rows.length === 0) return resolve(new Uint8Array(0));
-          const table = tableFromJSON(rows);
-          const ipc = tableToIPC(table, 'stream');
-          resolve(ipc);
-        } catch (e) {
-          reject(e);
-        }
-      };
-
-      // Try Database.arrowIPCAll (available in newer node-duckdb)
-      // biome-ignore lint/suspicious/noExplicitAny: duckdb native type check
-      if (typeof (db as any).arrowIPCAll === 'function') {
-        // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-        (db as any).arrowIPCAll(sql, ...params, (err: any, result: any) => {
-          if (err) {
-            const msg = String(err.message || '');
-            if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-              return runFallback();
-            }
-            return reject(err);
-          }
-          // Result is usually Array<Uint8Array> (batches)
-          if (Array.isArray(result)) {
-            resolve(mergeBatches(result));
-          } else {
-            resolve(result ?? new Uint8Array(0));
-          }
-        });
-      } else {
-         // Fallback: Create a raw connection if db.arrowIPCAll missing
-         try {
-            const rawConn = db.connect();
-            
-            // biome-ignore lint/suspicious/noExplicitAny: check for method
-            if (rawConn && typeof (rawConn as any).arrowIPCAll === 'function') {
-               // biome-ignore lint/suspicious/noExplicitAny: internal callback signature
-               (rawConn as any).arrowIPCAll(sql, ...params, (err: any, result: any) => {
-                  if (err) {
-                    const msg = String(err.message || '');
-                    if (msg.includes('to_arrow_ipc') || msg.includes('Table Function')) {
-                      return runFallback();
-                    }
-                    return reject(err);
-                  }
-                  if (Array.isArray(result)) {
-                    resolve(mergeBatches(result));
-                  } else {
-                    resolve(result ?? new Uint8Array(0));
-                  }
-               });
-            } else {
-               runFallback();
-            }
-         } catch(_e) {
-            runFallback();
-         }
-      }
-    });
-  }
+  return null;
 }
 ```
 
-## File: packages/quackgraph/packages/quack-graph/src/graph.ts
+## File: packages/agent/test/unit/graph-tools.test.ts
 ```typescript
-import { NativeGraph } from '@quackgraph/native';
-import { DuckDBManager } from './db';
-import { SchemaManager } from './schema';
-import { QueryBuilder } from './query';
+import { describe, it, expect } from "bun:test";
+import { GraphTools } from "../../src/tools/graph-tools";
+import { runWithTestGraph } from "../utils/test-graph";
 
-class WriteLock {
-  private mutex: Promise<void> = Promise.resolve();
+describe("Unit: GraphTools (Physics Layer)", () => {
+  it("getNavigationalMap: handles cycles gracefully (Infinite Loop Protection)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
 
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    // Chain the new operation to the existing promise
-    const result = this.mutex.then(() => fn());
+      // Create a cycle: A <-> B
+      // @ts-expect-error - dynamic graph
+      await graph.addNode("A", ["Entity"], { name: "A" });
+      // @ts-expect-error
+      await graph.addNode("B", ["Entity"], { name: "B" });
 
-    // Update the mutex to wait for the new operation to complete (success or failure)
-    // We strictly return void so the mutex remains Promise<void>
-    this.mutex = result.then(
-      () => { },
-      () => { }
-    );
+      // @ts-expect-error
+      await graph.addEdge("A", "B", "LOOP", {});
+      // @ts-expect-error
+      await graph.addEdge("B", "A", "LOOP", {});
 
-    return result;
-  }
-}
+      // Recursion depth 3
+      const { map, truncated } = await tools.getNavigationalMap("A", 3);
 
-export class QuackGraph {
-  db: DuckDBManager;
-  schema: SchemaManager;
-  native: InstanceType<typeof NativeGraph>;
-  private writeLock = new WriteLock();
-  private _isInternalWrite = false;
-
-  capabilities = {
-    vss: false
-  };
-
-  // Context for the current instance (Time Travel)
-  context: {
-    asOf?: Date;
-    topologySnapshot?: string;
-  } = {};
-
-  constructor(path: string = ':memory:', options: { asOf?: Date, topologySnapshot?: string } = {}) {
-    this.db = new DuckDBManager(path);
-    this.schema = new SchemaManager(this.db);
-    this.native = new NativeGraph();
-    this.context.asOf = options.asOf;
-    this.context.topologySnapshot = options.topologySnapshot;
-  }
-
-  async init() {
-    await this.db.init();
-
-    // Load Extensions
-    try {
-      await this.db.execute("INSTALL vss; LOAD vss;");
-      this.capabilities.vss = true;
-    } catch (e) {
-      console.warn("QuackGraph: Failed to load 'vss' extension. Vector search will be disabled.", e);
-    }
-
-    await this.schema.ensureSchema();
-
-    // If we are in time-travel mode, we might skip hydration or hydrate a snapshot (Advanced).
-    // For V1, we always hydrate "Current Active" topology.
-
-    // Check for Topology Snapshot
-    let snapshotLoaded = false;
-    if (this.context.topologySnapshot) {
-      try {
-        // Try loading from disk
-        this.native.loadSnapshot(this.context.topologySnapshot);
-        snapshotLoaded = true;
-        // If successful, skip hydration
-        // We don't return here because we still need to set up the listener below
-      } catch (e) {
-        console.warn(`QuackGraph: Failed to load snapshot '${this.context.topologySnapshot}'. Falling back to full hydration.`, e);
-      }
-    }
-
-    try {
-      if (!snapshotLoaded) {
-        await this.hydrate();
-      }
-    } catch (e) {
-      console.error("Failed to hydrate graph topology from disk:", e);
-      // We don't throw here to allow partial functionality (metadata queries) if needed,
-      // but usually this is fatal for graph operations.
-      throw e;
-    }
-
-    // Setup Reactive Consistency
-    // Registered LAST to ensure initialization DDL doesn't trigger premature hydration/reloads
-    this.db.onWrite(async () => {
-      // If the write didn't originate from our internal methods, it's external (e.g. test SQL, or direct DB manipulation)
-      // We must reload the graph to maintain split-brain consistency.
-      if (!this._isInternalWrite) {
-        await this.reload();
-      }
-    });
-  }
-
-  async reload() {
-    await this.writeLock.run(async () => {
-      // Clear RAM index
-      if (typeof this.native.clear === 'function') {
-        this.native.clear();
-      } else {
-        // Fallback for older native bindings if necessary, though clear() is added now
-        // biome-ignore lint/suspicious/noExplicitAny: native method
-        (this.native as any).clear?.();
-      }
+      // Should show A -> B -> A -> B
+      // The logic clamps at max depth, preventing infinite recursion
+      expect(map).toContain("[ROOT] A");
+      expect(map).toContain("(B)");
       
-      // Re-hydrate
-      try {
-        await this.hydrate();
-      } catch (e) {
-        console.warn("QuackGraph: Auto-reload hydration failed", e);
-      }
-    });
-  }
-
-  /**
-   * Hydrates the in-memory Rust graph from the persistent DuckDB storage.
-   * This is critical for the "Split-Brain" architecture.
-   */
-  async hydrate() {
-    // Zero-Copy Arrow IPC
-    // We load ALL edges (active and historical) to support time-travel.
-    // We cast valid_from/valid_to to DOUBLE to ensure JS/JSON compatibility (avoiding BigInt issues in fallback)
-    try {
-      const ipcBuffer = await this.db.queryArrow(
-        `SELECT source, target, type, heat,
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_from) as valid_from, 
-                date_diff('us', '1970-01-01'::TIMESTAMPTZ, valid_to) as valid_to 
-         FROM edges`
-      );
-
-      if (ipcBuffer && ipcBuffer.length > 0) {
-        // Napi-rs expects a Buffer or equivalent
-        // Buffer.from is zero-copy in Node for Uint8Array usually, or cheap copy
-        // We cast to any to satisfy the generated TS definitions which might expect Buffer
-        const bufferForNapi = Buffer.isBuffer(ipcBuffer)
-          ? ipcBuffer
-          : Buffer.from(ipcBuffer);
-
-        this.native.loadArrowIpc(bufferForNapi);
-
-        // Reclaim memory after burst hydration
-        this.native.compact();
-      }
-      // biome-ignore lint/suspicious/noExplicitAny: error handling
-    } catch (e: any) {
-      throw new Error(`Hydration Error: ${e.message}`);
-    }
-  }
-
-  async close() {
-    await this.db.close();
-    // Clear RAM index
-    if (typeof this.native.clear === 'function') {
-      this.native.clear();
-    } else {
-      // biome-ignore lint/suspicious/noExplicitAny: native method
-      (this.native as any).clear?.();
-    }
-  }
-
-  asOf(date: Date): QuackGraph {
-    // Return a shallow copy with new context
-    const g = new QuackGraph(this.db.path, { asOf: date });
-    // Share the same DB connection and Native index (assuming topology is shared/latest)
-    g.db = this.db;
-    g.schema = this.schema;
-    g.native = this.native;
-    g.capabilities = { ...this.capabilities };
-    return g;
-  }
-
-  // --- Write Operations (Write-Through) ---
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addNode(id: string, labels: string[], props: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date } = {}) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        // 1. Write to Disk (Source of Truth)
-        await this.schema.writeNode(id, labels, props, options);
-        // 2. Write to RAM (Cache)
-        // Note: Rust V1 Index doesn't track node validity history, only existence.
-        this.native.addNode(id);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addNodes(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        await this.schema.writeNodesBulk(nodes);
-        const ids = nodes.map(n => n.id);
-        this.native.addNodes(ids);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addEdge(source: string, target: string, type: string, props: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date, heat?: number } = {}) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        // Generate timestamp in JS to ensure RAM and DB match for deduplication
-        const vfDate = options.validFrom || new Date();
-
-        // 1. Write to Disk (Source of Truth) - Pass explicit date to match RAM
-        await this.schema.writeEdge(source, target, type, props, { ...options, validFrom: vfDate });
-        // 2. Write to RAM (Cache)
-        const vf = vfDate.getTime();
-        const vt = options.validTo ? options.validTo.getTime() : undefined;
-        const heat = options.heat || 0;
-        this.native.addEdge(source, target, type, vf, vt, heat);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async addEdges(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        const now = new Date();
-        // Normalize validFrom in JS so DB and RAM receive the exact same value
-        const edgesWithTime = edges.map(e => ({
-            ...e,
-            validFrom: e.validFrom || now
-        }));
-
-        await this.schema.writeEdgesBulk(edgesWithTime);
-        const sources = edgesWithTime.map(e => e.source);
-        const targets = edgesWithTime.map(e => e.target);
-        const types = edgesWithTime.map(e => e.type);
-        // Rust Napi expects parallel arrays
-        const validFroms = edgesWithTime.map(e => e.validFrom?.getTime() ?? 0);
-        const validTos = edgesWithTime.map(e => e.validTo ? e.validTo.getTime() : Number.MAX_SAFE_INTEGER);
-        const heats = edgesWithTime.map(e => e.heat || 0);
-
-        this.native.addEdges(sources, targets, types, validFroms, validTos, heats);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  async deleteNode(id: string) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        // 1. Write to Disk (Soft Delete)
-        await this.schema.deleteNode(id);
-        // 2. Write to RAM (Tombstone)
-        this.native.removeNode(id);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        // 1. Write to Disk (Soft Delete)
-        await this.schema.deleteEdge(source, target, type);
-        // 2. Write to RAM (Remove)
-        this.native.removeEdge(source, target, type);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  // --- Pheromones & Schema (Agent) ---
-
-  async updateEdgeHeat(source: string, target: string, type: string, heat: number) {
-    await this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        // 1. Write to Disk (In-Place Update for Learning Signal)
-        // We only update active edges (valid_to IS NULL)
-        await this.db.execute(
-          "UPDATE edges SET heat = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL",
-          [heat, source, target, type]
-        );
-        // 2. Write to RAM (Atomic)
-        this.native.updateEdgeHeat(source, target, type, heat);
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  async getAvailableEdgeTypes(sources: string[]): Promise<string[]> {
-    // Fast scan of the CSR index
-    // Returns unique edge types outgoing from the source set
-    // Used for Labyrinth LOD 0 (Sector Scan)
-    const asOfTs = this.context.asOf ? this.context.asOf.getTime() : undefined;
-    return this.native.getAvailableEdgeTypes(sources, asOfTs);
-  }
-
-  async getSectorStats(sources: string[], allowedEdgeTypes?: string[]): Promise<{ edgeType: string; count: number; avgHeat: number }[]> {
-    // Fast scan of the CSR index with aggregation
-    // Returns counts and heat for outgoing edge types
-    const asOfTs = this.context.asOf ? this.context.asOf.getTime() : undefined;
-    return this.native.getSectorStats(sources, asOfTs, allowedEdgeTypes);
-  }
-
-  async traverseInterval(sources: string[], edgeType: string | undefined, direction: 'out' | 'in' = 'out', start: Date, end: Date, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
-    const s = start.getTime();
-    const e = end.getTime();
-    // If end < start, return empty
-    if (e <= s) return [];
-    return this.native.traverseInterval(sources, edgeType, direction, s, e, constraint);
-  }
-
-  /**
-   * Upsert a node.
-   * @param label Primary label to match.
-   * @param matchProps Properties to match against (e.g. { email: '...' }).
-   * @param setProps Properties to set/update if found or created.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any> = {}, options: { validFrom?: Date, validTo?: Date } = {}) {
-    return this.writeLock.run(async () => {
-      this._isInternalWrite = true;
-      try {
-        const id = await this.schema.mergeNode(label, matchProps, setProps, options);
-        // Update cache
-        this.native.addNode(id);
-        return id;
-      } finally {
-        this._isInternalWrite = false;
-      }
-    });
-  }
-
-  // --- Optimization & Maintenance ---
-
-  get optimize() {
-    return {
-      promoteProperty: async (label: string, property: string, type: string) => {
-        await this.schema.promoteNodeProperty(label, property, type);
-      },
-      saveTopologySnapshot: (path: string) => {
-        this.native.saveSnapshot(path);
-      }
-    };
-  }
-
-  // --- Read Operations ---
-
-  match(labels: string[]): QueryBuilder {
-    return new QueryBuilder(this, labels);
-  }
-}
-```
-
-## File: packages/quackgraph/packages/quack-graph/src/schema.ts
-```typescript
-import type { DuckDBManager, DbExecutor } from './db';
-
-const NODES_TABLE = `
-CREATE TABLE IF NOT EXISTS nodes (
-    row_id UBIGINT NOT NULL, -- Simple auto-increment equivalent logic handled by sequence
-    id TEXT NOT NULL,
-    labels TEXT[],
-    properties JSON,
-    embedding DOUBLE[], -- Vector embedding
-    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS seq_node_id;
-`;
-
-const EDGES_TABLE = `
-CREATE TABLE IF NOT EXISTS edges (
-    source TEXT NOT NULL,
-    target TEXT NOT NULL,
-    type TEXT NOT NULL,
-    properties JSON,
-    heat UTINYINT DEFAULT 0,
-    valid_from TIMESTAMPTZ DEFAULT current_timestamp,
-    valid_to TIMESTAMPTZ DEFAULT NULL
-);
-`;
-
-export interface TemporalOptions {
-  validFrom?: Date;
-  validTo?: Date;
-}
-
-export class SchemaManager {
-  constructor(private db: DuckDBManager) {}
-
-  async ensureSchema() {
-    // Ensure sequence exists before table creation to avoid race conditions.
-    // Note: Breaking NODES_TABLE into separate executions to ensure sequence is ready.
-    await this.db.execute("CREATE SEQUENCE IF NOT EXISTS seq_node_id");
-    
-    await this.db.execute(NODES_TABLE);
-    await this.db.execute(EDGES_TABLE);
-
-    // Sync sequence to avoid collisions if table existed with data but sequence was reset
-    // Force checkpoint to ensure we see committed data for sequence calc
-    try { await this.db.execute("CHECKPOINT"); } catch {}
-
-    // We use a robust query to find the max ID, handling potential NULLs from empty tables
-    const rows = await this.db.query("SELECT COALESCE(MAX(row_id), 0) as max_id FROM nodes");
-    const maxId = rows.length > 0 ? BigInt(rows[0].max_id) : 0n;
-
-    // Recreate sequence starting after maxId.
-    // Only advance sequence if needed (idempotent for persistent stores)
-    if (maxId > 0n) {
-      const nextVal = maxId + 1n;
-      // Try setval (standard), fallback to ALTER (Postgres/DuckDB variant), fallback to DROP/CREATE
-      try {
-        await this.db.execute(`SELECT setval('seq_node_id', ${nextVal})`);
-      } catch {
-        try {
-          await this.db.execute(`ALTER SEQUENCE seq_node_id RESTART WITH ${nextVal}`);
-        } catch (_e) {
-          try {
-            await this.db.execute(`DROP SEQUENCE IF EXISTS seq_node_id`);
-            await this.db.execute(`CREATE SEQUENCE seq_node_id START ${nextVal}`);
-          } catch (finalErr) {
-            console.warn("SchemaManager: Could not sync sequence", finalErr);
-          }
-        }
-      }
-    }
-
-    // Performance Indexes
-    // Note: Partial indexes (WHERE valid_to IS NULL) are not supported in all DuckDB environments/bindings yet.
-    // We use standard indexes for now.
-    // NOTE: row_id does NOT have a uniqueness constraint (PRIMARY KEY or UNIQUE INDEX) due to a DuckDB bug
-    // where updating array columns on tables with such constraints causes "Duplicate key" errors.
-    // Since row_id is only used internally for SCD-2 versioning and we query by 'id' instead, this is safe.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_row_id ON nodes (row_id)');
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_id ON nodes (id)');
-    // idx_nodes_labels removed: Standard B-Tree on LIST column does not help list_contains() queries.
-    await this.db.execute('CREATE INDEX IF NOT EXISTS idx_edges_src_tgt_type ON edges (source, target, type)');
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNode(id: string, labels: string[], properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp)";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing record (SCD Type 2)
-      await tx.execute(
-        `UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(labels), JSON.stringify(properties)]);
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdge(source: string, target: string, type: string, properties: Record<string, any> = {}, options: TemporalOptions = {}) {
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp)";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    await this.db.transaction(async (tx: DbExecutor) => {
-      // 1. Close existing edge
-      await tx.execute(
-        `UPDATE edges SET valid_to = ${vf} WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-      // 2. Insert new version
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to) 
-        VALUES (?, ?, ?, ?::JSON, ${vf}, ${vt})
-      `, [source, target, type, JSON.stringify(properties)]);
-    });
-  }
-
-  async deleteNode(id: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE nodes SET valid_to = (current_timestamp) WHERE id = ? AND valid_to IS NULL`,
-        [id]
-      );
-    });
-  }
-
-  async deleteEdge(source: string, target: string, type: string) {
-    // Soft Delete: Close the validity period
-    await this.db.transaction(async (tx: DbExecutor) => {
-      await tx.execute(
-        `UPDATE edges SET valid_to = (current_timestamp) WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [source, target, type]
-      );
-    });
-  }
-
-  /**
-   * Promotes a JSON property to a native column for faster filtering.
-   * This creates a column on the `nodes` table and backfills it from the `properties` JSON blob.
-   * 
-   * @param label The node label to target (e.g., 'User'). Only nodes with this label will be updated.
-   * @param property The property key to promote (e.g., 'age').
-   * @param type The DuckDB SQL type (e.g., 'INTEGER', 'VARCHAR').
-   */
-  async promoteNodeProperty(label: string, property: string, type: string) {
-    // Sanitize inputs to prevent basic SQL injection (rudimentary check)
-    if (!/^[a-zA-Z0-9_]+$/.test(property)) throw new Error(`Invalid property name: '${property}'. Must be alphanumeric + underscore.`);
-    // Type check is looser to allow various SQL types, but strictly alphanumeric + spaces/parens usually safe enough for now
-    if (!/^[a-zA-Z0-9_() ]+$/.test(type)) throw new Error(`Invalid SQL type: '${type}'.`);
-    // Sanitize label just in case, though it is used as a parameter usually, here we might need dynamic check if we were using it in table names, but we use it in list_contains param.
-    
-    // 1. Add Column (Idempotent)
-    try {
-      // Note: DuckDB 0.9+ supports ADD COLUMN IF NOT EXISTS
-      await this.db.execute(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS ${property} ${type}`);
-    } catch (_e) {
-      // Fallback or ignore if column exists
-    }
-
-    // 2. Backfill Data
-    // We use list_contains to only update relevant nodes
-    const sql = `
-      UPDATE nodes 
-      SET ${property} = CAST(json_extract(properties, '$.${property}') AS ${type})
-      WHERE list_contains(labels, ?)
-    `;
-    await this.db.execute(sql, [label]);
-  }
-
-  /**
-   * Declarative Merge (Upsert).
-   * Finds a node by `matchProps` and `label`.
-   * If found: Updates properties with `setProps`.
-   * If not found: Creates new node with `matchProps` + `setProps`.
-   * Returns the node ID.
-   */
-  // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-  async mergeNode(label: string, matchProps: Record<string, any>, setProps: Record<string, any>, options: TemporalOptions = {}): Promise<string> {
-    // 1. Build Search Query
-    const vf = options.validFrom ? `'${options.validFrom.toISOString()}'` : "(current_timestamp)";
-    const vt = options.validTo ? `'${options.validTo.toISOString()}'` : "NULL";
-
-    const matchKeys = Object.keys(matchProps);
-    const conditions = [`valid_to IS NULL`, `list_contains(labels, ?)`];
-    // biome-ignore lint/suspicious/noExplicitAny: Params array
-    const params: any[] = [label];
-    
-    for (const key of matchKeys) {
-      if (key === 'id') {
-        conditions.push(`id = ?`);
-        params.push(matchProps[key]);
-      } else {
-        conditions.push(`json_extract(properties, '$.${key}') = ?::JSON`);
-        params.push(JSON.stringify(matchProps[key]));
-      }
-    }
-
-    const searchSql = `SELECT id, labels, properties FROM nodes WHERE ${conditions.join(' AND ')} LIMIT 1`;
-
-    return await this.db.transaction(async (tx) => {
-      const rows = await tx.query(searchSql, params);
-      let id: string;
-      // biome-ignore lint/suspicious/noExplicitAny: Generic property bag
-      let finalProps: Record<string, any>;
-      let finalLabels: string[];
-
-      if (rows.length > 0) {
-        // Update Existing
-        const row = rows[0];
-        id = row.id;
-        const currentProps = typeof row.properties === 'string' ? JSON.parse(row.properties) : row.properties;
-        finalProps = { ...currentProps, ...setProps };
-        finalLabels = row.labels; // Preserve existing labels
-
-        // Close old version
-        await tx.execute(`UPDATE nodes SET valid_to = ${vf} WHERE id = ? AND valid_to IS NULL`, [id]);
-      } else {
-        // Insert New
-        id = matchProps.id || crypto.randomUUID();
-        finalProps = { ...matchProps, ...setProps };
-        finalLabels = [label];
-      }
-
-      // Insert new version (for both Update and Create cases)
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to) 
-        VALUES (nextval('seq_node_id'), ?, ?::JSON::TEXT[], ?::JSON, ${vf}, ${vt})
-      `, [id, JSON.stringify(finalLabels), JSON.stringify(finalProps)]);
-
-      return id;
-    });
-  }
-
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeNodesBulk(nodes: { id: string, labels: string[], properties: Record<string, any>, validFrom?: Date, validTo?: Date }[]) {
-    if (nodes.length === 0) return;
-    
-    // Using Staging Table Strategy for efficient SCD-2
-    const stagingName = `staging_nodes_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-    
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (id TEXT, labels TEXT[], properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ)`);
+      // We expect some repetition due to depth=3, but it must not crash or hang
+      const occurrencesOfB = map.match(/\(B\)/g)?.length || 0;
+      expect(occurrencesOfB).toBeGreaterThanOrEqual(1);
       
-      // Bulk Insert into Staging
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < nodes.length; i += BATCH_SIZE) {
-        const chunk = nodes.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?::JSON::TEXT[], ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ)`).join(',');
-        // biome-ignore lint/suspicious/noExplicitAny: SQL params
-        const params: any[] = [];
-
-        for (const n of chunk) {
-          const vf = n.validFrom ? n.validFrom.toISOString() : new Date().toISOString(); // Fallback to JS now if undefined (since we can't use SQL function in param)
-          const vt = n.validTo ? n.validTo.toISOString() : null;
-          params.push(n.id, JSON.stringify(n.labels), JSON.stringify(n.properties), vf, vt);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
-
-      // SCD-2 Close Old Rows (Set valid_to = new_valid_from for existing active rows)
-      await tx.execute(`
-        UPDATE nodes 
-        SET valid_to = s.valid_from 
-        FROM ${stagingName} s 
-        WHERE nodes.id = s.id AND nodes.valid_to IS NULL
-      `);
-
-      // Insert New Rows
-      await tx.execute(`
-        INSERT INTO nodes (row_id, id, labels, properties, valid_from, valid_to)
-        SELECT nextval('seq_node_id'), id, labels, properties, valid_from, valid_to FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
+      // Should not have exploded the line count limit immediately
+      expect(truncated).toBe(false);
     });
-  }
+  });
 
-  // biome-ignore lint/suspicious/noExplicitAny: generic properties
-  async writeEdgesBulk(edges: { source: string, target: string, type: string, properties: Record<string, any>, validFrom?: Date, validTo?: Date, heat?: number }[]) {
-    if (edges.length === 0) return;
+  it("reinforcePath: increments edge heat (Pheromones)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
 
-    const stagingName = `staging_edges_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+      // A -> B
+      // @ts-expect-error
+      await graph.addNode("start", ["Start"], {});
+      // @ts-expect-error
+      await graph.addNode("end", ["End"], {});
+      // @ts-expect-error
+      await graph.addEdge("start", "end", "PATH", { weight: 1 });
 
-    await this.db.transaction(async (tx) => {
-      await tx.execute(`CREATE TEMP TABLE ${stagingName} (source TEXT, target TEXT, type TEXT, properties JSON, valid_from TIMESTAMPTZ, valid_to TIMESTAMPTZ, heat UTINYINT)`);
+      // Initial state: heat is 0 (or default)
+      const initialSummary = await tools.getSectorSummary(["start"]);
+      const initialHeat = initialSummary.find(s => s.edgeType === "PATH")?.avgHeat || 0;
 
-      const BATCH_SIZE = 200;
-      for (let i = 0; i < edges.length; i += BATCH_SIZE) {
-        const chunk = edges.slice(i, i + BATCH_SIZE);
-        const placeholders = chunk.map(() => `(?, ?, ?, ?::JSON, ?::TIMESTAMPTZ, ?::TIMESTAMPTZ, ?::UTINYINT)`).join(',');
-        // biome-ignore lint/suspicious/noExplicitAny: SQL params
-        const params: any[] = [];
+      // Reinforce
+      await tools.reinforcePath(["start", "end"], [undefined, "PATH"], 1.0);
 
-        for (const e of chunk) {
-          const vf = e.validFrom ? e.validFrom.toISOString() : new Date().toISOString();
-          const vt = e.validTo ? e.validTo.toISOString() : null;
-          const heat = e.heat || 0;
-          params.push(e.source, e.target, e.type, JSON.stringify(e.properties), vf, vt, heat);
-        }
-        
-        await tx.execute(`INSERT INTO ${stagingName} VALUES ${placeholders}`, params);
-      }
+      // Check heat increase
+      const newSummary = await tools.getSectorSummary(["start"]);
+      const newHeat = newSummary.find(s => s.edgeType === "PATH")?.avgHeat || 0;
 
-      // Close Old Edges
-      await tx.execute(`
-        UPDATE edges 
-        SET valid_to = s.valid_from
-        FROM ${stagingName} s
-        WHERE edges.source = s.source AND edges.target = s.target AND edges.type = s.type AND edges.valid_to IS NULL
-      `);
-
-      // Insert New Edges
-      await tx.execute(`
-        INSERT INTO edges (source, target, type, properties, valid_from, valid_to, heat)
-        SELECT source, target, type, properties, valid_from, valid_to, heat FROM ${stagingName}
-      `);
-
-      await tx.execute(`DROP TABLE ${stagingName}`);
+      // Note: In-memory mock might not implement the full u8 heat decay math, 
+      // but we expect the command to have been issued and state updated if supported.
+      // If the mock supports it:
+      expect(newHeat).toBeGreaterThan(initialHeat);
     });
-  }
-}
-```
-
-## File: packages/quackgraph/test/unit/graph.test.ts
-```typescript
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { createGraph, cleanupGraph } from '../utils/helpers';
-import type { QuackGraph } from '../../packages/quack-graph/src/index';
-
-describe('Unit: QuackGraph Core', () => {
-  let g: QuackGraph;
-  let path: string;
-
-  beforeEach(async () => {
-    const setup = await createGraph('memory');
-    g = setup.graph;
-    path = setup.path;
   });
 
-  afterEach(async () => {
-    await cleanupGraph(path);
-  });
+  it("getSectorSummary: strictly enforces allowedEdgeTypes (Governance)", async () => {
+    await runWithTestGraph(async (graph) => {
+      const tools = new GraphTools(graph);
 
-  test('should initialize with zero nodes', () => {
-    expect(g.native.nodeCount).toBe(0);
-    expect(g.native.edgeCount).toBe(0);
-  });
+      // Root connected to Safe and Unsafe
+      // @ts-expect-error
+      await graph.addNode("root", ["Root"], {});
+      // @ts-expect-error
+      await graph.addNode("safe", ["Child"], {});
+      // @ts-expect-error
+      await graph.addNode("unsafe", ["Child"], {});
 
-  test('should add nodes and increment count', async () => {
-    await g.addNode('u:1', ['User'], { name: 'Alice' });
-    await g.addNode('u:2', ['User'], { name: 'Bob' });
-    
-    // Check Rust Index
-    expect(g.native.nodeCount).toBe(2);
-    
-    // Check DuckDB Storage
-    const rows = await g.db.query('SELECT * FROM nodes');
-    expect(rows.length).toBe(2);
-    expect(rows.find(r => r.id === 'u:1').properties).toContain('Alice');
-  });
+      // @ts-expect-error
+      await graph.addEdge("root", "safe", "SAFE_LINK", {});
+      // @ts-expect-error
+      await graph.addEdge("root", "unsafe", "FORBIDDEN_LINK", {});
 
-  test('should add edges and support traversal', async () => {
-    await g.addNode('a', ['Node']);
-    await g.addNode('b', ['Node']);
-    await g.addEdge('a', 'b', 'LINK');
+      // 1. Unrestricted
+      const all = await tools.getSectorSummary(["root"]);
+      expect(all.length).toBe(2);
 
-    expect(g.native.edgeCount).toBe(1);
-
-    // Simple manual traversal check using native directly
-    const neighbors = g.native.traverse(['a'], 'LINK', 'out');
-    expect(neighbors).toEqual(['b']);
-  });
-
-  test('should be idempotent when adding same edge', async () => {
-    await g.addNode('a', ['Node']);
-    await g.addNode('b', ['Node']);
-    
-    await g.addEdge('a', 'b', 'LINK');
-    await g.addEdge('a', 'b', 'LINK'); // Duplicate
-
-    expect(g.native.edgeCount).toBe(1);
-    const neighbors = g.native.traverse(['a'], 'LINK', 'out');
-    expect(neighbors).toEqual(['b']);
-  });
-
-  test('should soft delete nodes and stop traversal', async () => {
-    await g.addNode('a', ['Node']);
-    await g.addNode('b', ['Node']);
-    await g.addEdge('a', 'b', 'LINK');
-
-    let neighbors = g.native.traverse(['a'], 'LINK', 'out');
-    expect(neighbors).toEqual(['b']);
-
-    await g.deleteNode('b');
-
-    // Rust index should treat it as tombstoned
-    neighbors = g.native.traverse(['a'], 'LINK', 'out');
-    expect(neighbors).toEqual([]);
-
-    // Check DB soft delete
-    const rows = await g.db.query("SELECT * FROM nodes WHERE id = 'b' AND valid_to IS NOT NULL");
-    expect(rows.length).toBe(1);
+      // 2. Restricted
+      const restricted = await tools.getSectorSummary(["root"], undefined, ["SAFE_LINK"]);
+      expect(restricted.length).toBe(1);
+      expect(restricted[0].edgeType).toBe("SAFE_LINK");
+      
+      const forbidden = restricted.find(r => r.edgeType === "FORBIDDEN_LINK");
+      expect(forbidden).toBeUndefined();
+    });
   });
 });
 ```
 
-## File: packages/agent/test/utils/chaos-graph.ts
+## File: packages/agent/test/unit/temporal.test.ts
 ```typescript
-import type { QuackGraph } from '@quackgraph/graph';
+import { describe, it, expect } from "bun:test";
+import { resolveRelativeTime } from "../../src/utils/temporal";
 
-/**
- * Simulates data corruption by injecting invalid or unexpected schema data directly into the DB.
- */
-export async function corruptNode(graph: QuackGraph, nodeId: string) {
-    // We assume properties are stored as JSON string in 'nodes' table.
-    // We inject a string that is technically valid JSON but breaks expected schema,
-    // or invalid JSON if the DB allows (SQLite/DuckDB often allows loose text).
-    
-    const badData = '{"corrupted": true, "critical_field": null, "unexpected_array": [1,2,3]}';
-    
-    // Direct SQL injection to bypass application-layer validation
-    await graph.db.execute(
-        `UPDATE nodes SET properties = ? WHERE id = ?`,
-        [badData, nodeId]
-    );
-}
+describe("Temporal Logic (resolveRelativeTime)", () => {
+  // Fixed reference time: 2025-01-01T12:00:00Z
+  // Timestamp: 1735732800000
+  const refDate = new Date("2025-01-01T12:00:00Z");
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const ONE_HOUR = 60 * 60 * 1000;
 
-/**
- * Simulates a network partition or edge loss.
- * Can be used to test resilience against missing links.
- */
-export async function severConnection(graph: QuackGraph, source: string, target: string, type: string) {
-    // 1. Soft Delete (Time Travel)
-    const now = new Date().toISOString();
-    await graph.db.execute(
-        `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`,
-        [now, source, target, type]
-    );
+  it("resolves exact keywords", () => {
+    expect(resolveRelativeTime("now", refDate)?.getTime()).toBe(refDate.getTime());
+    expect(resolveRelativeTime("today", refDate)?.getTime()).toBe(refDate.getTime());
     
-    // 2. Force removal from RAM index if applicable to simulation
-    // (Assuming graph.native has a remove method exposed or we rely on reload)
-    try {
-        // @ts-expect-error - native method might vary
-        if (graph.native.removeEdge) {
-            // @ts-expect-error
-            graph.native.removeEdge(source, target, type);
-        }
-    } catch (e) {
-        console.warn("Could not remove edge from native index manually:", e);
-    }
-}
+    const yesterday = resolveRelativeTime("yesterday", refDate);
+    expect(yesterday?.getTime()).toBe(refDate.getTime() - ONE_DAY);
+
+    const tomorrow = resolveRelativeTime("tomorrow", refDate);
+    expect(tomorrow?.getTime()).toBe(refDate.getTime() + ONE_DAY);
+  });
+
+  it("resolves 'X time ago' patterns", () => {
+    const twoDaysAgo = resolveRelativeTime("2 days ago", refDate);
+    expect(twoDaysAgo?.getTime()).toBe(refDate.getTime() - (2 * ONE_DAY));
+
+    const fiveHoursAgo = resolveRelativeTime("5 hours ago", refDate);
+    expect(fiveHoursAgo?.getTime()).toBe(refDate.getTime() - (5 * ONE_HOUR));
+  });
+
+  it("resolves 'in X time' patterns", () => {
+    const inThreeWeeks = resolveRelativeTime("in 3 weeks", refDate);
+    // 3 weeks = 21 days
+    expect(inThreeWeeks?.getTime()).toBe(refDate.getTime() + (21 * ONE_DAY));
+  });
+
+  it("resolves absolute dates", () => {
+    const iso = "2023-10-05T00:00:00.000Z";
+    const result = resolveRelativeTime(iso, refDate);
+    expect(result?.toISOString()).toBe(iso);
+  });
+
+  it("returns null for garbage input", () => {
+    expect(resolveRelativeTime("not a date", refDate)).toBeNull();
+  });
+});
 ```
 
 ## File: packages/agent/test/unit/chronos.test.ts
@@ -1186,375 +433,192 @@ describe("Unit: Chronos (Temporal Physics)", () => {
 });
 ```
 
-## File: packages/agent/src/mastra/workflows/mutation-workflow.ts
+## File: packages/agent/src/types.ts
 ```typescript
-import { createStep, createWorkflow } from '@mastra/core/workflows';
-import { z } from 'zod';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { ScribeDecisionSchema } from '../../agent-schemas';
+export enum ZoomLevel {
+  SECTOR = 0,    // Ghost/Satellite View: Available Moves (Schema)
+  TOPOLOGY = 1,  // Drone View: Structural Hops (IDs only)
+  CONTENT = 2    // Street View: Full JSON Data
+}
 
-// Input Schema
-const MutationInputSchema = z.object({
-  query: z.string(),
-  traceId: z.string().optional(),
-  userId: z.string().optional().default('Me'),
-  asOf: z.number().optional()
-});
+// Type alias for Mastra Agent - imports the actual Agent type from @mastra/core
+import type { Agent, ToolsInput } from '@mastra/core/agent';
+import type { Metric } from '@mastra/core/eval';
+import type { z } from 'zod';
+import type { RouterDecisionSchema, ScoutDecisionSchema } from './agent-schemas';
 
-// Step 1: Scribe Analysis (Intent -> Operations)
-const analyzeIntent = createStep({
-  id: 'analyze-intent',
-  inputSchema: MutationInputSchema,
-  outputSchema: z.object({
-    operations: z.array(z.any()),
-    reasoning: z.string(),
-    requiresClarification: z.string().optional()
-  }),
-  execute: async ({ inputData, mastra }) => {
-    const scribe = mastra?.getAgent('scribeAgent');
-    if (!scribe) throw new Error("Scribe Agent not found");
+// Re-export as an alias for cleaner internal usage
+export type MastraAgent = Agent<string, ToolsInput, Record<string, Metric>>;
 
-    const now = inputData.asOf ? new Date(inputData.asOf) : new Date();
-    
-    // Prompt Scribe
-    const prompt = `
-      User Query: "${inputData.query}"
-      Context User ID: "${inputData.userId}"
-      System Time: ${now.toISOString()}
-    `;
+// Labyrinth Runtime Context (Injected via Mastra)
+export interface LabyrinthContext {
+  // Temporal: The "Now" for the graph traversal (Unix Timestamp in seconds or Date)
+  // If undefined, defaults to real-time.
+  asOf?: number | Date;
 
-    const res = await scribe.generate(prompt, {
-      structuredOutput: { schema: ScribeDecisionSchema },
-      // Inject context for tools (Time Travel & Governance)
-      // @ts-expect-error - Mastra context injection
-      runtimeContext: { asOf: inputData.asOf } 
-    });
+  // Governance: The semantic lens restricting traversal (e.g., "Medical", "Financial")
+  domain?: string;
 
-    const decision = res.object;
-    if (!decision) throw new Error("Scribe returned no structured decision");
+  // Traceability: The distributed trace ID for this execution
+  traceId?: string;
 
-    return {
-      operations: decision.operations,
-      reasoning: decision.reasoning,
-      requiresClarification: decision.requiresClarification
-    };
-  }
-});
+  // Threading: The specific cursor/thread ID for parallel speculation
+  threadId?: string;
+}
 
-// Step 2: Apply Mutations (Batch Execution)
-const applyMutations = createStep({
-  id: 'apply-mutations',
-  inputSchema: z.object({
-    operations: z.array(z.any()),
-    reasoning: z.string(),
-    requiresClarification: z.string().optional()
-  }),
-  outputSchema: z.object({
-    success: z.boolean(),
-    summary: z.string()
-  }),
-  execute: async ({ inputData }) => {
-    if (inputData.requiresClarification) {
-      return { success: false, summary: `Clarification needed: ${inputData.requiresClarification}` };
-    }
+export interface AgentConfig {
+  llmProvider: {
+    generate: (prompt: string, signal?: AbortSignal) => Promise<string>;
+  };
+  maxHops?: number;
+  // Max number of concurrent exploration threads
+  maxCursors?: number;
+  // Minimum confidence to pursue a path (0.0 - 1.0)
+  confidenceThreshold?: number;
+  // Vector Genesis: Optional embedding provider for start-from-text
+  embeddingProvider?: {
+    embed: (text: string) => Promise<number[]>;
+  };
+}
 
-    const graph = getGraphInstance();
-    const ops = inputData.operations;
+// --- Governance & Router ---
 
-    if (!ops || !Array.isArray(ops)) {
-        return { success: false, summary: "No operations returned by agent." };
-    }
-    
-    // Arrays for Batching
-    // biome-ignore lint/suspicious/noExplicitAny: Batch types
-    const nodesToAdd: any[] = [];
-    // biome-ignore lint/suspicious/noExplicitAny: Batch types
-    const edgesToAdd: any[] = [];
-    
-    const summaryLines: string[] = [];
-    
-    for (const op of ops) {
-      const validFrom = op.validFrom ? new Date(op.validFrom) : undefined;
-      const validTo = op.validTo ? new Date(op.validTo) : undefined;
+export interface DomainConfig {
+  name: string;
+  description: string;
+  allowedEdges: string[]; // Whitelist of edge types (empty = all unless excluded)
+  excludedEdges?: string[]; // Blacklist of edge types (overrides allowed)
+  // If true, traversal enforces Monotonic Time (Next Event >= Current Event)
+  isCausal?: boolean;
+}
 
-      try {
-        switch (op.op) {
-          case 'CREATE_NODE': {
-            const id = op.id || crypto.randomUUID();
-            nodesToAdd.push({
-              id,
-              labels: op.labels,
-              properties: op.properties,
-              validFrom,
-              validTo
-            });
-            summaryLines.push(`Created Node ${id} (${op.labels.join(',')})`);
-            break;
-          }
-          case 'CREATE_EDGE': {
-            edgesToAdd.push({
-              source: op.source,
-              target: op.target,
-              type: op.type,
-              properties: op.properties || {},
-              validFrom,
-              validTo
-            });
-            summaryLines.push(`Created Edge ${op.source}->${op.target} [${op.type}]`);
-            break;
-          }
-          case 'UPDATE_NODE': {
-            // Fetch label if needed for optimization, or pass generic
-            // For now, we assume simple properties update.
-            // If the schema requires label, we find it.
-            let label = 'Entity'; // Fallback
-            const existing = await graph.db.query('SELECT labels FROM nodes WHERE id = ?', [op.match.id]);
-            if (existing.length > 0 && existing[0].labels && existing[0].labels.length > 0) {
-                label = existing[0].labels[0];
-            }
+export interface RouterPrompt {
+  goal: string;
+  availableDomains: DomainConfig[];
+}
 
-            await graph.mergeNode(
-              label, 
-              op.match, 
-              op.set, 
-              { validFrom }
-            );
-            summaryLines.push(`Updated Node ${op.match.id}`);
-            break;
-          }
-          case 'DELETE_NODE': {
-              // Direct DB manipulation for retroactive delete if needed
-              if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE nodes SET valid_to = ? WHERE id = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.id]
-                   );
-                   // Update RAM
-                   graph.native.removeNode(op.id);
-              } else {
-                  await graph.deleteNode(op.id);
-              }
-              summaryLines.push(`Deleted Node ${op.id}`);
-              break;
-          }
-          case 'CLOSE_EDGE': {
-              if (validTo) {
-                   await graph.db.execute(
-                       `UPDATE edges SET valid_to = ? WHERE source = ? AND target = ? AND type = ? AND valid_to IS NULL`, 
-                       [validTo.toISOString(), op.source, op.target, op.type]
-                   );
-                   // Update RAM: remove old edge and re-add with validTo
-                   // First, get the edge properties from DB
-                   const existingEdge = await graph.db.query(
-                       `SELECT valid_from, valid_to, heat FROM edges WHERE source = ? AND target = ? AND type = ?`,
-                       [op.source, op.target, op.type]
-                   );
-                   graph.native.removeEdge(op.source, op.target, op.type);
-                   if (existingEdge[0]) {
-                       graph.native.addEdge(
-                           op.source, 
-                           op.target, 
-                           op.type, 
-                           new Date(existingEdge[0].valid_from).getTime(),
-                           new Date(existingEdge[0].valid_to).getTime(),
-                           existingEdge[0].heat || 0
-                       );
-                   }
-              } else {
-                  await graph.deleteEdge(op.source, op.target, op.type);
-              }
-              summaryLines.push(`Closed Edge ${op.source}->${op.target} [${op.type}]`);
-              break;
-          }
-        }
-      } catch (e) {
-          console.error(`Failed to apply operation ${op.op}:`, e);
-          summaryLines.push(`FAILED: ${op.op} - ${(e as Error).message}`);
-      }
-    }
+export type RouterDecision = z.infer<typeof RouterDecisionSchema>;
 
-    // Execute Batches
-    if (nodesToAdd.length > 0) {
-        await graph.addNodes(nodesToAdd);
-    }
-    if (edgesToAdd.length > 0) {
-        await graph.addEdges(edgesToAdd);
-    }
+// --- Scout ---
 
-    return { success: true, summary: summaryLines.join('\n') };
-  }
-});
+export interface TimeContext {
+  asOf?: Date;
+  windowStart?: Date;
+  windowEnd?: Date;
+}
 
-export const mutationWorkflow = createWorkflow({
-  id: 'mutation-workflow',
-  inputSchema: MutationInputSchema,
-  outputSchema: z.object({
-    success: z.boolean(),
-    summary: z.string()
-  })
-})
-.then(analyzeIntent)
-.then(applyMutations)
-.commit();
-```
+export interface SectorSummary {
+  edgeType: string;
+  count: number;
+  avgHeat?: number;
+}
 
-## File: packages/agent/src/mastra/workflows/metabolism-workflow.ts
-```typescript
-import { createStep, createWorkflow } from '@mastra/core/workflows';
-import { z } from 'zod';
-import { getGraphInstance } from '../../lib/graph-instance';
-import { randomUUID } from 'node:crypto';
-import { JudgeDecisionSchema } from '../../agent-schemas';
+export type ScoutDecision = z.infer<typeof ScoutDecisionSchema>;
 
-// Step 1: Identify Candidates
-const identifyCandidates = createStep({
-  id: 'identify-candidates',
-  description: 'Finds old nodes suitable for summarization',
-  inputSchema: z.object({
-    minAgeDays: z.number(),
-    targetLabel: z.string(),
-  }),
-  outputSchema: z.object({
-    candidateIds: z.array(z.string()),
-    candidatesContent: z.array(z.record(z.any())),
-  }),
-  execute: async ({ inputData }) => {
-    const graph = getGraphInstance();
-    // Raw SQL for efficiency
-    // Ensure we don't accidentally wipe recent data if minAgeDays is too small
-    const safeDays = Math.max(inputData.minAgeDays, 1);
-    const sql = `
-      SELECT id, properties 
-      FROM nodes 
-      WHERE list_contains(labels, ?) 
-        AND valid_from < (current_timestamp - INTERVAL ${safeDays} DAY)
-        AND valid_to IS NULL
-      LIMIT 100
-    `;
-    const rows = await graph.db.query(sql, [inputData.targetLabel]);
+export interface ScoutPrompt {
+  goal: string;
+  activeDomain: string; // The semantic domain grounding this search
+  currentNodeId: string;
+  currentNodeLabels: string[];
+  sectorSummary: SectorSummary[];
+  pathHistory: string[];
+  timeContext?: string;
+}
 
-    const candidatesContent = rows.map((c) =>
-      typeof c.properties === 'string' ? JSON.parse(c.properties) : c.properties
-    );
-    const candidateIds = rows.map(c => c.id);
+export interface JudgePrompt {
+  goal: string;
+  // biome-ignore lint/suspicious/noExplicitAny: generic content
+  nodeContent: Record<string, any>[];
+  timeContext?: string;
+}
 
-    return { candidateIds, candidatesContent };
-  },
-});
+// --- Traces ---
 
-// Step 2: Synthesize Insight (using Judge Agent)
-const synthesizeInsight = createStep({
-  id: 'synthesize-insight',
-  description: 'Uses LLM to summarize the candidates',
-  inputSchema: z.object({
-    candidateIds: z.array(z.string()),
-    candidatesContent: z.array(z.record(z.any())),
-  }),
-  outputSchema: z.object({
-    summaryText: z.string().optional(),
-    candidateIds: z.array(z.string()),
-  }),
-  execute: async ({ inputData, mastra }) => {
-    if (inputData.candidateIds.length === 0) return { candidateIds: [] };
+export interface LabyrinthArtifact {
+  answer: string;
+  confidence: number;
+  traceId: string;
+  sources: string[];
+  metadata?: LabyrinthMetadata;
+}
 
-    const judge = mastra?.getAgent('judgeAgent');
-    if (!judge) throw new Error('Judge Agent not found');
+export interface LabyrinthMetadata {
+  duration_ms: number;
+  tokens_used: number;
+  governance: {
+    query: string;
+    selected_domain: string;
+    rejected_domains: string[];
+    reasoning: string;
+  };
+  execution: ThreadTrace[];
+  judgment?: {
+    verdict: string;
+    confidence: number;
+  };
+}
 
-    const prompt = `
-      Goal: Metabolism/Dreaming: Summarize these ${inputData.candidatesContent.length} logs into a single concise insight node. Focus on patterns and key events.
-      Data: ${JSON.stringify(inputData.candidatesContent)}
-    `;
+export interface ThreadTrace {
+  thread_id: string;
+  status: 'COMPLETED' | 'KILLED' | 'ACTIVE';
+  steps: {
+    step: number;
+    node_id: string;
+    ghost_view?: string; // Snapshot of what the agent saw
+    action: string;
+    reasoning: string;
+  }[];
+}
 
-    const response = await judge.generate(prompt, {
-      structuredOutput: {
-        schema: JudgeDecisionSchema
-      }
-    });
-    let summaryText = '';
+// Temporal Logic Types
+export interface TemporalWindow {
+  anchorNodeId: string;
+  windowStart: number; // Unix timestamp
+  windowEnd: number;   // Unix timestamp
+}
 
-    try {
-      const result = response.object;
-      if (result && (result.isAnswer || result.answer)) {
-        summaryText = result.answer;
-      }
-    } catch (e) {
-      // Fallback or just log, but don't crash workflow if one synthesis fails
-      console.error("Metabolism synthesis failed parsing", e);
-    }
+export interface CorrelationResult {
+  anchorLabel: string;
+  targetLabel: string;
+  windowSizeMinutes: number;
+  correlationScore: number; // 0.0 - 1.0
+  sampleSize: number;
+  description: string;
+}
 
-    return { summaryText, candidateIds: inputData.candidateIds };
-  },
-});
+export interface EvolutionResult {
+  anchorNodeId: string;
+  timeline: TimeStepDiff[];
+}
 
-// Step 3: Apply Summary (Rewire Graph)
-const applySummary = createStep({
-  id: 'apply-summary',
-  description: 'Writes the summary node and prunes old nodes',
-  inputSchema: z.object({
-    summaryText: z.string().optional(),
-    candidateIds: z.array(z.string()),
-  }),
-  outputSchema: z.object({
-    success: z.boolean(),
-  }),
-  execute: async ({ inputData }) => {
-    if (!inputData.summaryText || inputData.candidateIds.length === 0) return { success: false };
+export interface TimeStepDiff {
+  timestamp: Date;
+  // Comparison vs previous step (or baseline)
+  addedEdges: SectorSummary[];
+  removedEdges: SectorSummary[];
+  persistedEdges: SectorSummary[];
+  densityChange: number; // percentage
+}
 
-    const graph = getGraphInstance();
+export interface StepEvent {
+  step: number;
+  node_id: string;
+  ghost_view?: string;
+  action: string;
+  reasoning: string;
+}
 
-    // Find parents
-    const allParents = await graph.native.traverse(
-      inputData.candidateIds,
-      undefined,
-      'in',
-      undefined,
-      undefined
-    );
-
-    const candidateSet = new Set(inputData.candidateIds);
-    const externalParents = allParents.filter((p: string) => !candidateSet.has(p));
-
-    if (externalParents.length === 0) return { success: false };
-
-    const summaryId = `summary:${randomUUID()}`;
-    const summaryProps = {
-      content: inputData.summaryText,
-      source_count: inputData.candidateIds.length,
-      generated_at: new Date().toISOString(),
-      period_end: new Date().toISOString()
-    };
-
-    await graph.addNode(summaryId, ['Summary', 'Insight'], summaryProps);
-
-    for (const parentId of externalParents) {
-      await graph.addEdge(parentId, summaryId, 'HAS_SUMMARY');
-    }
-
-    for (const id of inputData.candidateIds) {
-      await graph.deleteNode(id);
-    }
-
-    return { success: true };
-  },
-});
-
-const workflow = createWorkflow({
-  id: 'metabolism-workflow',
-  inputSchema: z.object({
-    minAgeDays: z.number(),
-    targetLabel: z.string(),
-  }),
-  outputSchema: z.object({
-    success: z.boolean(),
-  }),
-})
-  .then(identifyCandidates)
-  .then(synthesizeInsight)
-  .then(applySummary);
-
-workflow.commit();
-
-export { workflow as metabolismWorkflow };
+export interface LabyrinthCursor {
+  id: string;
+  currentNodeId: string;
+  path: string[];
+  pathEdges: (string | undefined)[];
+  stepHistory: StepEvent[];
+  stepCount: number;
+  confidence: number;
+  lastEdgeType?: string;
+  lastTimestamp?: number;
+}
 ```
 
 ## File: packages/agent/src/agent/chronos.ts
@@ -1596,34 +660,7 @@ export class Chronos {
     targetLabel: string,
     windowMinutes: number
   ): Promise<CorrelationResult> {
-    const anchorRows = await this.graph.db.query(
-      "SELECT valid_from FROM nodes WHERE id = ?",
-      [anchorNodeId]
-    );
-
-    if (anchorRows.length === 0) {
-      throw new Error(`Anchor node ${anchorNodeId} not found`);
-    }
-
-    const sql = `
-      WITH Anchor AS (
-        SELECT valid_from::TIMESTAMPTZ as t_anchor 
-        FROM nodes 
-        WHERE id = ?
-      ),
-      Targets AS (
-        SELECT id, valid_from::TIMESTAMPTZ as t_target 
-        FROM nodes 
-        WHERE list_contains(labels, ?)
-      )
-      SELECT count(*) as count
-      FROM Targets, Anchor
-      WHERE t_target >= (t_anchor - (INTERVAL 1 MINUTE * ${Math.floor(windowMinutes)}))
-        AND t_target <= t_anchor
-    `;
-
-    const result = await this.graph.db.query(sql, [anchorNodeId, targetLabel]);
-    const count = Number(result[0]?.count || 0);
+    const count = await this.graph.getTemporalCorrelation(anchorNodeId, targetLabel, windowMinutes);
 
     return {
       anchorLabel: 'Unknown',
@@ -1699,156 +736,674 @@ export class Chronos {
 }
 ```
 
-## File: packages/agent/test/integration/chronos.test.ts
+## File: packages/agent/src/mastra/tools/index.ts
 ```typescript
-import { describe, it, expect } from "bun:test";
-import { Chronos } from "../../src/agent/chronos";
-import { GraphTools } from "../../src/tools/graph-tools";
-import { runWithTestGraph } from "../utils/test-graph";
-import { generateTimeSeries } from "../utils/generators";
+import { createTool } from '@mastra/core/tools';
+import { z } from 'zod';
+import { getGraphInstance } from '../../lib/graph-instance';
+import { GraphTools } from '../../tools/graph-tools';
+import { getSchemaRegistry } from '../../governance/schema-registry';
+import { Chronos } from '../../agent/chronos';
 
-describe("Integration: Chronos (Temporal Physics)", () => {
-  
-  it("traverseInterval: strictly enforces interval algebra", async () => {
-    await runWithTestGraph(async (graph) => {
-      const tools = new GraphTools(graph);
-      const chronos = new Chronos(graph, tools);
+// Helper to reliably extract context from Mastra's RuntimeContext
+// biome-ignore lint/suspicious/noExplicitAny: RuntimeContext access
+function extractContext(runtimeContext: any) {
+  const asOf = runtimeContext?.get?.('asOf') as number | undefined;
+  const domain = runtimeContext?.get?.('domain') as string | undefined;
+  return { asOf, domain };
+}
 
-      const BASE_TIME = new Date("2025-01-01T12:00:00Z").getTime();
-      const ONE_HOUR = 60 * 60 * 1000;
+export const sectorScanTool = createTool({
+  id: 'sector-scan',
+  description: 'Get a summary of available moves (edge types) from the current nodes (LOD 0). Automatically filters by active governance domain.',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    allowedEdgeTypes: z.array(z.string()).optional(),
+  }),
+  outputSchema: z.object({
+    summary: z.array(z.object({
+      edgeType: z.string(),
+      count: z.number(),
+      avgHeat: z.number().optional(),
+    })),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const registry = getSchemaRegistry();
 
-      // 1. Setup Anchor Node (The Meeting)
-      // Duration: 12:00 -> 13:00
-      // @ts-expect-error
-      await graph.addNode("meeting", ["Event"], { name: "Meeting" });
-      
-      // We represent interval edges by having a target node that represents the interval context,
-      // OR we just test traverseInterval on nodes that have validFrom.
-      // QuackGraph's traverseInterval usually checks edge validity or target node validity.
-      // Let's assume we are checking TARGET NODE validFrom/validTo relative to the window.
+    // 1. Extract Environmental Context
+    const { asOf, domain } = extractContext(runtimeContext);
 
-      // Target A: Inside (12:15)
-      // @ts-expect-error
-      await graph.addNode("note_inside", ["Note"], {}, {
-        validFrom: new Date(BASE_TIME + 15 * 60 * 1000), // 12:15
-        validTo: new Date(BASE_TIME + 45 * 60 * 1000)    // 12:45 (Must end before window end for strictly DURING)
-      });
-      
-      // Target B: Before (11:00)
-      // @ts-expect-error
-      await graph.addNode("note_before", ["Note"], {}, { validFrom: new Date(BASE_TIME - ONE_HOUR) }); // 11:00
+    // 2. Apply Governance
+    const domainEdges = domain ? registry.getValidEdges(domain) : undefined;
+    
+    // Merge explicit allowed types (if provided by agent) with domain restrictions
+    let effectiveAllowed: string[] | undefined;
+    
+    if (context.allowedEdgeTypes && domainEdges) {
+      // Intersection
+      effectiveAllowed = context.allowedEdgeTypes.filter(e => domainEdges.includes(e));
+    } else {
+      effectiveAllowed = context.allowedEdgeTypes || domainEdges;
+    }
 
-      // Target C: After (14:00)
-      // @ts-expect-error
-      await graph.addNode("note_after", ["Note"], {}, { validFrom: new Date(BASE_TIME + 2 * ONE_HOUR) }); // 14:00
-
-      // Connect them all
-      // @ts-expect-error
-      await graph.addEdge("meeting", "note_inside", "HAS_NOTE", {}, { 
-        validFrom: new Date(BASE_TIME + 15 * 60 * 1000),
-        validTo: new Date(BASE_TIME + 45 * 60 * 1000) // Must end within window for DURING
-      });
-      // @ts-expect-error
-      await graph.addEdge("meeting", "note_before", "HAS_NOTE", {}, { validFrom: new Date(BASE_TIME - ONE_HOUR) });
-      // @ts-expect-error
-      await graph.addEdge("meeting", "note_after", "HAS_NOTE", {}, { validFrom: new Date(BASE_TIME + 2 * ONE_HOUR) });
-
-      // Define Window: 12:00 -> 13:00
-      const wStart = new Date(BASE_TIME);
-      const wEnd = new Date(BASE_TIME + ONE_HOUR);
-
-      // Test: CONTAINS / DURING (Strictly inside)
-      // Note: Implementation of 'contains' might vary, usually means Window contains Node.
-      const inside = await chronos.findEventsDuring("meeting", wStart, wEnd, 'during');
-      
-      // Depending on implementation, 'during' might mean the event is during the window.
-      // note_inside (12:15) is DURING [12:00, 13:00].
-      expect(inside).toContain("note_inside");
-      expect(inside).not.toContain("note_before");
-      expect(inside).not.toContain("note_after");
-
-      // Test: OVERLAPS (Any intersection)
-      // If we had an event spanning 11:30 -> 12:30, it should appear.
-      // note_before (11:00 point) does not overlap 12:00-13:00 if it's a point event.
-      const overlaps = await chronos.findEventsDuring("meeting", wStart, wEnd, 'overlaps');
-      expect(overlaps).toContain("note_inside");
-    });
-  });
-
-  it("evolutionaryDiff: handles out-of-order writes (Non-linear insertion)", async () => {
-    await runWithTestGraph(async (graph) => {
-      const tools = new GraphTools(graph);
-      const chronos = new Chronos(graph, tools);
-
-      const t1 = new Date("2024-01-01T00:00:00Z");
-      const t2 = new Date("2024-02-01T00:00:00Z");
-      const t3 = new Date("2024-03-01T00:00:00Z");
-
-      // @ts-expect-error
-      await graph.addNode("anchor", ["Entity"], {});
-      // @ts-expect-error
-      await graph.addNode("target", ["Entity"], {});
-
-      // 1. Write T1 state (First) - Edge valid from T1 to just after T1
-      await graph.addEdge("anchor", "target", "LINK", {}, { 
-        validFrom: t1, 
-        validTo: new Date(t1.getTime() + 1000) // Closed 1 second after T1
-      });
-
-      // 2. Write T3 state (Second) - Jump to future
-      // We simulate a change in T3. Let's say we add a NEW edge type.
-      await graph.addEdge("anchor", "target", "FUTURE_LINK", {}, { validFrom: t3 });
-
-      // Now request the diff in order: T1 -> T2 -> T3
-      const result = await chronos.evolutionaryDiff("anchor", [t1, t2, t3]);
-      
-      // T1 Snapshot: LINK exists
-      const snap1 = result.timeline[0];
-      expect(snap1.addedEdges.find(e => e.edgeType === "LINK")).toBeDefined();
-
-      // T2 Snapshot: LINK should be REMOVED (because we backfilled the close)
-      const snap2 = result.timeline[1];
-      expect(snap2.removedEdges.find(e => e.edgeType === "LINK")).toBeDefined();
-      
-      // T3 Snapshot: FUTURE_LINK should be ADDED
-      const snap3 = result.timeline[2];
-      expect(snap3.addedEdges.find(e => e.edgeType === "FUTURE_LINK")).toBeDefined();
-    });
-  });
-
-  it("analyzeCorrelation: detects patterns in high-noise environments", async () => {
-    await runWithTestGraph(async (graph) => {
-      const tools = new GraphTools(graph);
-      const chronos = new Chronos(graph, tools);
-      const windowMinutes = 60;
-
-      // 1. Generate Noise (Background events)
-      // @ts-expect-error
-      await graph.addNode("root", ["System"], {});
-      // Generate 50 events over the last 50 hours
-      await generateTimeSeries(graph, "root", 50, 60, 50 * 60);
-
-      // 2. Inject Correlation
-      // Anchor: "Failure" at T=0 (Now)
-      const now = new Date();
-      // @ts-expect-error
-      await graph.addNode("failure", ["Failure"], {}, { validFrom: now });
-
-      // Target: "CPU_Spike" at T=-30m (Inside window)
-      const tInside = new Date(now.getTime() - 30 * 60 * 1000);
-      // @ts-expect-error
-      await graph.addNode("cpu_spike", ["Metric"], { val: 99 }, { validFrom: tInside });
-      
-      // Target: "CPU_Spike" at T=-90m (Outside window)
-      const tOutside = new Date(now.getTime() - 90 * 60 * 1000);
-      // @ts-expect-error
-      await graph.addNode("cpu_spike_old", ["Metric"], { val: 80 }, { validFrom: tOutside });
-
-      const res = await chronos.analyzeCorrelation("failure", "Metric", windowMinutes);
-
-      expect(res.sampleSize).toBe(1); // Should only catch the one inside the window
-      expect(res.correlationScore).toBe(1.0);
-    });
-  });
+    const summary = await tools.getSectorSummary(context.nodeIds, asOf, effectiveAllowed);
+    return { summary };
+  },
 });
+
+export const topologyScanTool = createTool({
+  id: 'topology-scan',
+  description: 'Get IDs of neighbors reachable via a specific edge type (LOD 1) or visualize structure (Ghost Map).',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    edgeType: z.string().optional(),
+    depth: z.number().min(1).max(3).optional(),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()).optional(),
+    map: z.string().optional(),
+    truncated: z.boolean().optional(),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const registry = getSchemaRegistry();
+    const { asOf, domain } = extractContext(runtimeContext);
+
+    // 1. Governance Check
+    if (domain && context.edgeType) {
+      if (!registry.isEdgeAllowed(domain, context.edgeType)) {
+        return { neighborIds: [] }; // Silently block restricted edges
+      }
+    }
+
+    // 2. Ghost Map Mode (LOD 1.5)
+    if (context.depth && context.depth > 1) {
+      const maps = [];
+      let truncated = false;
+      for (const id of context.nodeIds) {
+        // Note: NavigationalMap respects asOf
+        const res = await tools.getNavigationalMap(id, context.depth, { asOf });
+        maps.push(res.map);
+        if (res.truncated) truncated = true;
+      }
+      return { map: maps.join('\n\n'), truncated };
+    }
+
+    // Implicit map mode if no edgeType is provided
+    if (!context.edgeType) {
+        const maps = [];
+        for (const id of context.nodeIds) {
+            const res = await tools.getNavigationalMap(id, 1, { asOf });
+            maps.push(res.map);
+        }
+        return { map: maps.join('\n\n') };
+    }
+
+    // 3. Standard Traversal
+    const neighborIds = await tools.topologyScan(context.nodeIds, context.edgeType, { asOf });
+    return { neighborIds };
+  },
+});
+
+export const temporalScanTool = createTool({
+  id: 'temporal-scan',
+  description: 'Find neighbors connected via edges overlapping a specific time window.',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+    windowStart: z.string().describe('ISO Date String'),
+    windowEnd: z.string().describe('ISO Date String'),
+    edgeType: z.string().optional(),
+    constraint: z.enum(['overlaps', 'contains', 'during', 'meets']).optional().default('overlaps'),
+  }),
+  outputSchema: z.object({
+    neighborIds: z.array(z.string()),
+  }),
+  execute: async ({ context, runtimeContext }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const registry = getSchemaRegistry();
+    const { domain } = extractContext(runtimeContext);
+
+    // Governance Check
+    if (domain && context.edgeType) {
+       if (!registry.isEdgeAllowed(domain, context.edgeType)) {
+         return { neighborIds: [] };
+       }
+    }
+    
+    const s = new Date(context.windowStart).getTime();
+    const e = new Date(context.windowEnd).getTime();
+    const neighborIds = await tools.temporalScan(context.nodeIds, s, e, context.edgeType, context.constraint);
+    return { neighborIds };
+  },
+});
+
+export const contentRetrievalTool = createTool({
+  id: 'content-retrieval',
+  description: 'Retrieve full content for nodes, including virtual spine expansion (LOD 2).',
+  inputSchema: z.object({
+    nodeIds: z.array(z.string()),
+  }),
+  outputSchema: z.object({
+    content: z.array(z.record(z.any())),
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const content = await tools.contentRetrieval(context.nodeIds);
+    return { content };
+  },
+});
+
+export const evolutionaryScanTool = createTool({
+  id: 'evolutionary-scan',
+  description: 'Analyze how the topology around a node changed over specific timepoints (LOD 4 - Time).',
+  inputSchema: z.object({
+    nodeId: z.string(),
+    timestamps: z.array(z.string()).describe('ISO Date Strings'),
+  }),
+  outputSchema: z.object({
+    timeline: z.array(z.object({
+      timestamp: z.string(),
+      added: z.array(z.string()),
+      removed: z.array(z.string()),
+      persisted: z.array(z.string()),
+      densityChange: z.string()
+    })),
+    summary: z.string()
+  }),
+  execute: async ({ context }) => {
+    const graph = getGraphInstance();
+    const tools = new GraphTools(graph);
+    const chronos = new Chronos(graph, tools);
+
+    const dates = context.timestamps.map(t => new Date(t));
+    const result = await chronos.evolutionaryDiff(context.nodeId, dates);
+
+    const timeline = result.timeline.map(t => ({
+      timestamp: t.timestamp.toISOString(),
+      added: t.addedEdges.map(e => `${e.edgeType} (${e.count})`),
+      removed: t.removedEdges.map(e => `${e.edgeType} (${e.count})`),
+      persisted: t.persistedEdges.map(e => `${e.edgeType} (${e.count})`),
+      densityChange: `${t.densityChange.toFixed(1)}%`
+    }));
+
+    const summary = `Evolution of ${context.nodeId} across ${dates.length} points. Net density change: ${timeline[timeline.length - 1]?.densityChange || '0%'}.`;
+
+    return { timeline, summary };
+  }
+});
+```
+
+## File: packages/agent/src/tools/graph-tools.ts
+```typescript
+import type { QuackGraph } from '@quackgraph/graph';
+import type { SectorSummary, LabyrinthContext } from '../types';
+// import type { JsPatternEdge } from '@quackgraph/native';
+
+export interface JsPatternEdge {
+  srcVar: number;
+  tgtVar: number;
+  edgeType: string;
+  direction: string;
+}
+
+export class GraphTools {
+  constructor(private graph: QuackGraph) { }
+
+  private resolveAsOf(contextOrAsOf?: LabyrinthContext | number): number | undefined {
+    let ms: number | undefined;
+    if (typeof contextOrAsOf === 'number') {
+      ms = contextOrAsOf;
+    } else if (contextOrAsOf?.asOf) {
+      ms = contextOrAsOf.asOf instanceof Date ? contextOrAsOf.asOf.getTime() : typeof contextOrAsOf.asOf === 'number' ? contextOrAsOf.asOf : undefined;
+    }
+    
+    // Native Rust layer expects milliseconds (f64) and converts to microseconds internally.
+    // We default to Date.now() if no time is provided, to ensure "present" physics by default.
+    // This prevents future edges from leaking into implicit queries.
+    return ms ?? Date.now();
+  }
+
+  /**
+   * LOD 0: Sector Scan / Satellite View
+   * Returns a summary of available moves from the current nodes.
+   */
+  async getSectorSummary(currentNodes: string[], contextOrAsOf?: LabyrinthContext | number, allowedEdgeTypes?: string[]): Promise<SectorSummary[]> {
+    if (currentNodes.length === 0) return [];
+
+    const asOf = this.resolveAsOf(contextOrAsOf);
+
+    // 1. Get Sector Stats (Count + Heat) in a single Rust call (O(1))
+    const results = await this.graph.native.getSectorStats(currentNodes, asOf, allowedEdgeTypes);
+
+    // 2. Filter if explicit allowed list provided (double check)
+    // Native usually handles this, but if we have complex registry logic (e.g. exclusions), we filter here too
+    if (allowedEdgeTypes && allowedEdgeTypes.length > 0) {
+      return results.filter((r: SectorSummary) => allowedEdgeTypes.includes(r.edgeType)).sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
+    }
+
+    // 3. Sort by count (descending)
+    return results.sort((a: SectorSummary, b: SectorSummary) => b.count - a.count);
+  }
+
+  /**
+   * LOD 1.5: Ghost Map / Navigational Map
+   * Generates an ASCII tree of the topology up to a certain depth.
+   * Uses geometric pruning and token budgeting to keep the map readable.
+   */
+  async getNavigationalMap(rootId: string, depth: number = 1, contextOrAsOf?: LabyrinthContext | number): Promise<{ map: string, truncated: boolean }> {
+    const maxDepth = Math.min(depth, 3); // Hard cap at depth 3 for safety
+    const treeLines: string[] = [`[ROOT] ${rootId}`];
+    let isTruncated = false;
+    let totalLines = 0;
+    const MAX_LINES = 40; // Prevent context window explosion
+
+    // Helper for recursion
+    const buildTree = async (currentId: string, currentDepth: number, prefix: string) => {
+      if (currentDepth >= maxDepth) return;
+      if (totalLines >= MAX_LINES) {
+        if (!isTruncated) {
+          treeLines.push(`${prefix}... (truncated)`);
+          isTruncated = true;
+        }
+        return;
+      }
+
+      // Geometric pruning: 8 -> 4 -> 2
+      const branchLimit = Math.max(2, Math.floor(8 / 2 ** currentDepth));
+      let branchesCount = 0;
+
+      // 1. Get stats to find "hot" edges
+      const stats = await this.getSectorSummary([currentId], contextOrAsOf);
+
+      // Sort by Heat first, then Count to prioritize "Hot" paths in the view
+      stats.sort((a, b) => (b.avgHeat || 0) - (a.avgHeat || 0) || b.count - a.count);
+
+      for (const stat of stats) {
+        if (branchesCount >= branchLimit) break;
+        if (totalLines >= MAX_LINES) break;
+
+        const edgeType = stat.edgeType;
+        const heatVal = stat.avgHeat || 0;
+        let heatMarker = '';
+        if (heatVal > 80) heatMarker = ' 🔥🔥🔥';
+        else if (heatVal > 50) heatMarker = ' 🔥';
+        else if (heatVal > 20) heatMarker = ' ♨️';
+
+        // 2. Traverse to get samples (fetch just enough to display)
+        const neighbors = await this.topologyScan([currentId], edgeType, contextOrAsOf);
+
+        // Pruning neighbor display based on depth
+        const neighborLimit = Math.max(1, Math.floor(branchLimit / (stats.length || 1)) + 1);
+        const displayNeighbors = neighbors.slice(0, neighborLimit);
+
+        for (let i = 0; i < displayNeighbors.length; i++) {
+          if (branchesCount >= branchLimit) break;
+          if (totalLines >= MAX_LINES) { isTruncated = true; break; }
+
+          const neighborId = displayNeighbors[i];
+          if (!neighborId) continue;
+
+          // Check if this is the last item to choose the connector symbol
+          const isLast = (i === displayNeighbors.length - 1) && (stats.indexOf(stat) === stats.length - 1 || branchesCount === branchLimit - 1);
+          const connector = isLast ? '└──' : '├──';
+
+          treeLines.push(`${prefix}${connector} [${edgeType}]──> (${neighborId})${heatMarker}`);
+          totalLines++;
+
+          const nextPrefix = prefix + (isLast ? '    ' : '│   ');
+          await buildTree(neighborId, currentDepth + 1, nextPrefix);
+          branchesCount++;
+        }
+      }
+    };
+
+    await buildTree(rootId, 0, ' ');
+
+    return {
+      map: treeLines.join('\n'),
+      truncated: isTruncated
+    };
+  }
+
+  /**
+   * LOD 1: Topology Scan
+   * Returns the IDs of neighbors reachable via a specific edge type.
+   */
+  async topologyScan(currentNodes: string[], edgeType?: string, contextOrAsOf?: LabyrinthContext | number, _minValidFrom?: number): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.traverse(currentNodes, edgeType, 'out', asOf);
+  }
+
+  /**
+   * LOD 1: Temporal Interval Scan
+   * Finds neighbors connected via edges overlapping/contained in the window.
+   */
+  async intervalScan(currentNodes: string[], windowStart: number, windowEnd: number, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    return this.graph.native.traverseInterval(currentNodes, undefined, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1: Temporal Scan (Wrapper for intervalScan with edge type filtering)
+   */
+  async temporalScan(currentNodes: string[], windowStart: number, windowEnd: number, edgeType?: string, constraint: 'overlaps' | 'contains' | 'during' | 'meets' = 'overlaps'): Promise<string[]> {
+    if (currentNodes.length === 0) return [];
+    // We use the native traverseInterval which accepts edgeType
+    return this.graph.native.traverseInterval(currentNodes, edgeType, 'out', windowStart, windowEnd, constraint);
+  }
+
+  /**
+   * LOD 1.5: Pattern Matching (Structural Inference)
+   * Finds subgraphs matching a specific shape.
+   */
+  async findPattern(startNodes: string[], pattern: Partial<JsPatternEdge>[], contextOrAsOf?: LabyrinthContext | number): Promise<string[][]> {
+    if (startNodes.length === 0) return [];
+    const nativePattern = pattern.map(p => ({
+      srcVar: p.srcVar || 0,
+      tgtVar: p.tgtVar || 0,
+      edgeType: p.edgeType || '',
+      direction: p.direction || 'out'
+    }));
+    const asOf = this.resolveAsOf(contextOrAsOf);
+    return this.graph.native.matchPattern(startNodes, nativePattern, asOf);
+  }
+
+  /**
+   * LOD 2: Content Retrieval with "Virtual Spine" Expansion.
+   * If nodes are part of a document chain (NEXT/PREV), fetch context.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: Generic node content
+  async contentRetrieval(nodeIds: string[]): Promise<any[]> {
+    if (nodeIds.length === 0) return [];
+
+    // 1. Fetch Primary Content
+    const primaryNodes = await this.graph.match([])
+      .where({ id: nodeIds })
+      .select();
+
+    // 2. Virtual Spine Expansion
+    // Check for "NEXT" or "PREV" connections to provide document flow context.
+    const spineContextIds = new Set<string>();
+
+    for (const id of nodeIds) {
+      // Look ahead
+      const next = await this.graph.native.traverse([id], 'NEXT', 'out');
+      next.forEach((nid: string) => { spineContextIds.add(nid); });
+
+      // Look back
+      const incomingNext = await this.graph.native.traverse([id], 'NEXT', 'in');
+      incomingNext.forEach((nid: string) => { spineContextIds.add(nid); });
+
+      const explicitPrev = await this.graph.native.traverse([id], 'PREV', 'out');
+      explicitPrev.forEach((nid: string) => { spineContextIds.add(nid); });
+    }
+
+    // Remove duplicates (original nodes)
+    nodeIds.forEach(id => { spineContextIds.delete(id); });
+
+    if (spineContextIds.size > 0) {
+      const contextNodes = await this.graph.match([])
+        .where({ id: Array.from(spineContextIds) })
+        .select();
+
+      // Merge and Annotate
+      // Create a map for fast lookup
+      const contextMap = new Map(contextNodes.map(n => [n.id, n]));
+
+      return primaryNodes.map(node => {
+        // Find connected context nodes?
+        // For simplicity, we just attach all found spine context, 
+        // ideally we would link specific context to specific nodes but that requires tracking edges again.
+        // We will just return the primary node and let the LLM see the expanded content if requested separately
+        // or attach generic context.
+        return {
+          ...node,
+          _isPrimary: true,
+          _context: Array.from(contextMap.values()).map(c => ({ id: c.id, ...c.properties }))
+        };
+      });
+    }
+
+    return primaryNodes;
+  }
+
+  /**
+   * Pheromones: Reinforce a successful path by increasing edge heat.
+   */
+  async reinforcePath(nodes: string[], edges: (string | undefined)[], qualityScore: number = 1.0) {
+    if (nodes.length < 2) return;
+
+    // Base increment is 50 for a perfect score. 
+    const heatDelta = Math.floor(qualityScore * 50);
+
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const source = nodes[i];
+      const target = nodes[i + 1];
+      const edge = edges[i + 1]; // edges[0] is undefined (start)
+
+      if (source && target && edge) {
+        // Call native update
+        try {
+          await this.graph.native.updateEdgeHeat(source, target, edge, heatDelta);
+        } catch (e) {
+          console.warn(`[Pheromones] Failed to update heat for ${source}->${target}:`, e);
+        }
+      }
+    }
+  }
+}
+```
+
+## File: packages/agent/src/labyrinth.ts
+```typescript
+import type { QuackGraph } from '@quackgraph/graph';
+import type {
+  AgentConfig,
+  LabyrinthArtifact,
+  CorrelationResult,
+  TimeContext,
+  DomainConfig,
+  MastraAgent
+} from './types';
+import { trace, type Span } from '@opentelemetry/api';
+
+// Core Dependencies
+import { setGraphInstance } from './lib/graph-instance';
+import { mastra } from './mastra';
+import { Chronos } from './agent/chronos';
+import { GraphTools } from './tools/graph-tools';
+import { SchemaRegistry } from './governance/schema-registry';
+
+/**
+ * The QuackGraph Agent Facade.
+ * 
+ * A Native Mastra implementation.
+ * This class acts as a thin client that orchestrates the `labyrinth-workflow` 
+ * and injects the RuntimeContext (Time Travel & Governance).
+ */
+export class Labyrinth {
+  public chronos: Chronos;
+  public tools: GraphTools;
+  public registry: SchemaRegistry;
+  
+  // Simulating persistence layer for traces (In production, use Redis/DB via Mastra Storage)
+  private traceCache = new Map<string, LabyrinthArtifact>();
+  private logger = mastra.getLogger();
+  private tracer = trace.getTracer('quackgraph-agent');
+
+  constructor(
+    graph: QuackGraph,
+    _agents: {
+      scout: MastraAgent;
+      judge: MastraAgent;
+      router: MastraAgent;
+    },
+    private config: AgentConfig
+  ) {
+    // Bridge Pattern: Inject the graph instance into the global scope
+    // so Mastra Tools can access it without passing it through every step.
+    setGraphInstance(graph);
+
+    // Utilities
+    this.tools = new GraphTools(graph);
+    this.chronos = new Chronos(graph, this.tools);
+    this.registry = new SchemaRegistry();
+  }
+
+  /**
+   * Registers a semantic domain (LOD 0 governance).
+   * Direct proxy to the singleton registry used by tools.
+   */
+  registerDomain(config: DomainConfig) {
+    this.registry.register(config);
+  }
+
+  /**
+   * Main Entry Point: Finds a path through the Labyrinth.
+   * 
+   * @param start - Starting Node ID or natural language query
+   * @param goal - The question to answer
+   * @param timeContext - "Time Travel" parameters (asOf, window)
+   */
+  async findPath(
+    start: string | { query: string },
+    goal: string,
+    timeContext?: TimeContext
+  ): Promise<LabyrinthArtifact | null> {
+    return this.tracer.startActiveSpan('labyrinth.findPath', async (span: Span) => {
+        try {
+            const workflow = mastra.getWorkflow('labyrinthWorkflow');
+            if (!workflow) throw new Error("Labyrinth Workflow not registered in Mastra.");
+
+            // 1. Prepare Input Data & Configuration
+            const inputData = {
+                goal,
+                start,
+                // Domain is left undefined here; the 'route-domain' step will decide it
+                // unless we wanted to force it via config.
+                maxHops: this.config.maxHops,
+                maxCursors: this.config.maxCursors,
+                confidenceThreshold: this.config.confidenceThreshold,
+                timeContext: timeContext ? {
+                    asOf: timeContext.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext.asOf,
+                    windowStart: timeContext.windowStart?.toISOString(),
+                    windowEnd: timeContext.windowEnd?.toISOString()
+                } : undefined
+            };
+
+            // 2. Execute Workflow
+            const run = await workflow.createRunAsync();
+            
+            // The workflow steps are responsible for extracting timeContext from input
+            // and passing it to agents via runtimeContext injection in the 'speculative-traversal' step.
+            const result = await run.start({ inputData });
+            
+            // 3. Extract Result
+            // @ts-expect-error - Result payload typing
+            const payload = result.result || result;
+            const artifact = payload?.artifact as LabyrinthArtifact | null;
+            if (!artifact && result.status === 'failed') {
+                 throw new Error(`Workflow failed: ${result.error?.message || 'Unknown error'}`);
+            }
+
+            if (artifact) {
+              // Sync traceId with the actual Run ID for retrievability
+              // @ts-expect-error - runId access
+              const runId = run.runId || run.id;
+              artifact.traceId = runId;
+
+              span.setAttribute('labyrinth.confidence', artifact.confidence);
+              span.setAttribute('labyrinth.traceId', artifact.traceId);
+
+              // Cache the full artifact (with heavy execution trace)
+              this.traceCache.set(runId, JSON.parse(JSON.stringify(artifact)));
+
+              // Return "Executive Briefing" version (strip execution logs)
+              if (artifact.metadata) {
+                 artifact.metadata.execution = []; 
+              }
+            }
+
+            return artifact;
+
+        } catch (e) {
+            this.logger.error("Labyrinth traversal failed", { error: e });
+            span.recordException(e as Error);
+            throw e;
+        } finally {
+            span.end();
+        }
+    });
+  }
+
+  /**
+   * Retrieve the full reasoning trace for a specific run.
+   * Useful for auditing or "Show your work" features.
+   */
+  async getTrace(traceId: string): Promise<LabyrinthArtifact | undefined> {
+    // 1. Try Memory Cache
+    if (this.traceCache.has(traceId)) {
+        return this.traceCache.get(traceId);
+    }
+
+    // 2. Future: Try Mastra Storage (DB)
+    // const run = await mastra.getRun(traceId);
+    // return run?.result?.artifact;
+
+    return undefined;
+  }
+
+  /**
+   * Direct access to Chronos for temporal analytics.
+   * Useful for "Life Coach" dashboards that need raw stats without full agent traversal.
+   */
+  async analyzeCorrelation(
+    anchorNodeId: string,
+    targetLabel: string,
+    windowMinutes: number
+  ): Promise<CorrelationResult> {
+    return this.chronos.analyzeCorrelation(anchorNodeId, targetLabel, windowMinutes);
+  }
+
+  /**
+   * Execute a Natural Language Mutation.
+   * Uses the Scribe Agent to parse intent and apply graph operations.
+   */
+  async mutate(query: string, timeContext?: TimeContext): Promise<{ success: boolean; summary: string }> {
+    return this.tracer.startActiveSpan('labyrinth.mutate', async (span: Span) => {
+      try {
+        const workflow = mastra.getWorkflow('mutationWorkflow');
+        if (!workflow) throw new Error("Mutation Workflow not registered.");
+
+        const inputData = {
+          query,
+          asOf: timeContext?.asOf instanceof Date ? timeContext.asOf.getTime() : timeContext?.asOf,
+          userId: 'Me' // Default context
+        };
+
+        const run = await workflow.createRunAsync();
+        const result = await run.start({ inputData });
+        if (result.status === 'failed') {
+          throw new Error(`Mutation failed: ${result.error.message}`);
+        }
+        if (result.status !== 'success') {
+          throw new Error(`Mutation possibly failed with status: ${result.status}`);
+        }
+        const payload = result.result || result;
+        return payload as { success: boolean; summary: string };
+          } catch (e) {
+            this.logger.error("Mutation failed", { error: e });
+            span.recordException(e as Error);
+            return { success: false, summary: `Mutation failed: ${(e as Error).message}` };
+          } finally {
+            span.end();
+          }
+    });
+  }
+}
 ```
